@@ -1,126 +1,145 @@
-import hashlib
+# main.py
+# -*- coding: utf-8 -*-
+
 import os
-import re
-import sqlite3
+import json
 import time
+import hashlib
 import urllib.parse
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
+import requests
+import redis
 from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse, PlainTextResponse
+from fastapi.responses import RedirectResponse
 
-DB_PATH = os.getenv("COUNTERS_DB", "counters.sqlite")
+# ───────────────────────── CONFIG ─────────────────────────
+REDIS_URL   = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+COUNTER_KEY = os.getenv("UTM_COUNTER_KEY", "utm_counter_path_style")
 
-app = FastAPI(title="Shopee shortlink + UTM dinâmica (todas as UTMs)")
+# Shopee Affiliate (shortlink)
+SHOPEE_APP_ID     = os.getenv("SHOPEE_APP_ID", "18314810331")
+SHOPEE_APP_SECRET = os.getenv("SHOPEE_APP_SECRET", "LO3QSEG45TYP4NYQBRXLA2YYUL3ZCUPN")
+SHOPEE_ENDPOINT   = "https://open-api.affiliate.shopee.com.br/graphql"
 
-# --------- DB (contador) ----------
-def _ensure_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS counters(
-            k TEXT PRIMARY KEY,
-            n INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
-        )
-    """)
-    conn.commit()
-    return conn
+DEFAULT_UA = "Mozilla/5.0 (compatible; RasantBot/1.0; +https://rasant-api.onrender.com)"
 
-DB = _ensure_db()
+# ───────────────────────── APP / REDIS ─────────────────────────
+r = redis.from_url(REDIS_URL)
+app = FastAPI(title="Rasant Path Redirector with UTM n-suffix")
 
-def _db_next(k: str) -> int:
-    cur = DB.cursor()
-    row = cur.execute("SELECT n FROM counters WHERE k=?", (k,)).fetchone()
-    if row is None:
-        n = 0
-        cur.execute("INSERT INTO counters(k,n,updated_at) VALUES(?,?,?)", (k, n, int(time.time())))
-    else:
-        n = int(row[0]) + 1
-        cur.execute("UPDATE counters SET n=?, updated_at=? WHERE k=?", (n, int(time.time()), k))
-    DB.commit()
-    return n
+# ───────────────────────── HELPERS ─────────────────────────
+def incr_counter_zero_based() -> int:
+    return int(r.incr(COUNTER_KEY)) - 1
 
-# --------- Helpers ----------
-RE_TRAIL_N = re.compile(r"(.*?)(?:N\d+)$", re.IGNORECASE)
+def expand_url(url: str, timeout: float = 15.0) -> str:
+    try:
+        resp = requests.get(url, allow_redirects=True, timeout=timeout, headers={"User-Agent": DEFAULT_UA})
+        return resp.url
+    except Exception:
+        return url
 
 def parse_query(url: str) -> Tuple[urllib.parse.SplitResult, List[Tuple[str, str]]]:
-    p = urllib.parse.urlsplit(url)
-    pairs = urllib.parse.parse_qsl(p.query, keep_blank_values=True)
-    return p, pairs
+    parsed = urllib.parse.urlsplit(url)
+    params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    return parsed, params
 
-def strip_trailing_N(value: str) -> str:
-    """
-    Remove um sufixo N<numero> no final do valor, se existir.
-    """
-    m = RE_TRAIL_N.match(value)
-    return m.group(1) if m else value
+def rebuild_url(parsed: urllib.parse.SplitResult, params: List[Tuple[str, str]]) -> str:
+    new_query = urllib.parse.urlencode(params, doseq=True)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
 
-def normalized_key(url: str) -> str:
-    """
-    Gera chave estável para o contador:
-    - ordena parâmetros da query;
-    - remove sufixos N<dígitos> do final de **valores de UTMs**.
-    """
-    p, pairs = parse_query(url)
-    norm_pairs: List[Tuple[str, str]] = []
-    for k, v in pairs:
-        if k.lower().startswith("utm_"):
-            v = strip_trailing_N(v)
-        norm_pairs.append((k, v))
-    norm_pairs.sort()
-    norm_q = urllib.parse.urlencode(norm_pairs, doseq=True)
-    key_url = urllib.parse.urlunsplit((p.scheme, p.netloc, p.path, norm_q, p.fragment))
-    return hashlib.sha1(key_url.encode("utf-8")).hexdigest()
+def append_suffix_to_utms(raw_url: str, suffix: str) -> str:
+    parsed, params = parse_query(raw_url)
+    has_utm = False
+    new_params: List[Tuple[str, str]] = []
+    for k, v in params:
+        if k.lower().startswith("utm_") and v:
+            has_utm = True
+            new_params.append((k, f"{v}{suffix}"))
+        else:
+            new_params.append((k, v))
+    # Se não tem nenhuma UTM → não inventa nada
+    return rebuild_url(parsed, new_params)
 
-def add_N_to_all_utms(url: str, n_value: int) -> str:
-    """
-    Para cada parâmetro 'utm_*' no URL, acrescenta (ou atualiza) o sufixo N<n_value>.
-    - Se o valor já termina com N<algo>, substitui pelo N<n_value> atual.
-    - Se não termina, concatena N<n_value>.
-    - Se não houver nenhuma UTM, cria utm_content=N<n_value>.
-    """
-    p, pairs = parse_query(url)
-    q: Dict[str, str] = {}
-    for k, v in pairs:
-        q[k] = v
+def extract_utm_content(raw_url: str) -> str:
+    _, params = parse_query(raw_url)
+    for k, v in params:
+        if k.lower() == "utm_content":
+            return v
+    return ""
 
-    touched_any = False
-    for k in list(q.keys()):
-        if k.lower().startswith("utm_"):
-            old = q[k] or ""
-            base = strip_trailing_N(old)
-            # Se já havia um N e depois do strip ficou vazio, base = "" (ok).
-            new_val = (base + f"N{n_value}") if base else f"N{n_value}"
-            q[k] = new_val
-            touched_any = True
+def generate_shopee_shortlink(origin_url: str, utm_content: str) -> str:
+    payload_obj = {
+        "query": (
+            "mutation{generateShortLink(input:{"
+            f"originUrl:\"{origin_url}\","
+            f"subIds:[\"\",\"\",\"{utm_content}\",\"\",\"\"]"
+            "}){shortLink}}"
+        )
+    }
+    payload = json.dumps(payload_obj, separators=(',', ':'), ensure_ascii=False)
+    ts = str(int(time.time()))
+    signature = hashlib.sha256((SHOPEE_APP_ID + ts + payload + SHOPEE_APP_SECRET).encode("utf-8")).hexdigest()
+    headers = {
+        "Authorization": f"SHA256 Credential={SHOPEE_APP_ID}, Timestamp={ts}, Signature={signature}",
+        "Content-Type": "application/json",
+        "User-Agent": DEFAULT_UA,
+    }
+    resp = requests.post(SHOPEE_ENDPOINT, headers=headers, data=payload, timeout=20)
+    resp.raise_for_status()
+    return resp.json()["data"]["generateShortLink"]["shortLink"]
 
-    if not touched_any:
-        # Nenhuma UTM presente -> cria utm_content=N<n>
-        q["utm_content"] = f"N{n_value}"
+def clean_target_from_path(target: str) -> str:
+    url = urllib.parse.unquote(target).strip()
+    if url.startswith("https://rasant-api.onrender.com"):
+        url = url.replace("https://rasant-api.onrender.com", "", 1).lstrip("/")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        url = "https://" + url.lstrip("/")
+    return url
 
-    new_query = urllib.parse.urlencode(q, doseq=True)
-    return urllib.parse.urlunsplit((p.scheme, p.netloc, p.path, new_query, p.fragment))
-
-# --------- Rotas ----------
+# ───────────────────────── ROUTES ─────────────────────────
 @app.get("/health")
 def health():
     return {"ok": True, "ts": int(time.time())}
 
-# padrão de shortlink: /{url_codificada}
-@app.get("/{encoded:path}")
-def go(encoded: str, request: Request):
+@app.get("/{target:path}")
+def redirect_with_suffix(request: Request, target: str):
+    incoming_url = clean_target_from_path(target)
+    final_url = expand_url(incoming_url)
+
+    # contador e sufixo
+    n = incr_counter_zero_based()
+    suffix = f"n{n}"
+
+    # aplica sufixo nas UTMs
+    enriched = append_suffix_to_utms(final_url, suffix)
+
+    # extrai utm_content (se houver)
+    utm_content_final = extract_utm_content(enriched)
+
+    # gera shortlink
     try:
-        target = urllib.parse.unquote(encoded)
-    except Exception:
-        return PlainTextResponse("Bad encoded URL", status_code=400)
+        short = generate_shopee_shortlink(enriched, utm_content_final or suffix)
+        dest = short
+    except Exception as e:
+        print(f"[ShopeeShortLink][ERRO] {e}. Usando URL enriquecida.")
+        dest = enriched
 
-    if not (target.startswith("http://") or target.startswith("https://")):
-        return PlainTextResponse("Expected an URL after '/'", status_code=400)
+    # log
+    print(json.dumps({
+        "ip": (request.client.host if request.client else "-"),
+        "ua": request.headers.get("user-agent", "-")[:160],
+        "n": n,
+        "incoming": incoming_url,
+        "expanded": final_url,
+        "enriched": enriched,
+        "utm_content": utm_content_final,
+        "dest": dest,
+    }, ensure_ascii=False))
 
-    # chave normalizada (ignora N já existente nas UTMs)
-    k = normalized_key(target)
-    n = _db_next(k)  # começa em 0
+    return RedirectResponse(dest, status_code=302)
 
-    final_url = add_N_to_all_utms(target, n)
-    return RedirectResponse(final_url, status_code=302)
+# ───────────────────────── START ─────────────────────────
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
