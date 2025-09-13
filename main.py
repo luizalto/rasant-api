@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI – Shopee ShortLink com UTM numerada + Logs em GCS + Redis + Google GA4 (Measurement Protocol)
+FastAPI – Shopee ShortLink com UTM numerada (somente letras e números) + Logs em GCS + Redis + Google GA4
+
 Processo:
-- Recebe short/URL Shopee já com UTM → resolve para URL longa
-- Acrescenta numeração em utm_content (mantém demais params)
-- Gera short-link oficial (Shopee GraphQL); para a API usamos subIds[2] SANITIZADO
-- Envia GA4 com IP/UA + UTM original e numerada (sem sanitizar)
+- Recebe short/URL Shopee com UTM → resolve para URL longa
+- Extrai utm_content ORIGINAL → remove símbolos (fica só [A-Za-z0-9]) → acrescenta numeração
+- Substitui SOMENTE utm_content na URL longa
+- Gera short-link oficial (Shopee GraphQL) usando subIds[2] = UTM numerada (já alfanumérica)
+- Envia GA4 com IP/UA + UTM original e numerada
 - Salva cache/CSV e redireciona 302 para o short oficial
 """
 
@@ -251,12 +253,12 @@ def send_ga4_event(name: str, ip: str, ua: str, params: Dict[str, Any], event_ts
     except Exception as e:
         return {"error": str(e)}
 
-# ─────────── Sanitização para Shopee subIds ───────────
+# ─────────── Sanitização para Shopee subIds (apenas letras e números) ───────────
 _SUBID_MAXLEN = int(os.getenv("SHOPEE_SUBID_MAXLEN", "50"))
-_SUBID_REGEX  = re.compile(r"[^A-Za-z0-9_\-]")  # conservador: letras, números, _ e -
-def sanitize_subid_for_shopee(utm_value: str) -> str:
-    if not utm_value: return "na"
-    cleaned = _SUBID_REGEX.sub("", utm_value)
+_SUBID_REGEX  = re.compile(r"[^A-Za-z0-9]")  # somente alfanumérico
+def sanitize_subid_for_shopee(value: str) -> str:
+    if not value: return "na"
+    cleaned = _SUBID_REGEX.sub("", value)
     cleaned = cleaned[:_SUBID_MAXLEN] if cleaned else "na"
     return cleaned
 
@@ -339,27 +341,22 @@ def track_number_and_redirect(
     if not _is_valid_http_url(resolved_url):
         resolved_url = incoming_url
 
-    # 3) Extrai UTM original e adiciona numeração
+    # 3) UTM original → limpar símbolos → numerar
     utm_original = subids_in.get("utm_content") or ""
-   seq = incr_counter()
+    clean_base = re.sub(r'[^A-Za-z0-9]', '', utm_original or "")
+    if not clean_base:
+        clean_base = "n"  # prefixo padrão quando base vier vazia após limpeza
+    seq = incr_counter()
+    utm_numbered = f"{clean_base}{seq}"  # apenas letras e números
 
-    # Remove tudo que não for letra ou número da UTM original
-    clean_base = re.sub(r'[^a-zA-Z0-9]', '', base_utm or "")
-    
-    # Agora monta a UTM numerada somente com caracteres válidos
-    utm_numbered = f"{clean_base}{seq}"
-
-
-    # substitui SOMENTE utm_content na URL longa
+    # Substitui SOMENTE utm_content na URL longa
     final_with_number = replace_utm_content_only(resolved_url, utm_numbered)
 
-    # 4) Gera short-link oficial usando subIds[2] SANITIZADO p/ API
-    sub_id_api = sanitize_subid_for_shopee(utm_numbered)
-    if sub_id_api != utm_numbered:
-        print(f"[ShopeeShortLink] sanitizado subId: '{utm_numbered}' -> '{sub_id_api}'")
+    # 4) Gera short-link oficial (Shopee) com subIds[2] já alfanumérico
+    sub_id_api = sanitize_subid_for_shopee(utm_numbered)  # redundante, mas garante regra e tamanho
     dest = generate_short_link(final_with_number, sub_id_api)
 
-    # 5) GA4: envia evento com IP/UA + UTM original e numerada (sem sanitizar)
+    # 5) GA4: envia evento com IP/UA + UTM original (como chegou) e UTM numerada (limpa)
     ga_params = {
         "link_url": dest,
         "event_source_url": final_with_number,
@@ -436,4 +433,3 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
-
