@@ -1,6 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI – Logger de cliques em CSV (GCS) + Redis (contador infinito) + Shopee ShortLink + Meta CAPI
+FastAPI – Shopee ShortLink com UTM numerada + Logs em GCS + Redis + Google GA4 (Measurement Protocol)
+
+Fluxo:
+1) Recebe short-link/URL da Shopee JÁ com UTM no path (catch-all).
+2) Resolve até a URL final, lê o utm_content ORIGINAL.
+3) Acrescenta numeração sequencial ao utm_content (mantém ordem e demais parâmetros).
+4) Gera short-link OFICIAL da Shopee (API GraphQL) com subIds[2] = UTM numerada (fallback para URL longa).
+5) Envia evento ao Google GA4 (Measurement Protocol) com IP, UA, UTM original e numerada.
+6) Salva user_data no Redis e loga CSV no GCS.
+7) Redireciona (302) para o short-link gerado.
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json
@@ -9,7 +18,7 @@ from typing import Optional, Dict, Tuple, List, Any
 import requests
 import redis
 from fastapi import FastAPI, Request, Query, Path, UploadFile, File
-from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse, PlainTextResponse
+from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse
 
 # ─────────────────────────── Credenciais GCP ────────────────────────────────
 def _bootstrap_gcp_credentials():
@@ -23,59 +32,68 @@ def _bootstrap_gcp_credentials():
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
 
 _bootstrap_gcp_credentials()
-from google.cloud import storage  # importar após preparar as credenciais
+from google.cloud import storage  # importa após preparar credenciais
 
 # ───────────────────────────── Configuração ─────────────────────────────────
 DEFAULT_TIMEOUT   = float(os.getenv("HTTP_TIMEOUT", "12"))
+
+# GCS
 GCS_BUCKET        = os.getenv("GCS_BUCKET")
 GCS_PREFIX        = os.getenv("GCS_PREFIX", "logs/")
 FLUSH_MAX_ROWS    = int(os.getenv("FLUSH_MAX_ROWS", "500"))
 FLUSH_MAX_SECONDS = int(os.getenv("FLUSH_MAX_SECONDS", "30"))
+
+# Admin
 ADMIN_TOKEN       = os.getenv("ADMIN_TOKEN", "12345678")
 
-# Redis / chaves
+# Redis
 REDIS_URL            = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 COUNTER_KEY          = os.getenv("UTM_COUNTER_KEY", "utm_counter")
 USERDATA_TTL_SECONDS = int(os.getenv("USERDATA_TTL_SECONDS", "604800"))
 USERDATA_KEY_PREFIX  = os.getenv("USERDATA_KEY_PREFIX", "ud:")
-MAX_DELAY_SECONDS    = int(os.getenv("MAX_DELAY_SECONDS", str(7 * 24 * 60 * 60)))
 
+# Anti-bot simples
 CLICK_WINDOW_SECONDS = int(os.getenv("CLICK_WINDOW_SECONDS", "3600"))
 MAX_CLICKS_PER_FP    = int(os.getenv("MAX_CLICKS_PER_FP", "2"))
 FINGERPRINT_PREFIX   = os.getenv("FINGERPRINT_PREFIX", "fp:")
 EMIT_INTERNAL_BLOCK_LOG = str(os.getenv("EMIT_INTERNAL_BLOCK_LOG", "true")).lower() == "true"
-VIDEO_ID             = os.getenv("VIDEO_ID", "v15")
 
-# Meta (Conversions API)
-FB_PIXEL_ID     = os.getenv("FB_PIXEL_ID") or os.getenv("META_PIXEL_ID") or "COLOQUE_SEU_PIXEL_ID_AQUI"
-FB_ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN") or os.getenv("META_ACCESS_TOKEN") or "COLOQUE_SEU_ACCESS_TOKEN_AQUI"
-FB_ENDPOINT     = f"https://graph.facebook.com/v14.0/{FB_PIXEL_ID}/events?access_token={FB_ACCESS_TOKEN}"
+# Apenas para informar a versão do criativo no log
+VIDEO_ID             = os.getenv("VIDEO_ID", "v15")
 
 # Shopee Affiliate
 SHOPEE_APP_ID     = os.getenv("SHOPEE_APP_ID", "18314810331")
 SHOPEE_APP_SECRET = os.getenv("SHOPEE_APP_SECRET", "LO3QSEG45TYP4NYQBRXLA2YYUL3ZCUPN")
 SHOPEE_ENDPOINT   = "https://open-api.affiliate.shopee.com.br/graphql"
 
-# ───────────────────────────── App / Clients ────────────────────────────────
-app = FastAPI(title="Click Logger → GCS + Redis + Shopee ShortLink + Meta CAPI")
+# Google Analytics 4 (Measurement Protocol)
+GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID")  # p.ex. G-XXXXXXX
+GA4_API_SECRET     = os.getenv("GA4_API_SECRET")
+GA4_ENDPOINT       = f"https://www.google-analytics.com/mp/collect?measurement_id={GA4_MEASUREMENT_ID}&api_secret={GA4_API_SECRET}" if (GA4_MEASUREMENT_ID and GA4_API_SECRET) else None
 
+# ───────────────────────────── App / Clients ────────────────────────────────
+app = FastAPI(title="Shopee UTM Numbered → ShortLink + GCS + Redis + GA4")
+
+# Redis
 r = redis.from_url(REDIS_URL)
 
+# GCS
 _gcs_client: Optional[storage.Client] = None
 _bucket: Optional[storage.Bucket] = None
 if GCS_BUCKET:
     _gcs_client = storage.Client()
     _bucket = _gcs_client.bucket(GCS_BUCKET)
 
-# ───────────────────────── Buffer em memória ────────────────────────────────
+# ───────────────────────── Buffer em memória (thread-safe) ──────────────────
 _buffer_lock = threading.Lock()
 _buffer_rows: List[List[str]] = []
 _last_flush_ts = time.time()
 
 CSV_HEADERS = [
     "timestamp","iso_time","ip","user_agent","device_name","os_family","os_version","referrer",
-    "short_link","final_url","original_utm","category",
-    "utm_content","sub_id1","sub_id2","sub_id3","sub_id4","sub_id5",
+    "short_link_in","resolved_url","final_url","category",
+    "utm_original","utm_numbered",
+    "sub_id1","sub_id2","sub_id3","sub_id4","sub_id5",
     "fbclid","fbp","fbc"
 ]
 
@@ -119,16 +137,20 @@ def parse_subids_from_query(qs: str) -> Dict[str, Optional[str]]:
     out = {"utm_content": None, "sub_id1": None, "sub_id2": None, "sub_id3": None, "sub_id4": None, "sub_id5": None}
     if not qs: return out
     q = urllib.parse.parse_qs(qs, keep_blank_values=True)
+
     if "utm_content" in q and q["utm_content"]:
         out["utm_content"] = q["utm_content"][0]
+
     for i in range(5):
         key_idx = f"subIds[{i}]"
         if key_idx in q and q[key_idx]:
             out[f"sub_id{i+1}"] = q[key_idx][0]
+
     if "subIds" in q:
         vals = q["subIds"]
         for i in range(min(5, len(vals))):
             out[f"sub_id{i+1}"] = out[f"sub_id{i+1}"] or vals[i]
+
     aliases = {
         "sub_id1":"sub_id1","subid1":"sub_id1","Sub_id1":"sub_id1",
         "sub_id2":"sub_id2","subid2":"sub_id2","Sub_id2":"sub_id2",
@@ -139,6 +161,7 @@ def parse_subids_from_query(qs: str) -> Dict[str, Optional[str]]:
     for src, dst in aliases.items():
         if src in q and q[src] and not out[dst]:
             out[dst] = q[src][0]
+
     if not out["utm_content"] and out["sub_id3"]:
         out["utm_content"] = out["sub_id3"]
     return out
@@ -174,9 +197,17 @@ def resolve_short_link(short_url: str, max_hops: int = 6) -> Tuple[str, Dict[str
             break
     except Exception:
         final_url = short_url
+
     parsed = urllib.parse.urlsplit(final_url)
     subids = parse_subids_from_query(parsed.query)
     return final_url, subids
+
+def _is_valid_http_url(u: str) -> bool:
+    try:
+        p = urllib.parse.urlsplit(u)
+        return p.scheme in ("http", "https") and bool(p.netloc)
+    except Exception:
+        return False
 
 def _day_key(ts: int) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts))
@@ -190,6 +221,7 @@ def _flush_buffer_to_gcs(force: bool = False) -> int:
     if not _bucket:
         print("[WARN] GCS_BUCKET não configurado; pulando flush.")
         return 0
+
     with _buffer_lock:
         rows = list(_buffer_rows)
         need = (force or len(rows) >= FLUSH_MAX_ROWS or (time.time() - _last_flush_ts) >= FLUSH_MAX_SECONDS)
@@ -197,155 +229,66 @@ def _flush_buffer_to_gcs(force: bool = False) -> int:
             return 0
         _buffer_rows = []
         _last_flush_ts = time.time()
+
     output = io.StringIO()
     w = csv.writer(output)
     w.writerow(CSV_HEADERS)
     w.writerows(rows)
     data = output.getvalue().encode("utf-8")
+
     part = int(time.time() * 1000) % 10_000_000
     blob_name = _gcs_object_name(int(time.time()), part)
     _bucket.blob(blob_name).upload_from_string(data, content_type="text/csv")
+
     print(f"[FLUSH] {len(rows)} linha(s) → gs://{GCS_BUCKET}/{blob_name}")
     return len(rows)
 
-# ─────────────────────── Meta CAPI / Scoring ────────────────────────────────
-def send_fb_event(event_name: str, event_id: str, event_source_url: str,
-                  user_data: Dict[str, Any], custom_data: Dict[str, Any], event_time: int) -> Dict[str, Any]:
-    payload = {"data": [{
-        "event_name": event_name, "event_time": int(event_time), "event_id": event_id,
-        "action_source": "website", "event_source_url": event_source_url,
-        "user_data": user_data, "custom_data": custom_data
-    }]}
-    rqs = requests.post(FB_ENDPOINT, json=payload, timeout=20)
-    try: return rqs.json()
-    except Exception: return {"status_code": rqs.status_code, "text": rqs.text}
+# ─────────────────────── Google Analytics 4 (MP) ────────────────────────────
+def _ga4_client_id(ip: str, ua: str) -> str:
+    # client_id determinístico a partir de IP + UA (apenas para vincular sessões de forma simples)
+    return hashlib.sha256(f"{ip}|{ua}".encode("utf-8")).hexdigest()[:32]
 
-def parse_device_os(ua: str) -> Tuple[str, str]:
-    if not ua: return ("-", "-")
-    m = re.search(r"iPhone OS (\d+)_?", ua) or re.search(r"CPU iPhone OS (\d+)", ua)
-    if m: return ("iOS", m.group(1))
-    m = re.search(r"Android (\d+)", ua)
-    if m: return ("Android", m.group(1))
-    if "iPhone" in ua or "iPad" in ua: return ("iOS", "-")
-    if "Android" in ua: return ("Android", "-")
-    return ("Other", "-")
-
-def make_fingerprint(ip: str, ua: str) -> str:
-    osfam, osmaj = parse_device_os(ua)
-    return hashlib.sha1(f"{ip}|{osfam}|{osmaj}".encode("utf-8")).hexdigest()
-
-def fp_counter_key(fp: str) -> str:
-    return f"{FINGERPRINT_PREFIX}{fp}"
-
-def allow_viewcontent(ip: str, ua: str) -> Tuple[bool, str, int]:
-    fp = make_fingerprint(ip, ua)
-    key = fp_counter_key(fp)
-    cnt = r.incr(key)
-    if cnt == 1:
-        r.expire(key, CLICK_WINDOW_SECONDS)
-    if cnt > MAX_CLICKS_PER_FP:
-        return False, "rate_limited", int(cnt)
-    return True, "ok", int(cnt)
-
-ATC_BASELINE_RATE = float(os.getenv("ATC_BASELINE_RATE", "0.05"))
-ATC_THRESHOLD     = float(os.getenv("ATC_THRESHOLD", "0.15"))
-ATC_MAX_RATE      = float(os.getenv("ATC_MAX_RATE", "0.25"))
-RULES_KEY         = os.getenv("RULES_KEY", "rules:hour_category")
-MODEL_KEY         = os.getenv("MODEL_KEY", "model:logreg")
-MODEL_META_KEY    = os.getenv("MODEL_META_KEY", "model:meta")
-
-def save_rules(rules: Dict[str, Any]) -> None:
-    r.set(RULES_KEY, json.dumps(rules, ensure_ascii=False))
-
-def load_rules() -> Dict[str, Any]:
-    raw = r.get(RULES_KEY)
-    if not raw:
-        return {"by_hour": {}, "by_category": {}, "trained_at": None, "global_rate": ATC_BASELINE_RATE}
-    try: return json.loads(raw)
-    except Exception: return {"by_hour": {}, "by_category": {}, "trained_at": None, "global_rate": ATC_BASELINE_RATE}
-
-def save_model_pickle_bytes(b: bytes) -> None:
-    r.set(MODEL_KEY, b)
-    r.set(MODEL_META_KEY, json.dumps({"saved_at": int(time.time())}))
-
-def load_model_pickle_bytes() -> Optional[bytes]:
-    raw = r.get(MODEL_KEY)
-    return bytes(raw) if raw else None
-
-def _norm_category(cat: Optional[str]) -> str:
-    return (cat or "").strip().lower()
-
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-def score_click_prob_rules(hour: Optional[int], category: Optional[str]) -> float:
-    rules = load_rules()
-    base = rules.get("global_rate", ATC_BASELINE_RATE) or ATC_BASELINE_RATE
-    hfac = float(rules.get("by_hour", {}).get(str(int(hour)) if hour is not None else "", 1.0)) if hour is not None else 1.0
-    cfac = float(rules.get("by_category", {}).get(_norm_category(category), 1.0)) if category else 1.0
-    return _clamp(base * hfac * cfac, 0.0, ATC_MAX_RATE)
-
-def model_predict_proba(features: Dict[str, Any]) -> Optional[float]:
-    raw = load_model_pickle_bytes()
-    if not raw: return None
+def send_ga4_event(name: str, ip: str, ua: str, params: Dict[str, Any], event_ts: Optional[int] = None) -> Dict[str, Any]:
+    if not GA4_ENDPOINT:
+        print("[GA4] SKIP: GA4_MEASUREMENT_ID/API_SECRET ausentes.")
+        return {"skipped": True, "reason": "missing_config"}
+    payload = {
+        "client_id": _ga4_client_id(ip, ua),
+        "timestamp_micros": int((event_ts or int(time.time())) * 1_000_000),
+        "events": [{
+            "name": name,
+            "params": {
+                **params,
+                "engagement_time_msec": "1"
+            }
+        }]
+    }
     try:
-        import pickle, numpy as np  # noqa: F401
-        model = pickle.loads(raw)
-        hour = int(features.get("hour")) if features.get("hour") is not None else -1
-        cat  = _norm_category(features.get("category"))
-        gr   = float(features.get("global_rate", ATC_BASELINE_RATE))
-        x = [gr] + [1.0 if h==hour else 0.0 for h in range(24)]
-        hv=0
-        for ch in cat: hv=(hv*131+ord(ch))%(10**9+7)
-        bucket=hv%5
-        x += [1.0 if b==bucket else 0.0 for b in range(5)]
-        return float(model.predict_proba([x])[0][1])
-    except Exception as e:
-        print("[MODEL] predict error:", e)
-        return None
-
-def score_click_prob(hour: Optional[int], category: Optional[str]) -> float:
-    rules = load_rules()
-    p_model = model_predict_proba({"hour": hour, "category": category, "global_rate": rules.get("global_rate", ATC_BASELINE_RATE)})
-    return _clamp(p_model, 0.0, ATC_MAX_RATE) if p_model is not None else score_click_prob_rules(hour, category)
-
-def maybe_send_add_to_cart(event_id: str, event_source_url: str, user_data: Dict[str, Any],
-                           subid1: Optional[str], category: Optional[str], score_p: float) -> Optional[Dict[str, Any]]:
-    if score_p < ATC_THRESHOLD: return None
-    try:
-        resp = send_fb_event(
-            "AddToCart", event_id, event_source_url, user_data,
-            {"content_category": category or "", "content_ids": [subid1 or "na"],
-             "contents": [{"id": subid1 or "na", "quantity": 1}], "currency": "BRL", "value": 0},
-            int(time.time())
+        resp = requests.post(
+            GA4_ENDPOINT,
+            json=payload,
+            timeout=12,
+            headers={
+                "User-Agent": ua or "Mozilla/5.0",
+                "X-Forwarded-For": ip or "0.0.0.0"
+            }
         )
-        print("[ATC] sent", {"event_id": event_id, "p": score_p, "resp": resp})
-        return resp
+        try:
+            return resp.json()
+        except Exception:
+            return {"status_code": resp.status_code, "text": resp.text}
     except Exception as e:
-        print("[ATC] error", {"event_id": event_id, "p": score_p, "error": str(e)})
         return {"error": str(e)}
 
-def save_user_data(utm: str, data: Dict[str, Any]) -> None:
-    r.setex(f"{USERDATA_KEY_PREFIX}{utm}", USERDATA_TTL_SECONDS, json.dumps(data))
-
-def load_user_data(utm: str) -> Optional[Dict[str, Any]]:
-    raw = r.get(f"{USERDATA_KEY_PREFIX}{utm}")
-    if not raw: return None
-    try: return json.loads(raw)
-    except Exception: return None
-
-def fbc_creation_ts(fbc: Optional[str]) -> Optional[int]:
-    if not fbc: return None
-    try: return int(fbc.split(".")[2])
-    except Exception: return None
-
-# ───────────────────────── Shopee: gerar short link ─────────────────────────
+# ───────────────────────── Shopee: gerar short-link ─────────────────────────
 def generate_short_link(origin_url: str, utm_content: str) -> str:
     payload_obj = {
-        "query": ("mutation{generateShortLink(input:{"
-                  f"originUrl:\"{origin_url}\","
-                  f"subIds:[\"\",\"\",\"{utm_content}\",\"\",\"\"]"
-                  "}){shortLink}}")
+        "query": (
+            "mutation{generateShortLink(input:{"
+            f"originUrl:\"{origin_url}\","
+            f"subIds:[\"\",\"\",\"{utm_content}\",\"\",\"\"]"
+            "}){shortLink}}"
+        )
     }
     payload = json.dumps(payload_obj, separators=(',', ':'), ensure_ascii=False)
     ts = str(int(time.time()))
@@ -355,61 +298,55 @@ def generate_short_link(origin_url: str, utm_content: str) -> str:
     try:
         resp = requests.post(SHOPEE_ENDPOINT, headers=headers, data=payload, timeout=20)
         j = resp.json()
-        # Estrutura robusta (evita KeyError 'data')
         short = (((j or {}).get("data") or {}).get("generateShortLink") or {}).get("shortLink")
         if not short:
             raise ValueError(f"Resposta Shopee sem shortLink: {j}")
         return short
     except Exception as e:
-        print(f"[ShopeeShortLink] ERRO ao gerar shortlink: {e}. Fallback para URL longa.")
-        return origin_url  # fallback
+        print(f"[ShopeeShortLink] ERRO ao gerar shortlink: {e}. Fallback para URL numerada.")
+        return origin_url  # fallback seguro
 
 # ───────────────────────────── Rotas ────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"ok": True, "ts": int(time.time()), "bucket": GCS_BUCKET, "prefix": GCS_PREFIX, "pixel": FB_PIXEL_ID, "video_id": VIDEO_ID}
+    return {"ok": True, "ts": int(time.time()), "bucket": GCS_BUCKET, "prefix": GCS_PREFIX, "video_id": VIDEO_ID}
 
-# Evita capturar raiz e favicon no catch-all
 @app.get("/")
 def root():
-    return HTMLResponse("<!doctype html><title>OK</title><meta name='robots' content='noindex'>", status_code=200)
+    return PlainTextResponse("OK", status_code=200)
 
 @app.get("/favicon.ico")
 def favicon():
     return PlainTextResponse("", status_code=204)
 
-def _is_valid_http_url(u: str) -> bool:
-    try:
-        p = urllib.parse.urlsplit(u)
-        return p.scheme in ("http", "https") and bool(p.netloc)
-    except Exception:
-        return False
-
 @app.get("/{full_path:path}")
 def track_number_and_redirect(
     request: Request,
-    full_path: str = Path(..., description="Short-link direto, ex.: https://s.shopee.com.br/XXXX"),
-    cat: Optional[str] = Query(None, description="Categoria opcional p/ scoring (e logging)"),
+    full_path: str = Path(..., description="Short-link/URL Shopee (ex.: https://s.shopee.com.br/XXXX)"),
+    cat: Optional[str] = Query(None, description="Categoria opcional p/ scoring simples (log)"),
 ):
-    # 1) Normaliza o path: decodifica %3A etc
+    """
+    Recebe short-link Shopee JÁ com UTM, acrescenta numeração no utm_content,
+    gera short-link oficial e redireciona (302). Envia GA4 com IP/UA + UTM (old/new).
+    """
+    # Decodifica %3A etc.
     raw_path = urllib.parse.unquote(full_path or "").strip()
     if not raw_path or raw_path == "favicon.ico":
-        return RedirectResponse("/", status_code=302)
+        return JSONResponse({"ok": False, "error": "missing_url"}, status_code=400)
 
-    # Se o path não começar com http(s), tenta reconstituir a partir de //...
+    # Permite paths iniciando com //...
     if raw_path.startswith("//"):
         raw_path = "https:" + raw_path
     if not _is_valid_http_url(raw_path):
-        # Não processa; evita gerar "?utm_content=..." sem base
-        return JSONResponse({"ok": False, "error": "invalid_or_missing_url", "got": raw_path}, status_code=400)
+        return JSONResponse({"ok": False, "error": "invalid_url", "got": raw_path}, status_code=400)
 
-    s = raw_path  # short-link informado já decodificado
+    incoming_url = raw_path
     ts = int(time.time())
     iso_time = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(ts))
 
     headers = request.headers
     cookie_header = headers.get("cookie") or headers.get("Cookie")
-    referrer = headers.get("referer") or headers.get("referrer") or "-"
+    referrer = headers.get("referer") or headers.get("referrer") or "-";
     user_agent = headers.get("user-agent", "-")
     fbclid = request.query_params.get("fbclid")
 
@@ -418,120 +355,77 @@ def track_number_and_redirect(
         client_host = client_host.split("::ffff:")[-1]
     ip_addr = client_host or headers.get("x-forwarded-for") or "0.0.0.0"
 
+    # FB cookies úteis para atribuição em plataformas (registramos em log/GA também)
     fbp_cookie = get_cookie_value(cookie_header, "_fbp")
     fbc_val    = build_fbc_from_fbclid(fbclid, creation_ts=ts)
 
+    # Device
     device_name, os_family, os_version = parse_device_info(user_agent)
 
-    # 2) Resolve destino e lê UTM original
-    resolved_url, subids_in = resolve_short_link(s)
+    # Resolve o short-link → URL final e coleta subIDs/UTM originais
+    resolved_url, subids_in = resolve_short_link(incoming_url)
     if not _is_valid_http_url(resolved_url):
-        # Em caso de falha na resolução, usa a própria 's'
-        resolved_url = s
-    base_utm = subids_in.get("utm_content") or ""
-    if base_utm is None: base_utm = ""
+        resolved_url = incoming_url
 
-    # 3) Numeração utm_content
+    utm_original = subids_in.get("utm_content") or ""
+    # Numeração sequencial
     seq = incr_counter()
-    utm_numbered = f"{base_utm}{seq}"
+    utm_numbered = f"{utm_original}{seq}"  # acrescenta número mantendo prefixo recebido
+
+    # Substitui SOMENTE o utm_content, preservando ordem e demais parâmetros
     final_with_number = replace_utm_content_only(resolved_url, utm_numbered)
 
-    # 4) Shortlink oficial (robusto) ou fallback
+    # Gera short-link oficial via Shopee (subIds[2] = utm numerada)
     dest = generate_short_link(final_with_number, utm_numbered)
 
-    # 5) Anti-bot + CAPI
-    allowed, reason, cnt = allow_viewcontent(ip_addr, user_agent)
-    vc_time = ts
-    user_data_vc: Dict[str, Any] = {"client_ip_address": ip_addr, "client_user_agent": user_agent}
-    if fbp_cookie: user_data_vc["fbp"] = fbp_cookie
-    if fbc_val:    user_data_vc["fbc"] = fbc_val
+    # Envia ao Google GA4 (Measurement Protocol)
+    ga_params = {
+        "link_url": dest,
+        "event_source_url": final_with_number,
+        "utm_original": utm_original,
+        "utm_numbered": utm_numbered,
+        "category": (cat or ""),
+        "referrer": referrer,
+        "video_id": VIDEO_ID,
+        "fbclid": fbclid or "",
+        "fbp": fbp_cookie or "",
+        "fbc": fbc_val or "",
+    }
+    ga_resp = send_ga4_event("view_content", ip_addr, user_agent, ga_params, event_ts=ts)
 
-    capi_vc_resp: Dict[str, Any] = {"skipped": True, "reason": reason}
-    if allowed:
-        try:
-            capi_vc_resp = send_fb_event("ViewContent", utm_numbered, final_with_number, user_data_vc, {"content_type": "product"}, vc_time)
-        except Exception as e:
-            capi_vc_resp = {"error": str(e)}
+    # Cache mínimo p/ possíveis compras (chaveada por UTM numerada)
+    r.setex(f"{USERDATA_KEY_PREFIX}{utm_numbered}", USERDATA_TTL_SECONDS, json.dumps({
+        "ip": ip_addr, "ua": user_agent, "referrer": referrer,
+        "event_source_url": final_with_number, "short_link": dest,
+        "vc_time": ts, "utm_original": utm_original, "utm_numbered": utm_numbered,
+        "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_val
+    }))
 
-    # 6) Scoring e ATC condicional
-    try:
-        hour_now = time.localtime(vc_time).tm_hour
-        atc_p = score_click_prob(hour_now, cat)
-        atc_resp = maybe_send_add_to_cart(utm_numbered, final_with_number, user_data_vc, None, cat, atc_p)
-    except Exception as e:
-        atc_p = None
-        atc_resp = {"error": str(e)}
-
-    # 7) Cache para futuras compras
-    save_user_data(utm_numbered, {
-        "user_data": user_data_vc, "event_source_url": final_with_number, "vc_time": vc_time,
-        "allowed_vc": allowed, "reason": reason, "count_in_window": cnt,
-        "atc_prob": atc_p, "atc_resp": atc_resp
-    })
-
-    # 8) Log seguro (evita favicon/raiz)
+    # Log CSV → GCS
     csv_row = [
         ts, iso_time, ip_addr, user_agent, device_name, os_family, os_version, referrer,
-        s, final_with_number, base_utm, (cat or ""),
-        utm_numbered,
+        incoming_url, resolved_url, final_with_number, (cat or ""),
+        utm_original, utm_numbered,
         subids_in.get("sub_id1") or "", subids_in.get("sub_id2") or "",
-        utm_numbered,
-        subids_in.get("sub_id4") or "", subids_in.get("sub_id5") or "",
+        subids_in.get("sub_id3") or "", subids_in.get("sub_id4") or "", subids_in.get("sub_id5") or "",
         (fbclid or ""), (fbp_cookie or ""), (fbc_val or "")
     ]
-    print("Novo clique registrado:", {
-        "timestamp": ts, "iso_time": iso_time, "ip": ip_addr, "user_agent": user_agent,
-        "device_name": device_name, "os_family": os_family, "os_version": os_version, "referrer": referrer,
-        "short_link": s, "resolved_url": resolved_url, "final_url": final_with_number, "dest": dest,
-        "category": cat or "", "original_utm": base_utm, "utm_numbered": utm_numbered, "seq": seq,
-        "fbclid": fbclid or "", "fbp": fbp_cookie or "", "fbc": fbc_val or "",
-        "allowed": allowed, "reason": reason, "cnt": cnt, "atc_p": atc_p,
-        "vc_resp": capi_vc_resp
+    print("Novo clique:", {
+        "timestamp": ts, "iso_time": iso_time, "ip": ip_addr, "ua": user_agent[:160],
+        "device": {"name": device_name, "os": os_family, "os_ver": os_version},
+        "ref": referrer, "in": incoming_url, "resolved": resolved_url, "final": final_with_number,
+        "dest": dest, "utm_original": utm_original, "utm_numbered": utm_numbered, "seq": seq,
+        "ga4": ga_resp
     }, flush=True)
 
     with _buffer_lock:
         _buffer_rows.append(csv_row)
     _flush_buffer_to_gcs(force=False)
 
-    if (not allowed) and EMIT_INTERNAL_BLOCK_LOG:
-        print("[BLOCKED_VC]", json.dumps({"utm": utm_numbered, "ip": ip_addr, "ua": user_agent, "reason": reason, "cnt": cnt}, ensure_ascii=False))
+    # Redireciona para o short-link oficial (comportamento do primeiro código)
+    return RedirectResponse(dest, status_code=302)
 
-    # 9) DEEP LINK – HTML para forçar abrir o app
-    quoted_final = urllib.parse.quote(final_with_number, safe=":/?&=%+-_.~")
-    quoted_dest  = urllib.parse.quote(dest,               safe=":/?&=%+-_.~")
-    android_intent = (
-        f"intent://open?url={quoted_final}"
-        f"#Intent;scheme=shopee;package=com.shopee.br;"
-        f"S.browser_fallback_url={quoted_dest};end"
-    )
-    ios_scheme = f"shopee://open?url={quoted_final}"
-
-    html = f"""<!doctype html>
-<html lang="pt-br"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Abrindo Shopee…</title>
-<script>
-(function(){{
-  var ua=navigator.userAgent||"", A=/Android/i.test(ua), I=/(iPhone|iPad|iPod)/i.test(ua);
-  var intent={json.dumps(android_intent)}, ios={json.dumps(ios_scheme)}, fb={json.dumps(dest)};
-  function go(){{
-    if(A){{ location.href=intent; setTimeout(function(){{location.href=fb;}},800); }}
-    else if(I){{ var t=Date.now(); location.href=ios;
-      setTimeout(function(){{ if(Date.now()-t<1600) location.href=fb; }},700); }}
-    else{{ location.href=fb; }}
-  }}
-  window.addEventListener("load", function(){{ setTimeout(go, 50); }});
-}})();
-</script>
-<style>body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:24px}}</style>
-</head><body>
-<h2>Abrindo no app da Shopee…</h2>
-<p>Se nada acontecer:</p>
-<p><a href="{ios_scheme}">Abrir no app (iOS)</a> · <a href="{android_intent}">Abrir no app (Android)</a> · <a href="{dest}">Abrir no navegador</a></p>
-</body></html>"""
-    return HTMLResponse(content=html, status_code=200)
-
-# Força flush
+# Força flush manual
 @app.get("/admin/flush")
 def admin_flush(token: str):
     if token != ADMIN_TOKEN:
@@ -539,62 +433,16 @@ def admin_flush(token: str):
     sent = _flush_buffer_to_gcs(force=True)
     return {"ok": True, "sent_rows": sent}
 
-# Upload CSV → Purchase
+# Upload CSV (opcional, se você usar depois para conciliar compras)
 @app.post("/upload_csv")
 async def upload_csv(file: UploadFile = File(...)):
     content = await file.read()
     text = content.decode("utf-8", errors="replace").splitlines()
     reader = csv.DictReader(text)
     processed: List[Dict[str, Any]] = []
-    now_ts = int(time.time())
-    min_allowed = now_ts - MAX_DELAY_SECONDS
-
-    def normalize_utm(u: Optional[str]) -> Optional[str]:
-        return u if u else None
-
     for row in reader:
-        raw_utm = (row.get("utm_content") or row.get("utm") or
-                   row.get("sub_id3") or row.get("subid3") or row.get("sub_id_3") or
-                   row.get("Sub_id3") or row.get("SUBID3"))
-        utm = normalize_utm(raw_utm)
-        if not utm:
-            processed.append({"row": row, "status": "skipped_no_utm"})
-            continue
-
-        valor_raw  = row.get("value") or row.get("valor") or row.get("price") or row.get("amount")
-        vendas_raw = row.get("num_purchases") or row.get("vendas") or row.get("quantity") or row.get("qty") or row.get("purchases")
-        try: valor = float(str(valor_raw).replace(",", ".")) if valor_raw not in (None, "") else 0.0
-        except Exception: valor = 0.0
-        try: vendas = int(float(vendas_raw)) if vendas_raw not in (None, "") else 1
-        except Exception: vendas = 1
-
-        cache = load_user_data(utm)
-        if not cache or not cache.get("user_data"):
-            processed.append({"utm_content": raw_utm, "utm_norm": utm, "status": "skipped_no_user_data"})
-            continue
-
-        user_data_purchase = cache["user_data"]
-        event_source_url   = cache.get("event_source_url") or ""
-        vc_time            = cache.get("vc_time")
-        event_time = int(vc_time) if isinstance(vc_time, int) else now_ts
-
-        if event_time > now_ts: event_time = now_ts
-        if event_time < min_allowed: event_time = min_allowed
-        click_ts = fbc_creation_ts(user_data_purchase.get("fbc"))
-        if click_ts and event_time < click_ts: event_time = click_ts + 1
-
-        if cache.get("allowed_vc") is False:
-            processed.append({"utm_content": raw_utm, "utm_norm": utm, "status": "skipped_blocked_vc"})
-            continue
-
-        custom_data_purchase = {"currency": "BRL", "value": valor, "num_purchases": vendas}
-        try:
-            resp = send_fb_event("Purchase", utm, event_source_url or "https://shopee.com.br", user_data_purchase, custom_data_purchase, event_time)
-            processed.append({"utm_content": raw_utm, "utm_norm": utm, "status": "sent", "capi": resp})
-        except Exception as e:
-            processed.append({"utm_content": raw_utm, "utm_norm": utm, "status": "error", "error": str(e)})
-
-    return JSONResponse({"processed": processed})
+        processed.append(row)
+    return JSONResponse({"rows": processed})
 
 # Flush final ao encerrar
 @atexit.register
