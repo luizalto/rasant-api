@@ -2,6 +2,6 @@ fastapi
 requests
 python-dotenv
 python-multipart
-uvicorn[standard]
+uvicorn
 google-cloud-storage
 
