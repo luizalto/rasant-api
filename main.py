@@ -19,7 +19,7 @@ from contextlib import suppress
 import requests
 import redis
 from fastapi import FastAPI, Request, Path, Query
-from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import RedirectResponse, PlainTextResponse, Response
 
 # =============================================================================
 #                              CONFIG / ENVs
@@ -46,7 +46,6 @@ SHOPEE_SHORTLINK_ENABLED = os.getenv("SHOPEE_SHORTLINK_ENABLED", "true").lower()
 GCS_BUCKET_NAME        = (os.getenv("GCS_BUCKET_NAME", "").strip()
                           or os.getenv("GCS_BUCKET", "").strip())
 GCS_PREFIX             = os.getenv("GCS_PREFIX", "logs").strip()
-# Caminho do JSON da Service Account (opcional). Se não setar, usa ADC padrão do ambiente.
 GCS_SA_KEY_FILE        = os.getenv("GCS_SA_KEY_FILE", "").strip() or os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
 
 # 4) Flush (aceita ambos nomes)
@@ -63,7 +62,7 @@ EXPAND_TIMEOUT_SEC     = float(os.getenv("EXPAND_TIMEOUT_SEC", "6.0"))
 _redis_client: Optional[redis.Redis] = None
 _redis_lock = threading.Lock()
 
-# Fallback em memória para contador
+# Fallback em memória para contador (último recurso)
 _mem_lock = threading.Lock()
 _mem_counter = 0
 
@@ -144,7 +143,12 @@ def _get_redis() -> Optional[redis.Redis]:
         return _redis_client
 
 def _incr_counter() -> int:
-    """Tenta Redis; se falhar, usa SQLite; por fim, memória."""
+    """
+    Contador **infinito**:
+      - Tenta Redis (INCR) → não zera em restart/deploy.
+      - Se Redis indisponível, usa SQLite (persiste no filesystem do container).
+      - Se tudo falhar, usa memória (último recurso).
+    """
     rcli = _get_redis()
     if rcli is not None:
         with suppress(Exception):
@@ -243,97 +247,33 @@ def _expand_shortlink(url: str) -> str:
     except Exception:
         return url
 
-def _replace_or_append_utm_content_preserving_order(original_url: str, utm_value: str) -> str:
+def _append_n_to_all_utms(original_url: str, suffix: str) -> str:
     """
-    Modifica APENAS o valor de utm_content preservando a ordem dos demais parâmetros.
-    Se não existir utm_content, adiciona no FINAL da query string.
+    Acrescenta 'suffix' (ex.: 'n123') ao final de **todas** as UTMs existentes.
+    - Se NÃO houver nenhuma UTM, cria utm_content=suffix.
+    - Preserva ordem dos parâmetros e não reescreve UTMs.
+    - Evita duplicar o mesmo sufixo se já estiver presente no valor.
     """
     parsed = urllib.parse.urlsplit(original_url)
-    query = parsed.query
+    q = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
 
-    if not query:
-        new_query = f"utm_content={utm_value}"
+    utm_keys = [k for k in q.keys() if k.lower().startswith("utm_")]
+    if utm_keys:
+        for k in utm_keys:
+            vals = q.get(k, [])
+            new_vals = []
+            for v in vals:
+                v = v or ""
+                if not v.endswith(suffix):
+                    new_vals.append(v + suffix)
+                else:
+                    new_vals.append(v)
+            q[k] = new_vals
     else:
-        pattern = re.compile(r'(^|&)(utm_content=)([^&]*)')
-        if pattern.search(query):
-            new_query = pattern.sub(lambda m: f"{m.group(1)}{m.group(2)}{utm_value}", query, count=1)
-        else:
-            sep = '&' if query and not query.endswith('&') else ''
-            new_query = f"{query}{sep}utm_content={utm_value}"
+        q["utm_content"] = [suffix]
 
+    new_query = urllib.parse.urlencode(q, doseq=True)
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
-
-def _generate_shopee_shortlink(origin_url: str, utm_content: str) -> str:
-    """
-    Gera shortlink via GraphQL, deixando subId3 = utm_content.
-    Retorna o shortlink. Lança exceção se não houver shortLink.
-    """
-    payload_obj = {
-        "query": (
-            "mutation{generateShortLink(input:{"
-            f"originUrl:\"{origin_url}\","
-            f"subIds:[\"\",\"\",\"{utm_content}\",\"\",\"\"]"
-            "}){shortLink}}"
-        )
-    }
-    payload = json.dumps(payload_obj, separators=(',', ':'), ensure_ascii=False)
-    ts = str(int(time.time()))
-    signature = hashlib.sha256((SHOPEE_APP_ID + ts + payload + SHOPEE_APP_SECRET).encode("utf-8")).hexdigest()
-    headers = {
-        "Authorization": f"SHA256 Credential={SHOPEE_APP_ID}, Timestamp={ts}, Signature={signature}",
-        "Content-Type": "application/json",
-    }
-    resp = requests.post(SHOPEE_ENDPOINT, headers=headers, data=payload, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-
-    if "errors" in data and data["errors"]:
-        raise RuntimeError(f"GraphQL errors: {data['errors']}")
-    d = data.get("data") or {}
-    gl = d.get("generateShortLink") or {}
-    short = gl.get("shortLink")
-    if not short:
-        raise KeyError("Campo 'data.generateShortLink.shortLink' ausente")
-    return short
-
-def _flush_if_needed(force: bool = False) -> Optional[str]:
-    """Sobe o buffer como CSV para o GCS quando atingir N linhas ou X segundos."""
-    global _click_buffer, _last_flush_ts
-    if not GCS_BUCKET_NAME:
-        return None  # logging desativado
-
-    bucket = _get_gcs_bucket()
-    if bucket is None:
-        return None
-
-    do_flush = force or (len(_click_buffer) >= FLUSH_EVERY_N) or (time.time() - _last_flush_ts >= FLUSH_EVERY_SECONDS)
-    if not do_flush or not _click_buffer:
-        return None
-
-    date_str = _date_str()
-    part_id = (str(uuid.uuid4()).replace("-", "")[:7] + str(int(time.time()))[-4:])
-    object_name = f"{GCS_PREFIX}/date={date_str}/clicks_{date_str}_part-{part_id}.csv"
-
-    buf = io.StringIO()
-    fieldnames = list(_click_buffer[0].keys())
-    writer = csv.DictWriter(buf, fieldnames=fieldnames, lineterminator="\n")
-    writer.writeheader()
-    for row in _click_buffer:
-        writer.writerow(row)
-    data_csv = buf.getvalue()
-
-    blob = bucket.blob(object_name)
-    blob.upload_from_string(data_csv, content_type="text/csv")
-
-    count = len(_click_buffer)
-    _click_buffer = []
-    _last_flush_ts = time.time()
-    print(f"[FLUSH] {count} linha(s) → gs://{GCS_BUCKET_NAME}/{object_name}")
-    return object_name
-
-def _add_log_row(row: Dict[str, Any]):
-    _click_buffer.append(row)
-    _flush_if_needed(force=False)
 
 # =============================================================================
 #                              FASTAPI
@@ -380,8 +320,9 @@ def redirect_with_dynamic_utm(
     Fluxo:
       1) Recebe path tipo: /https://s.shopee.com.br/abc123?utm_x=...
       2) Expande shortlink → URL final do produto (mantém query original)
-      3) Gera sufixo n{contador} e substitui APENAS utm_content (se não existir, adiciona no fim)
-      4) (Opcional) Gera shortlink novo via GraphQL usando subId3 = utm_content
+      3) Gera sufixo n{contador} e ACRESCENTA esse sufixo a TODAS as UTMs existentes
+         (não remove nada; se não houver UTM, cria utm_content=sufixo)
+      4) (Opcional) Gera shortlink novo via GraphQL usando subId3 = utm_content (inalterado + sufixo)
       5) Loga clique e redireciona 302
     """
     # Reconstrói URL original (quando vem percent-encoded no path)
@@ -393,25 +334,25 @@ def redirect_with_dynamic_utm(
     # 1) Expandir shortlink para final_url
     expanded = _expand_shortlink(origin_short)
 
-    # 2) Gerar contador e utm_content
+    # 2) Contador infinito (Redis INCR)
     n = _incr_counter()
-    utm_value = f"n{n}"
+    suffix = f"n{n}"
 
-    # 3) Substituir só utm_content (preservando ordem/estrutura). NÃO reordena outros parâmetros.
-    final_with_utm = _replace_or_append_utm_content_preserving_order(expanded, utm_value)
+    # 3) Acrescenta sufixo n{n} a TODAS as UTMs, sem remover valores existentes
+    final_with_n = _append_n_to_all_utms(expanded, suffix)
 
-    # Extrai utm_content final
-    parsed_q = urllib.parse.urlsplit(final_with_utm).query
-    m = re.search(r'(?:^|&)utm_content=([^&]*)', parsed_q)
-    utm_content_final = m.group(1) if m else utm_value
+    # Extrai utm_content final (pode ter sido criada agora)
+    parsed = urllib.parse.urlsplit(final_with_n)
+    q = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    utm_content_final = (q.get("utm_content", [suffix]) or [suffix])[0]
 
-    # 4) (Opcional) Gerar shortlink via GraphQL
-    new_location = final_with_utm
+    # 4) (Opcional) Gera shortlink via GraphQL
+    new_location = final_with_n
     if SHOPEE_SHORTLINK_ENABLED and SHOPEE_APP_ID and SHOPEE_APP_SECRET:
         try:
-            new_location = _generate_shopee_shortlink(final_with_utm, utm_content_final)
+            new_location = _generate_shopee_shortlink(final_with_n, utm_content_final)
         except Exception as e:
-            print(f"[ShopeeShortLink] ERRO ao gerar shortlink: {e}. Fallback para final_with_utm.")
+            print(f"[ShopeeShortLink] ERRO ao gerar shortlink: {e}. Fallback para final_with_n.")
 
     # 5) Log
     try:
@@ -420,7 +361,7 @@ def redirect_with_dynamic_utm(
         ip = _safe_get_ip(request)
         ref = request.headers.get("referer") or request.headers.get("Referer") or "-"
 
-        q_all = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(final_with_utm).query, keep_blank_values=True))
+        q_all = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(final_with_n).query, keep_blank_values=True))
 
         row = {
             "timestamp": _now_ts(),
@@ -432,7 +373,7 @@ def redirect_with_dynamic_utm(
             "os_version": os_version,
             "referrer": ref or "-",
             "short_link": origin_short,
-            "final_url": final_with_utm,
+            "final_url": final_with_n,
             "redirect_to": new_location,
             "categoria": cat or "",
             # UTMs
@@ -447,7 +388,6 @@ def redirect_with_dynamic_utm(
             "sub_id3": q_all.get("sub_id3", ""),
             "sub_id4": q_all.get("sub_id4", ""),
             "sub_id5": q_all.get("sub_id5", ""),
-            # Facebook param (se vier)
             "fbclid": q_all.get("fbclid", ""),
         }
         _add_log_row(row)
