@@ -1,33 +1,33 @@
 # -*- coding: utf-8 -*-
 """
-Servidor FastAPI para LOG de cliques:
-- URL de uso (sem codificar o short-link):
-    https://seu-app.onrender.com/https://s.shopee.com.br/XXXX?cat=beleza
-- Resolve o short-link, extrai UTM/SubIDs (se houver),
-  coleta dados do dispositivo/IP/headers,
-  bufferiza e envia CSVs em lote ao Google Cloud Storage (GCS).
+FastAPI - Logger de cliques → CSV no Google Cloud Storage (GCS)
 
-Env vars principais:
-  - GOOGLE_APPLICATION_CREDENTIALS=/app/service_account.json   (ou use GOOGLE_APPLICATION_CREDENTIALS_JSON)
-  - GCS_BUCKET=utm-click-logs
-  - (opcionais) GCS_PREFIX=logs/ | FLUSH_MAX_ROWS=500 | FLUSH_MAX_SECONDS=30 | HTTP_TIMEOUT=12 | ADMIN_TOKEN=12345678
+Uso SEM codificar o short-link:
+  https://SEU-APP.onrender.com/https://s.shopee.com.br/XXXX?cat=beleza
 
-Start (Render): uvicorn mem:app --host 0.0.0.0 --port $PORT
+Env vars (Render):
+  GOOGLE_APPLICATION_CREDENTIALS=/etc/secrets/service_account.json  (Secret File)
+  ou GOOGLE_APPLICATION_CREDENTIALS_JSON=<conteúdo do JSON>         (alternativa)
+  GCS_BUCKET=utm-click-logs
+  (opcionais) GCS_PREFIX=logs/ | FLUSH_MAX_ROWS=500 | FLUSH_MAX_SECONDS=30
+  (opcionais) HTTP_TIMEOUT=12 | ADMIN_TOKEN=troque_isto
 """
 
-import os, re, time, csv, io, threading, urllib.parse
+import os, re, time, csv, io, threading, urllib.parse, atexit
 from typing import Optional, Dict, Tuple, List
 
 import requests
 from fastapi import FastAPI, Request, Query, Path
 from fastapi.responses import RedirectResponse, JSONResponse
 
-# ── Autenticação GCP: Secret File OU variável com JSON ───────────────────────
+# ─────────────────────────── Credenciais GCP ────────────────────────────────
 def _bootstrap_gcp_credentials():
-    # 1) Se GOOGLE_APPLICATION_CREDENTIALS já aponta para um arquivo, usa.
+    """
+    1) Se GOOGLE_APPLICATION_CREDENTIALS estiver setado (ex.: /etc/secrets/service_account.json) → ok.
+    2) Senão, se GOOGLE_APPLICATION_CREDENTIALS_JSON existir → grava em /tmp/gcp.json e seta a env.
+    """
     if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
         return
-    # 2) Senão, se GOOGLE_APPLICATION_CREDENTIALS_JSON existir, escreve em /tmp/gcp.json.
     raw_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
     if raw_json:
         path = "/tmp/gcp.json"
@@ -36,9 +36,9 @@ def _bootstrap_gcp_credentials():
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
 
 _bootstrap_gcp_credentials()
-from google.cloud import storage  # importa após preparar as credenciais
+from google.cloud import storage  # importar após preparar as credenciais
 
-# ── Configurações ────────────────────────────────────────────────────────────
+# ───────────────────────────── Configuração ─────────────────────────────────
 DEFAULT_TIMEOUT   = float(os.getenv("HTTP_TIMEOUT", "12"))
 GCS_BUCKET        = os.getenv("GCS_BUCKET")                    # obrigatório
 GCS_PREFIX        = os.getenv("GCS_PREFIX", "logs/")           # opcional
@@ -46,7 +46,7 @@ FLUSH_MAX_ROWS    = int(os.getenv("FLUSH_MAX_ROWS", "500"))
 FLUSH_MAX_SECONDS = int(os.getenv("FLUSH_MAX_SECONDS", "30"))
 ADMIN_TOKEN       = os.getenv("ADMIN_TOKEN", "12345678")
 
-# ── App / GCS ────────────────────────────────────────────────────────────────
+# ───────────────────────────── App / GCS ────────────────────────────────────
 app = FastAPI(title="Click Logger → GCS (CSV em lotes)")
 
 _gcs_client: Optional[storage.Client] = None
@@ -55,7 +55,7 @@ if GCS_BUCKET:
     _gcs_client = storage.Client()
     _bucket = _gcs_client.bucket(GCS_BUCKET)
 
-# ── Buffer em memória (thread-safe) ──────────────────────────────────────────
+# ───────────────────────── Buffer em memória (thread-safe) ──────────────────
 _buffer_lock = threading.Lock()
 _buffer_rows: List[List[str]] = []
 _last_flush_ts = time.time()
@@ -67,7 +67,7 @@ CSV_HEADERS = [
     "fbclid","fbp","fbc"
 ]
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ───────────────────────────── Helpers ──────────────────────────────────────
 def parse_subids_from_query(qs: str) -> Dict[str, Optional[str]]:
     out = {"utm_content": None, "sub_id1": None, "sub_id2": None, "sub_id3": None, "sub_id4": None, "sub_id5": None}
     if not qs: return out
@@ -76,16 +76,19 @@ def parse_subids_from_query(qs: str) -> Dict[str, Optional[str]]:
     if "utm_content" in q and q["utm_content"]:
         out["utm_content"] = q["utm_content"][0]
 
+    # subIds[indexados]
     for i in range(5):
         key_idx = f"subIds[{i}]"
         if key_idx in q and q[key_idx]:
             out[f"sub_id{i+1}"] = q[key_idx][0]
 
+    # múltiplos subIds sem índice
     if "subIds" in q:
         vals = q["subIds"]
         for i in range(min(5, len(vals))):
             out[f"sub_id{i+1}"] = out[f"sub_id{i+1}"] or vals[i]
 
+    # apelidos comuns
     aliases = {
         "sub_id1":"sub_id1","subid1":"sub_id1","Sub_id1":"sub_id1",
         "sub_id2":"sub_id2","subid2":"sub_id2","Sub_id2":"sub_id2",
@@ -162,7 +165,7 @@ def _gcs_object_name(ts: int, part: int) -> str:
     return f"{GCS_PREFIX}date={d}/clicks_{d}_part-{part:04d}.csv"
 
 def _flush_buffer_to_gcs(force: bool = False) -> int:
-    """Envia o buffer pro GCS se bater limite de linhas/tempo ou se force=True."""
+    """Envia o buffer ao GCS se bater limite de linhas/tempo ou se force=True."""
     global _buffer_rows, _last_flush_ts
     if not _bucket:
         return 0
@@ -186,7 +189,7 @@ def _flush_buffer_to_gcs(force: bool = False) -> int:
     _bucket.blob(blob_name).upload_from_string(data, content_type="text/csv")
     return len(rows)
 
-# ── Rotas ────────────────────────────────────────────────────────────────────
+# ───────────────────────────── Rotas ────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"ok": True, "ts": int(time.time()), "bucket": GCS_BUCKET, "prefix": GCS_PREFIX}
@@ -254,7 +257,6 @@ def admin_flush(token: str):
     return {"ok": True, "sent_rows": sent}
 
 # Flush final ao encerrar (melhor esforço)
-import atexit
 @atexit.register
 def _flush_on_exit():
     try:
