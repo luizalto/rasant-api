@@ -1,15 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 FastAPI – Shopee ShortLink com UTM numerada + Logs em GCS + Redis + Google GA4 (Measurement Protocol)
-
-Fluxo:
-1) Recebe short-link/URL da Shopee JÁ com UTM no path (catch-all).
-2) Resolve até a URL final, lê o utm_content ORIGINAL.
-3) Acrescenta numeração sequencial ao utm_content (mantém ordem e demais parâmetros).
-4) Gera short-link OFICIAL da Shopee (API GraphQL) com subIds[2] = UTM numerada (fallback para URL longa).
-5) Envia evento ao Google GA4 (Measurement Protocol) com IP, UA, UTM original e numerada.
-6) Salva user_data no Redis e loga CSV no GCS.
-7) Redireciona (302) para o short-link gerado.
+Processo:
+- Recebe short/URL Shopee já com UTM → resolve para URL longa
+- Acrescenta numeração em utm_content (mantém demais params)
+- Gera short-link oficial (Shopee GraphQL); para a API usamos subIds[2] SANITIZADO
+- Envia GA4 com IP/UA + UTM original e numerada (sem sanitizar)
+- Salva cache/CSV e redireciona 302 para o short oficial
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json
@@ -20,7 +17,7 @@ import redis
 from fastapi import FastAPI, Request, Query, Path, UploadFile, File
 from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse
 
-# ─────────────────────────── Credenciais GCP ────────────────────────────────
+# ─────────── GCP credenciais (opcional para GCS) ───────────
 def _bootstrap_gcp_credentials():
     if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
         return
@@ -32,9 +29,9 @@ def _bootstrap_gcp_credentials():
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
 
 _bootstrap_gcp_credentials()
-from google.cloud import storage  # importa após preparar credenciais
+from google.cloud import storage  # importa após credenciais
 
-# ───────────────────────────── Configuração ─────────────────────────────────
+# ─────────── Config ───────────
 DEFAULT_TIMEOUT   = float(os.getenv("HTTP_TIMEOUT", "12"))
 
 # GCS
@@ -58,33 +55,29 @@ MAX_CLICKS_PER_FP    = int(os.getenv("MAX_CLICKS_PER_FP", "2"))
 FINGERPRINT_PREFIX   = os.getenv("FINGERPRINT_PREFIX", "fp:")
 EMIT_INTERNAL_BLOCK_LOG = str(os.getenv("EMIT_INTERNAL_BLOCK_LOG", "true")).lower() == "true"
 
-# Apenas para informar a versão do criativo no log
-VIDEO_ID             = os.getenv("VIDEO_ID", "v15")
+VIDEO_ID = os.getenv("VIDEO_ID", "v15")
 
 # Shopee Affiliate
 SHOPEE_APP_ID     = os.getenv("SHOPEE_APP_ID", "18314810331")
 SHOPEE_APP_SECRET = os.getenv("SHOPEE_APP_SECRET", "LO3QSEG45TYP4NYQBRXLA2YYUL3ZCUPN")
 SHOPEE_ENDPOINT   = "https://open-api.affiliate.shopee.com.br/graphql"
 
-# Google Analytics 4 (Measurement Protocol)
+# GA4 Measurement Protocol
 GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID")  # p.ex. G-XXXXXXX
 GA4_API_SECRET     = os.getenv("GA4_API_SECRET")
 GA4_ENDPOINT       = f"https://www.google-analytics.com/mp/collect?measurement_id={GA4_MEASUREMENT_ID}&api_secret={GA4_API_SECRET}" if (GA4_MEASUREMENT_ID and GA4_API_SECRET) else None
 
-# ───────────────────────────── App / Clients ────────────────────────────────
+# ─────────── App / Clients ───────────
 app = FastAPI(title="Shopee UTM Numbered → ShortLink + GCS + Redis + GA4")
-
-# Redis
 r = redis.from_url(REDIS_URL)
 
-# GCS
 _gcs_client: Optional[storage.Client] = None
 _bucket: Optional[storage.Bucket] = None
 if GCS_BUCKET:
     _gcs_client = storage.Client()
     _bucket = _gcs_client.bucket(GCS_BUCKET)
 
-# ───────────────────────── Buffer em memória (thread-safe) ──────────────────
+# ─────────── Buffer CSV ───────────
 _buffer_lock = threading.Lock()
 _buffer_rows: List[List[str]] = []
 _last_flush_ts = time.time()
@@ -97,19 +90,17 @@ CSV_HEADERS = [
     "fbclid","fbp","fbc"
 ]
 
-# ───────────────────────────── Helpers gerais ───────────────────────────────
+# ─────────── Helpers ───────────
 def incr_counter() -> int:
     return int(r.incr(COUNTER_KEY))
 
 def get_cookie_value(cookie_header: Optional[str], name: str) -> Optional[str]:
-    if not cookie_header:
-        return None
+    if not cookie_header: return None
     try:
         for it in [c.strip() for c in cookie_header.split(";")]:
             if it.startswith(name + "="):
                 return it.split("=", 1)[1]
-    except Exception:
-        pass
+    except Exception: pass
     return None
 
 def build_fbc_from_fbclid(fbclid: Optional[str], creation_ts: Optional[int] = None) -> Optional[str]:
@@ -137,20 +128,15 @@ def parse_subids_from_query(qs: str) -> Dict[str, Optional[str]]:
     out = {"utm_content": None, "sub_id1": None, "sub_id2": None, "sub_id3": None, "sub_id4": None, "sub_id5": None}
     if not qs: return out
     q = urllib.parse.parse_qs(qs, keep_blank_values=True)
-
-    if "utm_content" in q and q["utm_content"]:
-        out["utm_content"] = q["utm_content"][0]
-
+    if "utm_content" in q and q["utm_content"]: out["utm_content"] = q["utm_content"][0]
     for i in range(5):
         key_idx = f"subIds[{i}]"
         if key_idx in q and q[key_idx]:
             out[f"sub_id{i+1}"] = q[key_idx][0]
-
     if "subIds" in q:
         vals = q["subIds"]
         for i in range(min(5, len(vals))):
             out[f"sub_id{i+1}"] = out[f"sub_id{i+1}"] or vals[i]
-
     aliases = {
         "sub_id1":"sub_id1","subid1":"sub_id1","Sub_id1":"sub_id1",
         "sub_id2":"sub_id2","subid2":"sub_id2","Sub_id2":"sub_id2",
@@ -161,7 +147,6 @@ def parse_subids_from_query(qs: str) -> Dict[str, Optional[str]]:
     for src, dst in aliases.items():
         if src in q and q[src] and not out[dst]:
             out[dst] = q[src][0]
-
     if not out["utm_content"] and out["sub_id3"]:
         out["utm_content"] = out["sub_id3"]
     return out
@@ -197,7 +182,6 @@ def resolve_short_link(short_url: str, max_hops: int = 6) -> Tuple[str, Dict[str
             break
     except Exception:
         final_url = short_url
-
     parsed = urllib.parse.urlsplit(final_url)
     subids = parse_subids_from_query(parsed.query)
     return final_url, subids
@@ -221,7 +205,6 @@ def _flush_buffer_to_gcs(force: bool = False) -> int:
     if not _bucket:
         print("[WARN] GCS_BUCKET não configurado; pulando flush.")
         return 0
-
     with _buffer_lock:
         rows = list(_buffer_rows)
         need = (force or len(rows) >= FLUSH_MAX_ROWS or (time.time() - _last_flush_ts) >= FLUSH_MAX_SECONDS)
@@ -229,23 +212,19 @@ def _flush_buffer_to_gcs(force: bool = False) -> int:
             return 0
         _buffer_rows = []
         _last_flush_ts = time.time()
-
     output = io.StringIO()
     w = csv.writer(output)
     w.writerow(CSV_HEADERS)
     w.writerows(rows)
     data = output.getvalue().encode("utf-8")
-
     part = int(time.time() * 1000) % 10_000_000
     blob_name = _gcs_object_name(int(time.time()), part)
     _bucket.blob(blob_name).upload_from_string(data, content_type="text/csv")
-
     print(f"[FLUSH] {len(rows)} linha(s) → gs://{GCS_BUCKET}/{blob_name}")
     return len(rows)
 
-# ─────────────────────── Google Analytics 4 (MP) ────────────────────────────
+# ─────────── GA4 (Measurement Protocol) ───────────
 def _ga4_client_id(ip: str, ua: str) -> str:
-    # client_id determinístico a partir de IP + UA (apenas para vincular sessões de forma simples)
     return hashlib.sha256(f"{ip}|{ua}".encode("utf-8")).hexdigest()[:32]
 
 def send_ga4_event(name: str, ip: str, ua: str, params: Dict[str, Any], event_ts: Optional[int] = None) -> Dict[str, Any]:
@@ -257,10 +236,7 @@ def send_ga4_event(name: str, ip: str, ua: str, params: Dict[str, Any], event_ts
         "timestamp_micros": int((event_ts or int(time.time())) * 1_000_000),
         "events": [{
             "name": name,
-            "params": {
-                **params,
-                "engagement_time_msec": "1"
-            }
+            "params": {**params, "engagement_time_msec": "1"}
         }]
     }
     try:
@@ -268,25 +244,29 @@ def send_ga4_event(name: str, ip: str, ua: str, params: Dict[str, Any], event_ts
             GA4_ENDPOINT,
             json=payload,
             timeout=12,
-            headers={
-                "User-Agent": ua or "Mozilla/5.0",
-                "X-Forwarded-For": ip or "0.0.0.0"
-            }
+            headers={"User-Agent": ua or "Mozilla/5.0", "X-Forwarded-For": ip or "0.0.0.0"}
         )
-        try:
-            return resp.json()
-        except Exception:
-            return {"status_code": resp.status_code, "text": resp.text}
+        try: return resp.json()
+        except Exception: return {"status_code": resp.status_code, "text": resp.text}
     except Exception as e:
         return {"error": str(e)}
 
-# ───────────────────────── Shopee: gerar short-link ─────────────────────────
-def generate_short_link(origin_url: str, utm_content: str) -> str:
+# ─────────── Sanitização para Shopee subIds ───────────
+_SUBID_MAXLEN = int(os.getenv("SHOPEE_SUBID_MAXLEN", "50"))
+_SUBID_REGEX  = re.compile(r"[^A-Za-z0-9_\-]")  # conservador: letras, números, _ e -
+def sanitize_subid_for_shopee(utm_value: str) -> str:
+    if not utm_value: return "na"
+    cleaned = _SUBID_REGEX.sub("", utm_value)
+    cleaned = cleaned[:_SUBID_MAXLEN] if cleaned else "na"
+    return cleaned
+
+# ─────────── Shopee: gerar short-link ───────────
+def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
     payload_obj = {
         "query": (
             "mutation{generateShortLink(input:{"
             f"originUrl:\"{origin_url}\","
-            f"subIds:[\"\",\"\",\"{utm_content}\",\"\",\"\"]"
+            f"subIds:[\"\",\"\",\"{utm_content_for_api}\",\"\",\"\"]"
             "}){shortLink}}"
         )
     }
@@ -304,9 +284,9 @@ def generate_short_link(origin_url: str, utm_content: str) -> str:
         return short
     except Exception as e:
         print(f"[ShopeeShortLink] ERRO ao gerar shortlink: {e}. Fallback para URL numerada.")
-        return origin_url  # fallback seguro
+        return origin_url  # fallback
 
-# ───────────────────────────── Rotas ────────────────────────────────────────
+# ─────────── Rotas ───────────
 @app.get("/health")
 def health():
     return {"ok": True, "ts": int(time.time()), "bucket": GCS_BUCKET, "prefix": GCS_PREFIX, "video_id": VIDEO_ID}
@@ -323,18 +303,12 @@ def favicon():
 def track_number_and_redirect(
     request: Request,
     full_path: str = Path(..., description="Short-link/URL Shopee (ex.: https://s.shopee.com.br/XXXX)"),
-    cat: Optional[str] = Query(None, description="Categoria opcional p/ scoring simples (log)"),
+    cat: Optional[str] = Query(None, description="Categoria opcional p/ log"),
 ):
-    """
-    Recebe short-link Shopee JÁ com UTM, acrescenta numeração no utm_content,
-    gera short-link oficial e redireciona (302). Envia GA4 com IP/UA + UTM (old/new).
-    """
-    # Decodifica %3A etc.
+    # 1) Decodifica e valida
     raw_path = urllib.parse.unquote(full_path or "").strip()
     if not raw_path or raw_path == "favicon.ico":
         return JSONResponse({"ok": False, "error": "missing_url"}, status_code=400)
-
-    # Permite paths iniciando com //...
     if raw_path.startswith("//"):
         raw_path = "https:" + raw_path
     if not _is_valid_http_url(raw_path):
@@ -346,7 +320,7 @@ def track_number_and_redirect(
 
     headers = request.headers
     cookie_header = headers.get("cookie") or headers.get("Cookie")
-    referrer = headers.get("referer") or headers.get("referrer") or "-";
+    referrer = headers.get("referer") or headers.get("referrer") or "-"
     user_agent = headers.get("user-agent", "-")
     fbclid = request.query_params.get("fbclid")
 
@@ -355,30 +329,31 @@ def track_number_and_redirect(
         client_host = client_host.split("::ffff:")[-1]
     ip_addr = client_host or headers.get("x-forwarded-for") or "0.0.0.0"
 
-    # FB cookies úteis para atribuição em plataformas (registramos em log/GA também)
     fbp_cookie = get_cookie_value(cookie_header, "_fbp")
     fbc_val    = build_fbc_from_fbclid(fbclid, creation_ts=ts)
 
-    # Device
     device_name, os_family, os_version = parse_device_info(user_agent)
 
-    # Resolve o short-link → URL final e coleta subIDs/UTM originais
+    # 2) Resolve short inicial → URL longa completa
     resolved_url, subids_in = resolve_short_link(incoming_url)
     if not _is_valid_http_url(resolved_url):
         resolved_url = incoming_url
 
+    # 3) Extrai UTM original e adiciona numeração
     utm_original = subids_in.get("utm_content") or ""
-    # Numeração sequencial
     seq = incr_counter()
-    utm_numbered = f"{utm_original}{seq}"  # acrescenta número mantendo prefixo recebido
+    utm_numbered = f"{utm_original}{seq}"  # mantém prefixo recebido + número
 
-    # Substitui SOMENTE o utm_content, preservando ordem e demais parâmetros
+    # substitui SOMENTE utm_content na URL longa
     final_with_number = replace_utm_content_only(resolved_url, utm_numbered)
 
-    # Gera short-link oficial via Shopee (subIds[2] = utm numerada)
-    dest = generate_short_link(final_with_number, utm_numbered)
+    # 4) Gera short-link oficial usando subIds[2] SANITIZADO p/ API
+    sub_id_api = sanitize_subid_for_shopee(utm_numbered)
+    if sub_id_api != utm_numbered:
+        print(f"[ShopeeShortLink] sanitizado subId: '{utm_numbered}' -> '{sub_id_api}'")
+    dest = generate_short_link(final_with_number, sub_id_api)
 
-    # Envia ao Google GA4 (Measurement Protocol)
+    # 5) GA4: envia evento com IP/UA + UTM original e numerada (sem sanitizar)
     ga_params = {
         "link_url": dest,
         "event_source_url": final_with_number,
@@ -393,7 +368,7 @@ def track_number_and_redirect(
     }
     ga_resp = send_ga4_event("view_content", ip_addr, user_agent, ga_params, event_ts=ts)
 
-    # Cache mínimo p/ possíveis compras (chaveada por UTM numerada)
+    # 6) Cache + Log
     r.setex(f"{USERDATA_KEY_PREFIX}{utm_numbered}", USERDATA_TTL_SECONDS, json.dumps({
         "ip": ip_addr, "ua": user_agent, "referrer": referrer,
         "event_source_url": final_with_number, "short_link": dest,
@@ -401,7 +376,6 @@ def track_number_and_redirect(
         "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_val
     }))
 
-    # Log CSV → GCS
     csv_row = [
         ts, iso_time, ip_addr, user_agent, device_name, os_family, os_version, referrer,
         incoming_url, resolved_url, final_with_number, (cat or ""),
@@ -415,17 +389,17 @@ def track_number_and_redirect(
         "device": {"name": device_name, "os": os_family, "os_ver": os_version},
         "ref": referrer, "in": incoming_url, "resolved": resolved_url, "final": final_with_number,
         "dest": dest, "utm_original": utm_original, "utm_numbered": utm_numbered, "seq": seq,
-        "ga4": ga_resp
+        "ga4": ga_resp, "sub_id_api": sub_id_api
     }, flush=True)
 
     with _buffer_lock:
         _buffer_rows.append(csv_row)
     _flush_buffer_to_gcs(force=False)
 
-    # Redireciona para o short-link oficial (comportamento do primeiro código)
+    # 7) Redireciona 302 para o short oficial
     return RedirectResponse(dest, status_code=302)
 
-# Força flush manual
+# Admin: flush manual
 @app.get("/admin/flush")
 def admin_flush(token: str):
     if token != ADMIN_TOKEN:
@@ -433,7 +407,7 @@ def admin_flush(token: str):
     sent = _flush_buffer_to_gcs(force=True)
     return {"ok": True, "sent_rows": sent}
 
-# Upload CSV (opcional, se você usar depois para conciliar compras)
+# Upload CSV (opcional)
 @app.post("/upload_csv")
 async def upload_csv(file: UploadFile = File(...)):
     content = await file.read()
@@ -444,7 +418,7 @@ async def upload_csv(file: UploadFile = File(...)):
         processed.append(row)
     return JSONResponse({"rows": processed})
 
-# Flush final ao encerrar
+# Flush final
 @atexit.register
 def _flush_on_exit():
     try:
@@ -452,7 +426,7 @@ def _flush_on_exit():
     except Exception:
         pass
 
-# ───────────────────────────── START ─────────────────────────────
+# Start
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
