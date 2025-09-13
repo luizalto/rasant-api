@@ -341,8 +341,14 @@ def track_number_and_redirect(
 
     # 3) Extrai UTM original e adiciona numeração
     utm_original = subids_in.get("utm_content") or ""
-    seq = incr_counter()
-    utm_numbered = f"{utm_original}{seq}"  # mantém prefixo recebido + número
+   seq = incr_counter()
+
+    # Remove tudo que não for letra ou número da UTM original
+    clean_base = re.sub(r'[^a-zA-Z0-9]', '', base_utm or "")
+    
+    # Agora monta a UTM numerada somente com caracteres válidos
+    utm_numbered = f"{clean_base}{seq}"
+
 
     # substitui SOMENTE utm_content na URL longa
     final_with_number = replace_utm_content_only(resolved_url, utm_numbered)
@@ -430,3 +436,4 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
+
