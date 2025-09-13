@@ -168,6 +168,7 @@ def _flush_buffer_to_gcs(force: bool = False) -> int:
     """Envia o buffer ao GCS se bater limite de linhas/tempo ou se force=True."""
     global _buffer_rows, _last_flush_ts
     if not _bucket:
+        print("[WARN] GCS_BUCKET não configurado; pulando flush.")
         return 0
 
     with _buffer_lock:
@@ -187,6 +188,8 @@ def _flush_buffer_to_gcs(force: bool = False) -> int:
     part = int(time.time() * 1000) % 10_000_000
     blob_name = _gcs_object_name(int(time.time()), part)
     _bucket.blob(blob_name).upload_from_string(data, content_type="text/csv")
+
+    print(f"[FLUSH] {len(rows)} linha(s) → gs://{GCS_BUCKET}/{blob_name}")
     return len(rows)
 
 # ───────────────────────────── Rotas ────────────────────────────────────────
@@ -242,6 +245,30 @@ def track_and_redirect(
         (utm_content or ""), (sub_id1 or ""), (sub_id2 or ""), (sub_id3 or ""), (sub_id4 or ""), (sub_id5 or ""),
         (fbclid or ""), (fbp_cookie or ""), (fbc_val or "")
     ]
+
+    # 🔎 Printar nos logs do servidor (Render → Logs)
+    print("Novo clique registrado:", {
+        "timestamp": ts,
+        "iso_time": iso_time,
+        "ip": ip_addr,
+        "user_agent": user_agent,
+        "device_name": device_name,
+        "os_family": os_family,
+        "os_version": os_version,
+        "referrer": referrer,
+        "short_link": s,
+        "final_url": final_url,
+        "category": cat or "",
+        "utm_content": utm_content or "",
+        "sub_id1": sub_id1 or "",
+        "sub_id2": sub_id2 or "",
+        "sub_id3": sub_id3 or "",
+        "sub_id4": sub_id4 or "",
+        "sub_id5": sub_id5 or "",
+        "fbclid": fbclid or "",
+        "fbp": fbp_cookie or "",
+        "fbc": fbc_val or ""
+    })
 
     with _buffer_lock:
         _buffer_rows.append(csv_row)
