@@ -18,8 +18,9 @@ from fastapi.responses import RedirectResponse, JSONResponse
 
 # ─────────────────────── Configuração ───────────────────────
 # Redis (contador UTM)
-REDIS_URL        = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-UTM_COUNTER_KEY  = os.getenv("UTM_COUNTER_KEY", "utm_counter_global")
+# Redis
+REDIS_URL   = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+COUNTER_KEY = os.getenv("UTM_COUNTER_KEY", "utm_counter")
 
 # Shopee Affiliate (shortlink)
 SHOPEE_APP_ID     = os.getenv("SHOPEE_APP_ID", "")
@@ -332,3 +333,4 @@ def admin_flush():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
+
