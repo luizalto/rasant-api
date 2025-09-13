@@ -2,7 +2,7 @@
 """
 FastAPI – Logger de cliques em CSV (GCS) + Redis (contador infinito) + Shopee ShortLink + Meta CAPI
 
-Como usar (short-link direto SEM codificar):
+Como usar (short-link direto SEM codificar no path):
   https://SEU-APP.onrender.com/https://s.shopee.com.br/XXXX?cat=beleza
 
 ENV (Render):
@@ -42,7 +42,7 @@ ENV (Render):
   MAX_CLICKS_PER_FP=2
   FINGERPRINT_PREFIX=fp:
   EMIT_INTERNAL_BLOCK_LOG=true
-  VIDEO_ID=v15  # apenas para logs; UTM é baseada na existente
+  VIDEO_ID=v15  # apenas para logs; a UTM numerada usa o contador
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json
@@ -62,7 +62,7 @@ def _bootstrap_gcp_credentials():
         path = "/tmp/gcp.json"
         with open(path, "w", encoding="utf-8") as f:
             f.write(raw_json)
-        os.environ["GOOGLE_APPLICATION_CREDIENTIALS"] = path  # compat
+        # corrige e garante a env certa
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
 
 _bootstrap_gcp_credentials()
@@ -77,8 +77,8 @@ FLUSH_MAX_SECONDS = int(os.getenv("FLUSH_MAX_SECONDS", "30"))
 ADMIN_TOKEN       = os.getenv("ADMIN_TOKEN", "12345678")
 
 # Redis / chaves
-REDIS_URL         = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-COUNTER_KEY       = os.getenv("UTM_COUNTER_KEY", "utm_counter")
+REDIS_URL            = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+COUNTER_KEY          = os.getenv("UTM_COUNTER_KEY", "utm_counter")
 USERDATA_TTL_SECONDS = int(os.getenv("USERDATA_TTL_SECONDS", "604800"))
 USERDATA_KEY_PREFIX  = os.getenv("USERDATA_KEY_PREFIX", "ud:")
 MAX_DELAY_SECONDS    = int(os.getenv("MAX_DELAY_SECONDS", str(7 * 24 * 60 * 60)))
@@ -87,7 +87,7 @@ CLICK_WINDOW_SECONDS = int(os.getenv("CLICK_WINDOW_SECONDS", "3600"))
 MAX_CLICKS_PER_FP    = int(os.getenv("MAX_CLICKS_PER_FP", "2"))
 FINGERPRINT_PREFIX   = os.getenv("FINGERPRINT_PREFIX", "fp:")
 EMIT_INTERNAL_BLOCK_LOG = str(os.getenv("EMIT_INTERNAL_BLOCK_LOG", "true")).lower() == "true"
-VIDEO_ID = os.getenv("VIDEO_ID", "v15")  # apenas info de log
+VIDEO_ID             = os.getenv("VIDEO_ID", "v15")  # apenas info de log
 
 # Meta (Conversions API)
 FB_PIXEL_ID     = os.getenv("FB_PIXEL_ID") or os.getenv("META_PIXEL_ID") or "COLOQUE_SEU_PIXEL_ID_AQUI"
@@ -119,7 +119,7 @@ _last_flush_ts = time.time()
 
 CSV_HEADERS = [
     "timestamp","iso_time","ip","user_agent","device_name","os_family","os_version","referrer",
-    "short_link","final_url","category",
+    "short_link","final_url","original_utm","category",
     "utm_content","sub_id1","sub_id2","sub_id3","sub_id4","sub_id5",
     "fbclid","fbp","fbc"
 ]
@@ -437,12 +437,12 @@ def track_number_and_redirect(
 ):
     """
     1) Recebe short-link direto no path, resolve até a URL final (Shopee).
-    2) Lê o utm_content existente dessa URL e ACRESCENTA numeração sequencial do Redis.
-       - Somente modifica o valor de utm_content; mantém TODOS os demais parâmetros e a ordem.
-    3) Gera um short-link OFICIAL da Shopee com subIds[2] = utm_content numerado (fallback para URL longa).
+    2) Lê o utm_content existente dessa URL (original) e ACRESCENTA numeração sequencial do Redis.
+       - Apenas modifica o valor de utm_content; mantém TODOS os demais parâmetros e a ordem.
+    3) Gera um short-link OFICIAL da Shopee com subIds[2] = utm_content numerada (fallback para URL longa).
     4) Dispara ViewContent (e AddToCart condicional por regras/modelo).
     5) Salva user_data no Redis (chaveada pela UTM numerada).
-    6) Loga o clique em CSV no GCS e redireciona (302) para o destino gerado.
+    6) Loga o clique em CSV no GCS (inclui original_utm e utm_content numerada) e redireciona (302) para o destino gerado.
     """
     s = full_path  # short-link informado
     ts = int(time.time())
@@ -467,12 +467,12 @@ def track_number_and_redirect(
     # Device
     device_name, os_family, os_version = parse_device_info(user_agent)
 
-    # Resolve short-link
+    # Resolve short-link → URL final e subIDs/UTM originais
     resolved_url, subids_in = resolve_short_link(s)
     base_utm = subids_in.get("utm_content") or ""
     if base_utm is None: base_utm = ""
 
-    # Numeração infinita: apenas acrescenta o número ao LADO da UTM existente
+    # Numeração infinita: acrescenta o número ao lado da UTM original
     seq = incr_counter()
     utm_numbered = f"{base_utm}{seq}"
 
@@ -516,13 +516,13 @@ def track_number_and_redirect(
         "atc_prob": atc_p, "atc_resp": atc_resp
     })
 
-    # Log da linha (usa o DESTINO com UTM numerada)
+    # Log da linha (inclui ORIGINAL e NUMERADA)
     csv_row = [
         ts, iso_time, ip_addr, user_agent, device_name, os_family, os_version, referrer,
-        s, final_with_number, (cat or ""),
+        s, final_with_number, base_utm, (cat or ""),
         utm_numbered,
         subids_in.get("sub_id1") or "", subids_in.get("sub_id2") or "",
-        utm_numbered,  # sub_id3 coerente com utm
+        utm_numbered,  # sub_id3 coerente com utm numerada
         subids_in.get("sub_id4") or "", subids_in.get("sub_id5") or "",
         (fbclid or ""), (fbp_cookie or ""), (fbc_val or "")
     ]
@@ -530,7 +530,7 @@ def track_number_and_redirect(
         "timestamp": ts, "iso_time": iso_time, "ip": ip_addr, "user_agent": user_agent,
         "device_name": device_name, "os_family": os_family, "os_version": os_version, "referrer": referrer,
         "short_link": s, "resolved_url": resolved_url, "final_url": final_with_number, "dest": dest,
-        "category": cat or "", "utm_numbered": utm_numbered, "seq": seq,
+        "category": cat or "", "original_utm": base_utm, "utm_numbered": utm_numbered, "seq": seq,
         "fbclid": fbclid or "", "fbp": fbp_cookie or "", "fbc": fbc_val or "",
         "allowed": allowed, "reason": reason, "cnt": cnt, "atc_p": atc_p,
         "vc_resp": capi_vc_resp
@@ -553,7 +553,7 @@ def admin_flush(token: str):
     sent = _flush_buffer_to_gcs(force=True)
     return {"ok": True, "sent_rows": sent}
 
-# ─────────────── Upload CSV (dispara Purchase) – do segundo código ──────────
+# ─────────────── Upload CSV (dispara Purchase) – com UTM numerada ───────────
 @app.post("/upload_csv")
 async def upload_csv(file: UploadFile = File(...)):
     content = await file.read()
