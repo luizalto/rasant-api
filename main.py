@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI – Shopee ShortLink com UTM numerada (somente letras e números) + Logs em GCS + Redis + Google GA4
+FastAPI – Shopee ShortLink com UTM numerada (somente letras e números) + Logs em GCS + Redis
 
 Processo:
 - Recebe short/URL Shopee com UTM → resolve para URL longa
 - Extrai utm_content ORIGINAL → remove símbolos (fica só [A-Za-z0-9]) → monta <base>N<sequência>
 - Substitui SOMENTE utm_content na URL longa
 - Gera short-link oficial (Shopee GraphQL) usando subIds[2] = UTM numerada (já alfanumérica)
-- Envia GA4 com IP/UA + UTM original e numerada
 - Salva cache/CSV e redireciona 302 para o short oficial
 """
 
@@ -18,20 +17,7 @@ import requests
 import redis
 from fastapi import FastAPI, Request, Query, Path, UploadFile, File
 from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse
-
-# ─────────── GCP credenciais (opcional para GCS) ───────────
-def _bootstrap_gcp_credentials():
-    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-        return
-    raw_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-    if raw_json:
-        path = "/tmp/gcp.json"
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(raw_json)
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
-
-_bootstrap_gcp_credentials()
-from google.cloud import storage  # importa após credenciais
+from google.cloud import storage
 
 # ─────────── Config ───────────
 DEFAULT_TIMEOUT   = float(os.getenv("HTTP_TIMEOUT", "12"))
@@ -51,12 +37,6 @@ COUNTER_KEY          = os.getenv("UTM_COUNTER_KEY", "utm_counter")
 USERDATA_TTL_SECONDS = int(os.getenv("USERDATA_TTL_SECONDS", "604800"))
 USERDATA_KEY_PREFIX  = os.getenv("USERDATA_KEY_PREFIX", "ud:")
 
-# (Anti-bot simples – variáveis reservadas)
-CLICK_WINDOW_SECONDS = int(os.getenv("CLICK_WINDOW_SECONDS", "3600"))
-MAX_CLICKS_PER_FP    = int(os.getenv("MAX_CLICKS_PER_FP", "2"))
-FINGERPRINT_PREFIX   = os.getenv("FINGERPRINT_PREFIX", "fp:")
-EMIT_INTERNAL_BLOCK_LOG = str(os.getenv("EMIT_INTERNAL_BLOCK_LOG", "true")).lower() == "true"
-
 VIDEO_ID = os.getenv("VIDEO_ID", "v15")
 
 # Shopee Affiliate
@@ -64,16 +44,8 @@ SHOPEE_APP_ID     = os.getenv("SHOPEE_APP_ID", "18314810331")
 SHOPEE_APP_SECRET = os.getenv("SHOPEE_APP_SECRET", "LO3QSEG45TYP4NYQBRXLA2YYUL3ZCUPN")
 SHOPEE_ENDPOINT   = "https://open-api.affiliate.shopee.com.br/graphql"
 
-# GA4 Measurement Protocol
-GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID")  # p.ex. G-XXXXXXX
-GA4_API_SECRET     = os.getenv("GA4_API_SECRET")
-GA4_ENDPOINT       = (
-    f"https://www.google-analytics.com/mp/collect?measurement_id={GA4_MEASUREMENT_ID}&api_secret={GA4_API_SECRET}"
-    if (GA4_MEASUREMENT_ID and GA4_API_SECRET) else None
-)
-
 # ─────────── App / Clients ───────────
-app = FastAPI(title="Shopee UTM Numbered → ShortLink + GCS + Redis + GA4")
+app = FastAPI(title="Shopee UTM Numbered → ShortLink + GCS + Redis")
 r = redis.from_url(REDIS_URL)
 
 _gcs_client: Optional[storage.Client] = None
@@ -143,18 +115,6 @@ def parse_subids_from_query(qs: str) -> Dict[str, Optional[str]]:
         vals = q["subIds"]
         for i in range(min(5, len(vals))):
             out[f"sub_id{i+1}"] = out[f"sub_id{i+1}"] or vals[i]
-    aliases = {
-        "sub_id1":"sub_id1","subid1":"sub_id1","Sub_id1":"sub_id1",
-        "sub_id2":"sub_id2","subid2":"sub_id2","Sub_id2":"sub_id2",
-        "sub_id3":"sub_id3","subid3":"sub_id3","Sub_id3":"sub_id3",
-        "sub_id4":"sub_id4","subid4":"sub_id4","Sub_id4":"sub_id4",
-        "sub_id5":"sub_id5","subid5":"sub_id5","Sub_id5":"sub_id5",
-    }
-    for src, dst in aliases.items():
-        if src in q and q[src] and not out[dst]:
-            out[dst] = q[src][0]
-    if not out["utm_content"] and out["sub_id3"]:
-        out["utm_content"] = out["sub_id3"]
     return out
 
 def replace_utm_content_only(raw_url: str, new_value: str) -> str:
@@ -192,13 +152,7 @@ def resolve_short_link(short_url: str, max_hops: int = 6) -> Tuple[str, Dict[str
     subids = parse_subids_from_query(parsed.query)
     return final_url, subids
 
-def _is_valid_http_url(u: str) -> bool:
-    try:
-        p = urllib.parse.urlsplit(u)
-        return p.scheme in ("http", "https") and bool(p.netloc)
-    except Exception:
-        return False
-
+# ─────────── GCS flush ───────────
 def _day_key(ts: int) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts))
 
@@ -209,7 +163,6 @@ def _gcs_object_name(ts: int, part: int) -> str:
 def _flush_buffer_to_gcs(force: bool = False) -> int:
     global _buffer_rows, _last_flush_ts
     if not _bucket:
-        print("[WARN] GCS_BUCKET não configurado; pulando flush.")
         return 0
     with _buffer_lock:
         rows = list(_buffer_rows)
@@ -226,49 +179,17 @@ def _flush_buffer_to_gcs(force: bool = False) -> int:
     part = int(time.time() * 1000) % 10_000_000
     blob_name = _gcs_object_name(int(time.time()), part)
     _bucket.blob(blob_name).upload_from_string(data, content_type="text/csv")
-    print(f"[FLUSH] {len(rows)} linha(s) → gs://{GCS_BUCKET}/{blob_name}")
     return len(rows)
 
-# ─────────── GA4 (Measurement Protocol) ───────────
-def _ga4_client_id(ip: str, ua: str) -> str:
-    return hashlib.sha256(f"{ip}|{ua}".encode("utf-8")).hexdigest()[:32]
-
-def send_ga4_event(name: str, ip: str, ua: str, params: Dict[str, Any], event_ts: Optional[int] = None) -> Dict[str, Any]:
-    if not GA4_ENDPOINT:
-        print("[GA4] SKIP: GA4_MEASUREMENT_ID/API_SECRET ausentes.")
-        return {"skipped": True, "reason": "missing_config"}
-    payload = {
-        "client_id": _ga4_client_id(ip, ua),
-        "timestamp_micros": int((event_ts or int(time.time())) * 1_000_000),
-        "events": [{
-            "name": name,
-            "params": {**params, "engagement_time_msec": "1"}
-        }]
-    }
-    try:
-        resp = requests.post(
-            GA4_ENDPOINT,
-            json=payload,
-            timeout=12,
-            headers={"User-Agent": ua or "Mozilla/5.0", "X-Forwarded-For": ip or "0.0.0.0"}
-        )
-        try:
-            return resp.json()
-        except Exception:
-            return {"status_code": resp.status_code, "text": resp.text}
-    except Exception as e:
-        return {"error": str(e)}
-
-# ─────────── Sanitização para Shopee subIds (apenas letras e números) ───────────
+# ─────────── Shopee short-link ───────────
 _SUBID_MAXLEN = int(os.getenv("SHOPEE_SUBID_MAXLEN", "50"))
-_SUBID_REGEX  = re.compile(r"[^A-Za-z0-9]")  # somente alfanumérico
+_SUBID_REGEX  = re.compile(r"[^A-Za-z0-9]")
+
 def sanitize_subid_for_shopee(value: str) -> str:
     if not value: return "na"
     cleaned = _SUBID_REGEX.sub("", value)
-    cleaned = cleaned[:_SUBID_MAXLEN] if cleaned else "na"
-    return cleaned
+    return cleaned[:_SUBID_MAXLEN] if cleaned else "na"
 
-# ─────────── Shopee: gerar short-link ───────────
 def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
     payload_obj = {
         "query": (
@@ -294,7 +215,7 @@ def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
         return short
     except Exception as e:
         print(f"[ShopeeShortLink] ERRO ao gerar shortlink: {e}. Fallback para URL numerada.")
-        return origin_url  # fallback para a URL longa numerada
+        return origin_url
 
 # ─────────── Rotas ───────────
 @app.get("/health")
@@ -305,32 +226,24 @@ def health():
 def root():
     return PlainTextResponse("OK", status_code=200)
 
-@app.get("/favicon.ico")
-def favicon():
-    return PlainTextResponse("", status_code=204)
-
 @app.get("/{full_path:path}")
 def track_number_and_redirect(
     request: Request,
-    full_path: str = Path(..., description="Short-link/URL Shopee (ex.: https://s.shopee.com.br/XXXX)"),
-    cat: Optional[str] = Query(None, description="Categoria opcional p/ log"),
+    full_path: str = Path(...),
+    cat: Optional[str] = Query(None),
 ):
-    # 1) Decodifica e valida
     raw_path = urllib.parse.unquote(full_path or "").strip()
     if not raw_path or raw_path == "favicon.ico":
         return JSONResponse({"ok": False, "error": "missing_url"}, status_code=400)
     if raw_path.startswith("//"):
         raw_path = "https:" + raw_path
-    if not _is_valid_http_url(raw_path):
-        return JSONResponse({"ok": False, "error": "invalid_url", "got": raw_path}, status_code=400)
-
     incoming_url = raw_path
     ts = int(time.time())
     iso_time = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(ts))
 
     headers = request.headers
     cookie_header = headers.get("cookie") or headers.get("Cookie")
-    referrer = headers.get("referer") or headers.get("referrer") or "-"
+    referrer = headers.get("referer") or "-"
     user_agent = headers.get("user-agent", "-")
     fbclid = request.query_params.get("fbclid")
 
@@ -344,42 +257,16 @@ def track_number_and_redirect(
 
     device_name, os_family, os_version = parse_device_info(user_agent)
 
-    # 2) Resolve short inicial → URL longa completa
     resolved_url, subids_in = resolve_short_link(incoming_url)
-    if not _is_valid_http_url(resolved_url):
-        resolved_url = incoming_url
-
-    # 3) UTM original → limpar símbolos → **montar <base>N<seq>**
     utm_original = subids_in.get("utm_content") or ""
-    clean_base = re.sub(r'[^A-Za-z0-9]', '', utm_original or "")
-    if not clean_base:
-        clean_base = "n"  # fallback quando base vier vazia após limpeza
+    clean_base = re.sub(r'[^A-Za-z0-9]', '', utm_original or "") or "n"
     seq = incr_counter()
-    utm_numbered = f"{clean_base}N{seq}"  # N fica no meio entre base e sequência
-
-    # Substitui SOMENTE utm_content na URL longa
+    utm_numbered = f"{clean_base}N{seq}"
     final_with_number = replace_utm_content_only(resolved_url, utm_numbered)
 
-    # 4) Gera short-link oficial (Shopee) com subIds[2] já alfanumérico
-    sub_id_api = sanitize_subid_for_shopee(utm_numbered)  # garante regra e tamanho
+    sub_id_api = sanitize_subid_for_shopee(utm_numbered)
     dest = generate_short_link(final_with_number, sub_id_api)
 
-    # 5) GA4: envia evento com IP/UA + UTM original (como chegou) e UTM numerada (limpa)
-    ga_params = {
-        "link_url": dest,
-        "event_source_url": final_with_number,
-        "utm_original": utm_original,
-        "utm_numbered": utm_numbered,
-        "category": (cat or ""),
-        "referrer": referrer,
-        "video_id": VIDEO_ID,
-        "fbclid": fbclid or "",
-        "fbp": fbp_cookie or "",
-        "fbc": fbc_val or "",
-    }
-    ga_resp = send_ga4_event("view_content", ip_addr, user_agent, ga_params, event_ts=ts)
-
-    # 6) Cache + Log
     r.setex(f"{USERDATA_KEY_PREFIX}{utm_numbered}", USERDATA_TTL_SECONDS, json.dumps({
         "ip": ip_addr, "ua": user_agent, "referrer": referrer,
         "event_source_url": final_with_number, "short_link": dest,
@@ -393,24 +280,14 @@ def track_number_and_redirect(
         utm_original, utm_numbered,
         subids_in.get("sub_id1") or "", subids_in.get("sub_id2") or "",
         subids_in.get("sub_id3") or "", subids_in.get("sub_id4") or "", subids_in.get("sub_id5") or "",
-        (fbclid or ""), (fbp_cookie or ""), (fbc_val or "")
+        fbclid or "", fbp_cookie or "", fbc_val or ""
     ]
-    print("Novo clique:", {
-        "timestamp": ts, "iso_time": iso_time, "ip": ip_addr, "ua": user_agent[:160],
-        "device": {"name": device_name, "os": os_family, "os_ver": os_version},
-        "ref": referrer, "in": incoming_url, "resolved": resolved_url, "final": final_with_number,
-        "dest": dest, "utm_original": utm_original, "utm_numbered": utm_numbered, "seq": seq,
-        "ga4": ga_resp, "sub_id_api": sub_id_api
-    }, flush=True)
-
     with _buffer_lock:
         _buffer_rows.append(csv_row)
     _flush_buffer_to_gcs(force=False)
 
-    # 7) Redireciona 302 para o short oficial
     return RedirectResponse(dest, status_code=302)
 
-# Admin: flush manual
 @app.get("/admin/flush")
 def admin_flush(token: str):
     if token != ADMIN_TOKEN:
@@ -418,7 +295,6 @@ def admin_flush(token: str):
     sent = _flush_buffer_to_gcs(force=True)
     return {"ok": True, "sent_rows": sent}
 
-# Upload CSV (opcional)
 @app.post("/upload_csv")
 async def upload_csv(file: UploadFile = File(...)):
     content = await file.read()
@@ -429,7 +305,6 @@ async def upload_csv(file: UploadFile = File(...)):
         processed.append(row)
     return JSONResponse({"rows": processed})
 
-# Flush final
 @atexit.register
 def _flush_on_exit():
     try:
@@ -437,7 +312,6 @@ def _flush_on_exit():
     except Exception:
         pass
 
-# Start
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
