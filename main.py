@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI – Shopee ShortLink com UTM numerada (somente letras e números) + Logs em GCS + Redis
+FastAPI – Shopee ShortLink com UTM numerada + Redis + GCS (flush em background)
 
 Processo:
 - Recebe short/URL Shopee com UTM → resolve para URL longa
-- Extrai utm_content ORIGINAL → remove símbolos (fica só [A-Za-z0-9]) → monta <base>N<sequência>
-- Substitui SOMENTE utm_content na URL longa
-- Gera short-link oficial (Shopee GraphQL) usando subIds[2] = UTM numerada (já alfanumérica)
-- Salva cache/CSV e redireciona 302 para o short oficial
+- Extrai utm_content ORIGINAL → limpa p/ alfanumérico → monta <base>N<sequência>
+- Substitui SOMENTE utm_content
+- Gera short-link oficial (Shopee GraphQL) com subIds[2] = UTM numerada
+- Grava Redis imediato
+- GCS: só enfileira linha no buffer com timestamp do clique → flush em thread separada
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json
@@ -45,7 +46,7 @@ SHOPEE_APP_SECRET = os.getenv("SHOPEE_APP_SECRET", "LO3QSEG45TYP4NYQBRXLA2YYUL3Z
 SHOPEE_ENDPOINT   = "https://open-api.affiliate.shopee.com.br/graphql"
 
 # ─────────── App / Clients ───────────
-app = FastAPI(title="Shopee UTM Numbered → ShortLink + GCS + Redis")
+app = FastAPI(title="Shopee UTM Numbered → ShortLink + Redis + GCS background")
 r = redis.from_url(REDIS_URL)
 
 _gcs_client: Optional[storage.Client] = None
@@ -131,7 +132,7 @@ def replace_utm_content_only(raw_url: str, new_value: str) -> str:
     new_query = "&".join([p for p in parts if p])
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
 
-def resolve_short_link(short_url: str, max_hops: int = 6) -> Tuple[str, Dict[str, Optional[str]]]:
+def resolve_short_link(short_url: str, max_hops: int = 4) -> Tuple[str, Dict[str, Optional[str]]]:
     current = short_url
     final_url = short_url
     try:
@@ -152,7 +153,7 @@ def resolve_short_link(short_url: str, max_hops: int = 6) -> Tuple[str, Dict[str
     subids = parse_subids_from_query(parsed.query)
     return final_url, subids
 
-# ─────────── GCS flush ───────────
+# ─────────── GCS flush em background ───────────
 def _day_key(ts: int) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts))
 
@@ -160,14 +161,13 @@ def _gcs_object_name(ts: int, part: int) -> str:
     d = _day_key(ts)
     return f"{GCS_PREFIX}date={d}/clicks_{d}_part-{part:04d}.csv"
 
-def _flush_buffer_to_gcs(force: bool = False) -> int:
+def _flush_buffer_to_gcs() -> int:
     global _buffer_rows, _last_flush_ts
     if not _bucket:
         return 0
     with _buffer_lock:
         rows = list(_buffer_rows)
-        need = (force or len(rows) >= FLUSH_MAX_ROWS or (time.time() - _last_flush_ts) >= FLUSH_MAX_SECONDS)
-        if not need or len(rows) == 0:
+        if len(rows) == 0:
             return 0
         _buffer_rows = []
         _last_flush_ts = time.time()
@@ -179,7 +179,18 @@ def _flush_buffer_to_gcs(force: bool = False) -> int:
     part = int(time.time() * 1000) % 10_000_000
     blob_name = _gcs_object_name(int(time.time()), part)
     _bucket.blob(blob_name).upload_from_string(data, content_type="text/csv")
+    print(f"[FLUSH] {len(rows)} linha(s) → gs://{GCS_BUCKET}/{blob_name}")
     return len(rows)
+
+def _background_flusher():
+    while True:
+        try:
+            _flush_buffer_to_gcs()
+        except Exception as e:
+            print("[FLUSH-ERR]", e)
+        time.sleep(FLUSH_MAX_SECONDS)
+
+threading.Thread(target=_background_flusher, daemon=True).start()
 
 # ─────────── Shopee short-link ───────────
 _SUBID_MAXLEN = int(os.getenv("SHOPEE_SUBID_MAXLEN", "50"))
@@ -284,17 +295,18 @@ def track_number_and_redirect(
     ]
     with _buffer_lock:
         _buffer_rows.append(csv_row)
-    _flush_buffer_to_gcs(force=False)
 
     return RedirectResponse(dest, status_code=302)
 
+# Admin flush manual
 @app.get("/admin/flush")
 def admin_flush(token: str):
     if token != ADMIN_TOKEN:
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-    sent = _flush_buffer_to_gcs(force=True)
+    sent = _flush_buffer_to_gcs()
     return {"ok": True, "sent_rows": sent}
 
+# Upload CSV (opcional)
 @app.post("/upload_csv")
 async def upload_csv(file: UploadFile = File(...)):
     content = await file.read()
@@ -308,7 +320,7 @@ async def upload_csv(file: UploadFile = File(...)):
 @atexit.register
 def _flush_on_exit():
     try:
-        _flush_buffer_to_gcs(force=True)
+        _flush_buffer_to_gcs()
     except Exception:
         pass
 
