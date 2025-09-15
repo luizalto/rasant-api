@@ -4,7 +4,7 @@ FastAPI – Shopee ShortLink com UTM numerada (somente letras e números) + Logs
 
 Processo:
 - Recebe short/URL Shopee com UTM → resolve para URL longa
-- Extrai utm_content ORIGINAL → remove símbolos (fica só [A-Za-z0-9]) → acrescenta numeração
+- Extrai utm_content ORIGINAL → remove símbolos (fica só [A-Za-z0-9]) → monta <base>N<sequência>
 - Substitui SOMENTE utm_content na URL longa
 - Gera short-link oficial (Shopee GraphQL) usando subIds[2] = UTM numerada (já alfanumérica)
 - Envia GA4 com IP/UA + UTM original e numerada
@@ -51,7 +51,7 @@ COUNTER_KEY          = os.getenv("UTM_COUNTER_KEY", "utm_counter")
 USERDATA_TTL_SECONDS = int(os.getenv("USERDATA_TTL_SECONDS", "604800"))
 USERDATA_KEY_PREFIX  = os.getenv("USERDATA_KEY_PREFIX", "ud:")
 
-# Anti-bot simples
+# (Anti-bot simples – variáveis reservadas)
 CLICK_WINDOW_SECONDS = int(os.getenv("CLICK_WINDOW_SECONDS", "3600"))
 MAX_CLICKS_PER_FP    = int(os.getenv("MAX_CLICKS_PER_FP", "2"))
 FINGERPRINT_PREFIX   = os.getenv("FINGERPRINT_PREFIX", "fp:")
@@ -67,7 +67,10 @@ SHOPEE_ENDPOINT   = "https://open-api.affiliate.shopee.com.br/graphql"
 # GA4 Measurement Protocol
 GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID")  # p.ex. G-XXXXXXX
 GA4_API_SECRET     = os.getenv("GA4_API_SECRET")
-GA4_ENDPOINT       = f"https://www.google-analytics.com/mp/collect?measurement_id={GA4_MEASUREMENT_ID}&api_secret={GA4_API_SECRET}" if (GA4_MEASUREMENT_ID and GA4_API_SECRET) else None
+GA4_ENDPOINT       = (
+    f"https://www.google-analytics.com/mp/collect?measurement_id={GA4_MEASUREMENT_ID}&api_secret={GA4_API_SECRET}"
+    if (GA4_MEASUREMENT_ID and GA4_API_SECRET) else None
+)
 
 # ─────────── App / Clients ───────────
 app = FastAPI(title="Shopee UTM Numbered → ShortLink + GCS + Redis + GA4")
@@ -130,7 +133,8 @@ def parse_subids_from_query(qs: str) -> Dict[str, Optional[str]]:
     out = {"utm_content": None, "sub_id1": None, "sub_id2": None, "sub_id3": None, "sub_id4": None, "sub_id5": None}
     if not qs: return out
     q = urllib.parse.parse_qs(qs, keep_blank_values=True)
-    if "utm_content" in q and q["utm_content"]: out["utm_content"] = q["utm_content"][0]
+    if "utm_content" in q and q["utm_content"]:
+        out["utm_content"] = q["utm_content"][0]
     for i in range(5):
         key_idx = f"subIds[{i}]"
         if key_idx in q and q[key_idx]:
@@ -248,8 +252,10 @@ def send_ga4_event(name: str, ip: str, ua: str, params: Dict[str, Any], event_ts
             timeout=12,
             headers={"User-Agent": ua or "Mozilla/5.0", "X-Forwarded-For": ip or "0.0.0.0"}
         )
-        try: return resp.json()
-        except Exception: return {"status_code": resp.status_code, "text": resp.text}
+        try:
+            return resp.json()
+        except Exception:
+            return {"status_code": resp.status_code, "text": resp.text}
     except Exception as e:
         return {"error": str(e)}
 
@@ -275,8 +281,10 @@ def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
     payload = json.dumps(payload_obj, separators=(',', ':'), ensure_ascii=False)
     ts = str(int(time.time()))
     signature = hashlib.sha256((SHOPEE_APP_ID + ts + payload + SHOPEE_APP_SECRET).encode("utf-8")).hexdigest()
-    headers = {"Authorization": f"SHA256 Credential={SHOPEE_APP_ID}, Timestamp={ts}, Signature={signature}",
-               "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"SHA256 Credential={SHOPEE_APP_ID}, Timestamp={ts}, Signature={signature}",
+        "Content-Type": "application/json"
+    }
     try:
         resp = requests.post(SHOPEE_ENDPOINT, headers=headers, data=payload, timeout=20)
         j = resp.json()
@@ -286,7 +294,7 @@ def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
         return short
     except Exception as e:
         print(f"[ShopeeShortLink] ERRO ao gerar shortlink: {e}. Fallback para URL numerada.")
-        return origin_url  # fallback
+        return origin_url  # fallback para a URL longa numerada
 
 # ─────────── Rotas ───────────
 @app.get("/health")
@@ -341,19 +349,19 @@ def track_number_and_redirect(
     if not _is_valid_http_url(resolved_url):
         resolved_url = incoming_url
 
-    # 3) UTM original → limpar símbolos → numerar
+    # 3) UTM original → limpar símbolos → **montar <base>N<seq>**
     utm_original = subids_in.get("utm_content") or ""
     clean_base = re.sub(r'[^A-Za-z0-9]', '', utm_original or "")
     if not clean_base:
-        clean_base = "n"  # prefixo padrão quando base vier vazia após limpeza
+        clean_base = "n"  # fallback quando base vier vazia após limpeza
     seq = incr_counter()
-    utm_numbered = f"{clean_base}{seq}"  # apenas letras e números
+    utm_numbered = f"{clean_base}N{seq}"  # N fica no meio entre base e sequência
 
     # Substitui SOMENTE utm_content na URL longa
     final_with_number = replace_utm_content_only(resolved_url, utm_numbered)
 
     # 4) Gera short-link oficial (Shopee) com subIds[2] já alfanumérico
-    sub_id_api = sanitize_subid_for_shopee(utm_numbered)  # redundante, mas garante regra e tamanho
+    sub_id_api = sanitize_subid_for_shopee(utm_numbered)  # garante regra e tamanho
     dest = generate_short_link(final_with_number, sub_id_api)
 
     # 5) GA4: envia evento com IP/UA + UTM original (como chegou) e UTM numerada (limpa)
