@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 FastAPI – Shopee ShortLink otimizado + Redis + GCS (flush background)
-- Preserva utm_content original
-- Adiciona utm_numbered=<base>N<seq> ao lado (sem substituir utm_content)
-- Short-link oficial Shopee com subIds[2] = utm_numbered
-- Suporte a UTM externa via ?uc=... (evita resolver Shopee → mais rápido)
+Regra de UTM:
+- Se vier ?uc=... (externo) → usa como utm_original (zero resolução).
+- Senão, tenta utm_content direto na URL recebida (zero rede).
+- Se ainda vazio, resolve 1 hop e tenta de novo.
+- Preserva utm_content; adiciona utm_numbered=<base>N<seq>.
+- Gera short-link Shopee com subIds[2] = utm_numbered.
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json
@@ -52,8 +54,7 @@ r = redis.from_url(REDIS_URL)
 _gcs_client: Optional[storage.Client] = None
 _bucket: Optional[storage.Bucket] = None
 if GCS_BUCKET:
-    # Usa credenciais padrão do ambiente (Render/Cloud Run já funciona)
-    _gcs_client = storage.Client()
+    _gcs_client = storage.Client()  # usa credenciais padrão do ambiente
     _bucket = _gcs_client.bucket(GCS_BUCKET)
 
 # Sessão HTTP global (reuso de conexões → menos latência)
@@ -127,19 +128,22 @@ def parse_subids_from_query(qs: str) -> Dict[str, Optional[str]]:
     return out
 
 def add_or_update_query_param(raw_url: str, key: str, value: str) -> str:
-    """Mantém a URL e adiciona (ou atualiza) um parâmetro de query (sem tocar em utm_content)."""
+    """Mantém a URL e adiciona/atualiza um parâmetro de query (sem tocar em utm_content)."""
     parsed = urlsplit(raw_url)
     q = parse_qs(parsed.query, keep_blank_values=True)
     q[key] = [value]
     new_query = urlencode(q, doseq=True)
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
 
-def is_shopee_url(u: str) -> bool:
+def extract_utm_content_from_url(u: str) -> str:
     try:
-        host = urlsplit(u).netloc.lower()
-        return ("shopee" in host) or ("s.shopee" in host)
+        qs = urlsplit(u).query
+        if not qs:
+            return ""
+        q = parse_qs(qs, keep_blank_values=True)
+        return (q.get("utm_content") or [""])[0]
     except:
-        return False
+        return ""
 
 def resolve_short_link(short_url: str, max_hops: int = 1) -> Tuple[str, Dict[str, Optional[str]]]:
     """Resolve no máximo 1 hop para reduzir latência; retorna URL final e sub-ids/utm da query."""
@@ -185,7 +189,6 @@ def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
         "Content-Type": "application/json"
     }
     try:
-        # timeout agressivo (connect=2s, read=10s) e sessão reutilizável
         resp = session.post(SHOPEE_ENDPOINT, headers=headers, data=payload, timeout=(2, 10))
         j = resp.json()
         short = (((j or {}).get("data") or {}).get("generateShortLink") or {}).get("shortLink")
@@ -256,9 +259,8 @@ def track_number_and_redirect(
     if raw_path.startswith("//"):
         raw_path = "https:" + raw_path
 
-    # Ex.: /https://s.shopee.com.br/9fBXK1BY6D?uc=MINHA_UTM
-    incoming_url = raw_path
-    outer_uc = request.query_params.get("uc")  # UTM original por fora (recomendado p/ velocidade)
+    incoming_url = raw_path  # ex: https://s.shopee.com.br/9fBXK1BY6D
+    outer_uc = request.query_params.get("uc")  # UTM original “por fora”, recomendada p/ velocidade
 
     # Dados básicos
     ts = int(time.time())
@@ -271,31 +273,31 @@ def track_number_and_redirect(
     ip_addr = (request.client.host if request.client else "0.0.0.0")
     device_name, os_family, os_version = parse_device_info(user_agent)
 
-    # 1) Extrair utm_original SEM chamar a Shopee (se possível)
-    if outer_uc:
-        utm_original = outer_uc
-        resolved_url = incoming_url  # zero requisição
-        subids_in = parse_subids_from_query(urlsplit(incoming_url).query)
-    else:
-        # Se já for Shopee, não resolvemos; se for outro encurtador, 1 hop no máx.
-        if is_shopee_url(incoming_url):
-            resolved_url = incoming_url
-            subids_in = parse_subids_from_query(urlsplit(incoming_url).query)
-        else:
-            resolved_url, subids_in = resolve_short_link(incoming_url, max_hops=1)
-        utm_original = subids_in.get("utm_content") or ""
+    # === LÓGICA DE UTM OTIMIZADA ===
+    resolved_url = incoming_url
+    utm_original = outer_uc or ""
 
-    # 2) Gerar numerada e ADICIONAR ao lado (não tocar em utm_content)
+    # Se não veio uc, tenta ler utm_content direto (sem rede)
+    if not utm_original:
+        utm_original = extract_utm_content_from_url(incoming_url)
+
+    subids_in = {}
+    # Se ainda não tiver UTM, resolve 1 hop e tenta de novo
+    if not utm_original:
+        resolved_url, subids_in = resolve_short_link(incoming_url, max_hops=1)
+        utm_original = subids_in.get("utm_content") or extract_utm_content_from_url(resolved_url)
+
+    # Gera numerada e ADICIONA ao lado (não tocar em utm_content)
     clean_base = re.sub(r'[^A-Za-z0-9]', '', utm_original or "") or "n"
     seq = incr_counter()
     utm_numbered = f"{clean_base}N{seq}"
     final_with_number = add_or_update_query_param(resolved_url, "utm_numbered", utm_numbered)
 
-    # 3) Short-link oficial Shopee com subIds[2] = utm_numbered
+    # Short-link oficial Shopee com subIds[2] = utm_numbered
     sub_id_api = sanitize_subid_for_shopee(utm_numbered)
     dest = generate_short_link(final_with_number, sub_id_api)
 
-    # 4) Snapshot em Redis
+    # Snapshot em Redis
     fbp_cookie = get_cookie_value(cookie_header, "_fbp")
     fbc_val    = build_fbc_from_fbclid(fbclid, creation_ts=ts)
     r.setex(f"{USERDATA_KEY_PREFIX}{utm_numbered}", USERDATA_TTL_SECONDS, json.dumps({
@@ -305,7 +307,7 @@ def track_number_and_redirect(
         "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_val
     }))
 
-    # 5) Enfileira linha p/ GCS (background)
+    # Enfileira linha p/ GCS (background)
     csv_row = [
         ts, iso_time, ip_addr, user_agent, device_name, os_family, os_version, referrer,
         incoming_url, resolved_url, final_with_number, (cat or ""),
@@ -317,7 +319,7 @@ def track_number_and_redirect(
     with _buffer_lock:
         _buffer_rows.append(csv_row)
 
-    # 6) Redirect imediato
+    # Redirect imediato
     return RedirectResponse(dest, status_code=302)
 
 # Admin flush manual
