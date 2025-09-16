@@ -1,28 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-Render Server – FastAPI + Redis + failover PC worker
-
-Fluxo:
-- Recebe clique
-- Enfileira no Redis
-- Espera resposta do PC (300ms)
-- Se o PC respondeu -> redireciona para dest calculado pelo PC
-- Se não respondeu -> processa localmente (igual código original)
+FastAPI – Shopee ShortLink otimizado + Redis + GCS (flush em background)
+Preserva utm_content existente e adiciona utm_numbered=<base>N<seq> ao lado.
+Gera short-link oficial (Shopee GraphQL) com subIds[2] = utm_numbered.
 """
 
-import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, uuid
+import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json
 from typing import Optional, Dict, Tuple, List, Any
-import requests, redis
-from fastapi import FastAPI, Request, Query, Path
+
+import requests
+import redis
+from fastapi import FastAPI, Request, Query, Path, UploadFile, File
 from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse
 from google.cloud import storage
 
-# ─────────── Config ───────────
-DEFAULT_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "12"))
-REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-QUEUE_KEY       = os.getenv("QUEUE_KEY", "q:jobs")
-RES_PREFIX      = os.getenv("RES_PREFIX", "res:")
-ACCEL_WAIT      = float(os.getenv("ACCEL_WAIT", "0.3"))  # segundos de espera pelo PC
+# ─────────── Config (usa env se tiver; senão, defaults seguros) ───────────
+DEFAULT_TIMEOUT   = float(os.getenv("HTTP_TIMEOUT", "12"))
 
 # GCS
 GCS_BUCKET        = os.getenv("GCS_BUCKET")
@@ -34,29 +27,43 @@ FLUSH_MAX_SECONDS = int(os.getenv("FLUSH_MAX_SECONDS", "30"))
 ADMIN_TOKEN       = os.getenv("ADMIN_TOKEN", "12345678")
 
 # Redis
+REDIS_URL            = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 COUNTER_KEY          = os.getenv("UTM_COUNTER_KEY", "utm_counter")
 USERDATA_TTL_SECONDS = int(os.getenv("USERDATA_TTL_SECONDS", "604800"))
 USERDATA_KEY_PREFIX  = os.getenv("USERDATA_KEY_PREFIX", "ud:")
-VIDEO_ID             = os.getenv("VIDEO_ID", "v15")
+
+VIDEO_ID = os.getenv("VIDEO_ID", "v15")
 
 # Shopee Affiliate
-SHOPEE_APP_ID     = os.getenv("SHOPEE_APP_ID", "")
-SHOPEE_APP_SECRET = os.getenv("SHOPEE_APP_SECRET", "")
+SHOPEE_APP_ID     = os.getenv("SHOPEE_APP_ID", "18314810331")
+SHOPEE_APP_SECRET = os.getenv("SHOPEE_APP_SECRET", "LO3QSEG45TYP4NYQBRXLA2YYUL3ZCUPN")
 SHOPEE_ENDPOINT   = "https://open-api.affiliate.shopee.com.br/graphql"
 
 # ─────────── App / Clients ───────────
-app = FastAPI(title="Shopee ShortLink – Render")
+app = FastAPI(title="Shopee UTM Numbered → ShortLink + Redis + GCS (optimized)")
+
+# Redis
 r = redis.from_url(REDIS_URL)
 
-_gcs_client = _bucket = None
+# GCS
+_gcs_client: Optional[storage.Client] = None
+_bucket: Optional[storage.Bucket] = None
 if GCS_BUCKET:
+    # Usa credenciais padrão do ambiente (no Render/Cloud Run já funciona)
     _gcs_client = storage.Client()
     _bucket = _gcs_client.bucket(GCS_BUCKET)
+
+# Sessão HTTP global (reduz latência por reuso de conexões)
+session = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=50)
+session.mount("http://", _adapter)
+session.mount("https://", _adapter)
 
 # ─────────── Buffer CSV ───────────
 _buffer_lock = threading.Lock()
 _buffer_rows: List[List[str]] = []
 _last_flush_ts = time.time()
+
 CSV_HEADERS = [
     "timestamp","iso_time","ip","user_agent","device_name","os_family","os_version","referrer",
     "short_link_in","resolved_url","final_url","category",
@@ -73,8 +80,10 @@ def get_cookie_value(cookie_header: Optional[str], name: str) -> Optional[str]:
     if not cookie_header: return None
     try:
         for it in [c.strip() for c in cookie_header.split(";")]:
-            if it.startswith(name + "="): return it.split("=", 1)[1]
-    except: pass
+            if it.startswith(name + "="):
+                return it.split("=", 1)[1]
+    except Exception:
+        pass
     return None
 
 def build_fbc_from_fbclid(fbclid: Optional[str], creation_ts: Optional[int] = None) -> Optional[str]:
@@ -98,34 +107,56 @@ def parse_device_info(ua: str):
     device_name = "iPhone" if "iphone" in ua_l else ("Android" if "android" in ua_l else "Desktop")
     return device_name, os_family, os_version
 
-def replace_utm_content_only(raw_url: str, new_value: str) -> str:
-    parsed = urllib.parse.urlsplit(raw_url)
-    parts = parsed.query.split("&") if parsed.query else []
-    found = False
-    for i, part in enumerate(parts):
-        if part.startswith("utm_content="):
-            parts[i] = "utm_content=" + new_value
-            found = True
-            break
-    if not found: parts.append("utm_content=" + new_value)
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "&".join(parts), parsed.fragment))
+def parse_subids_from_query(qs: str) -> Dict[str, Optional[str]]:
+    out = {"utm_content": None, "sub_id1": None, "sub_id2": None, "sub_id3": None, "sub_id4": None, "sub_id5": None}
+    if not qs: return out
+    q = urllib.parse.parse_qs(qs, keep_blank_values=True)
+    if "utm_content" in q and q["utm_content"]:
+        out["utm_content"] = q["utm_content"][0]
+    for i in range(5):
+        key_idx = f"subIds[{i}]"
+        if key_idx in q and q[key_idx]:
+            out[f"sub_id{i+1}"] = q[key_idx][0]
+    if "subIds" in q:
+        vals = q["subIds"]
+        for i in range(min(5, len(vals))):
+            out[f"sub_id{i+1}"] = out[f"sub_id{i+1}"] or vals[i]
+    return out
 
-def resolve_short_link(short_url: str, max_hops: int = 4) -> Tuple[str, Dict[str, Optional[str]]]:
-    current = short_url; final_url = short_url
+def add_or_update_query_param(raw_url: str, key: str, value: str) -> str:
+    """Mantém a URL e adiciona (ou atualiza) um parâmetro de query (sem tocar em utm_content)."""
+    parsed = urllib.parse.urlsplit(raw_url)
+    q = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    q[key] = [value]
+    new_query = urllib.parse.urlencode(q, doseq=True)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
+
+def resolve_short_link(short_url: str, max_hops: int = 1) -> Tuple[str, Dict[str, Optional[str]]]:
+    """Resolve no máximo 1 hop para reduzir latência; retorna URL final e sub-ids/utm da query."""
+    current = short_url
+    final_url = short_url
     try:
-        session = requests.Session()
-        for _ in range(max_hops):
-            resp = session.get(current, allow_redirects=False, timeout=DEFAULT_TIMEOUT)
-            if 300 <= resp.status_code < 400 and "Location" in resp.headers:
-                current = urllib.parse.urljoin(current, resp.headers["Location"])
-                final_url = current
-                continue
-            break
-    except: final_url = short_url
-    return final_url, urllib.parse.parse_qs(urllib.parse.urlsplit(final_url).query)
+        resp = session.get(current, allow_redirects=False, timeout=DEFAULT_TIMEOUT, headers={
+            "User-Agent": "Mozilla/5.0 (resolver/1.0)"
+        })
+        if 300 <= resp.status_code < 400 and "Location" in resp.headers:
+            location = resp.headers["Location"]
+            current = urllib.parse.urljoin(current, location)
+            final_url = current
+    except Exception:
+        final_url = short_url
+    parsed = urllib.parse.urlsplit(final_url)
+    subids = parse_subids_from_query(parsed.query)
+    return final_url, subids
+
+# ─────────── Shopee short-link ───────────
+_SUBID_MAXLEN = int(os.getenv("SHOPEE_SUBID_MAXLEN", "50"))
+_SUBID_REGEX  = re.compile(r"[^A-Za-z0-9]")
 
 def sanitize_subid_for_shopee(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]","",value)[:50] or "na"
+    if not value: return "na"
+    cleaned = _SUBID_REGEX.sub("", value)
+    return cleaned[:_SUBID_MAXLEN] if cleaned else "na"
 
 def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
     payload_obj = {
@@ -138,60 +169,168 @@ def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
     }
     payload = json.dumps(payload_obj, separators=(',', ':'), ensure_ascii=False)
     ts = str(int(time.time()))
-    signature = hashlib.sha256((SHOPEE_APP_ID+ts+payload+SHOPEE_APP_SECRET).encode()).hexdigest()
-    headers = {"Authorization": f"SHA256 Credential={SHOPEE_APP_ID}, Timestamp={ts}, Signature={signature}","Content-Type": "application/json"}
+    signature = hashlib.sha256((SHOPEE_APP_ID + ts + payload + SHOPEE_APP_SECRET).encode("utf-8")).hexdigest()
+    headers = {
+        "Authorization": f"SHA256 Credential={SHOPEE_APP_ID}, Timestamp={ts}, Signature={signature}",
+        "Content-Type": "application/json"
+    }
     try:
-        resp = requests.post(SHOPEE_ENDPOINT, headers=headers, data=payload, timeout=20)
-        j = resp.json(); short = (((j or {}).get("data") or {}).get("generateShortLink") or {}).get("shortLink")
-        if not short: raise ValueError(f"Resposta Shopee sem shortLink: {j}")
+        # timeout agressivo tipo (connect=2s, read=10s) e sessão reutilizável
+        resp = session.post(SHOPEE_ENDPOINT, headers=headers, data=payload, timeout=(2, 10))
+        j = resp.json()
+        short = (((j or {}).get("data") or {}).get("generateShortLink") or {}).get("shortLink")
+        if not short:
+            raise ValueError(f"Resposta Shopee sem shortLink: {j}")
         return short
     except Exception as e:
-        print("[ShopeeShortLink] ERRO:", e); return origin_url
+        print(f"[ShopeeShortLink] ERRO ao gerar shortlink: {e}. Fallback para URL numerada.")
+        return origin_url
+
+# ─────────── GCS flush em background ───────────
+def _day_key(ts: int) -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+def _gcs_object_name(ts: int, part: int) -> str:
+    d = _day_key(ts)
+    return f"{GCS_PREFIX}date={d}/clicks_{d}_part-{part:04d}.csv"
+
+def _flush_buffer_to_gcs() -> int:
+    global _buffer_rows, _last_flush_ts
+    if not _bucket:
+        return 0
+    with _buffer_lock:
+        rows = list(_buffer_rows)
+        if len(rows) == 0:
+            return 0
+        _buffer_rows = []
+        _last_flush_ts = time.time()
+    output = io.StringIO()
+    w = csv.writer(output)
+    w.writerow(CSV_HEADERS)
+    w.writerows(rows)
+    data = output.getvalue().encode("utf-8")
+    part = int(time.time() * 1000) % 10_000_000
+    blob_name = _gcs_object_name(int(time.time()), part)
+    _bucket.blob(blob_name).upload_from_string(data, content_type="text/csv")
+    print(f"[FLUSH] {len(rows)} linha(s) → gs://{GCS_BUCKET}/{blob_name}")
+    return len(rows)
+
+def _background_flusher():
+    while True:
+        try:
+            _flush_buffer_to_gcs()
+        except Exception as e:
+            print("[FLUSH-ERR]", e)
+        time.sleep(FLUSH_MAX_SECONDS)
+
+threading.Thread(target=_background_flusher, daemon=True).start()
 
 # ─────────── Rotas ───────────
 @app.get("/health")
-def health(): return {"ok":True,"ts":int(time.time())}
+def health():
+    return {"ok": True, "ts": int(time.time()), "bucket": GCS_BUCKET, "prefix": GCS_PREFIX, "video_id": VIDEO_ID}
+
+@app.get("/")
+def root():
+    return PlainTextResponse("OK", status_code=200)
 
 @app.get("/{full_path:path}")
-def track(request: Request, full_path: str = Path(...), cat: Optional[str] = Query(None)):
-    if not full_path or full_path=="favicon.ico": return JSONResponse({"ok":False,"error":"missing_url"},400)
-    if full_path.startswith("//"): full_path="https:"+full_path
-    incoming_url = urllib.parse.unquote(full_path)
+def track_number_and_redirect(
+    request: Request,
+    full_path: str = Path(...),
+    cat: Optional[str] = Query(None),
+):
+    raw_path = urllib.parse.unquote(full_path or "").strip()
+    if not raw_path or raw_path == "favicon.ico":
+        return JSONResponse({"ok": False, "error": "missing_url"}, status_code=400)
+    if raw_path.startswith("//"):
+        raw_path = "https:" + raw_path
+    incoming_url = raw_path
 
-    job_id = str(uuid.uuid4())
-    job = {
-        "id": job_id,
-        "url": incoming_url,
-        "cat": cat,
-        "headers": dict(request.headers),
-        "query": dict(request.query_params),
-        "ip": request.client.host if request.client else ""
-    }
-    # envia job para fila
-    r.lpush(QUEUE_KEY, json.dumps(job))
+    ts = int(time.time())
+    iso_time = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(ts))
 
-    # espera pelo PC
-    deadline = time.time()+ACCEL_WAIT
-    res_key = RES_PREFIX+job_id
-    while time.time()<deadline:
-        res = r.get(res_key)
-        if res:
-            r.delete(res_key)
-            return RedirectResponse(json.loads(res)["dest"],302)
-        time.sleep(0.01)
+    headers = request.headers
+    cookie_header = headers.get("cookie") or headers.get("Cookie")
+    referrer = headers.get("referer") or "-"
+    user_agent = headers.get("user-agent", "-")
+    fbclid = request.query_params.get("fbclid")
 
-    # failover local
-    headers=job["headers"]; user_agent=headers.get("user-agent","-")
-    device,osfam,osver = parse_device_info(user_agent)
-    ts=int(time.time()); iso=time.strftime("%Y-%m-%dT%H:%M:%S%z",time.localtime(ts))
-    resolved,qs = resolve_short_link(incoming_url)
-    utm = (qs.get("utm_content") or [""])[0]
+    client_host = request.client.host if request.client else None
+    if client_host and client_host.startswith("::ffff:"):
+        client_host = client_host.split("::ffff:")[-1]
+    ip_addr = client_host or headers.get("x-forwarded-for") or "0.0.0.0"
+
+    fbp_cookie = get_cookie_value(cookie_header, "_fbp")
+    fbc_val    = build_fbc_from_fbclid(fbclid, creation_ts=ts)
+
+    device_name, os_family, os_version = parse_device_info(user_agent)
+
+    # 1) resolve com 1 hop (rápido) e extrai utm/subIds originais
+    resolved_url, subids_in = resolve_short_link(incoming_url)
+    utm_original = subids_in.get("utm_content") or ""
+
+    # 2) gera sequência e nova utm_numbered (sem tocar em utm_content)
+    clean_base = re.sub(r'[^A-Za-z0-9]', '', utm_original or "") or "n"
     seq = incr_counter()
-    utm_num = f"{re.sub(r'[^A-Za-z0-9]','',utm) or 'n'}N{seq}"
-    final_url = replace_utm_content_only(resolved, utm_num)
-    dest = generate_short_link(final_url, sanitize_subid_for_shopee(utm_num))
+    utm_numbered = f"{clean_base}N{seq}"
 
-    # grava redis + gcs
-    r.setex(f"{USERDATA_KEY_PREFIX}{utm_num}",USERDATA_TTL_SECONDS,json.dumps({"ip":job["ip"],"ua":user_agent,"final":final_url,"short":dest}))
-    with _buffer_lock: _buffer_rows.append([ts,iso,job["ip"],user_agent,device,osfam,osver,headers.get("referer","-"),incoming_url,resolved,final_url,cat or "",utm,utm_num,"","","","","","",""])
-    return RedirectResponse(dest,302)
+    # 3) adiciona nossa utm_numbered ao lado (preserva utm_content original)
+    final_with_number = add_or_update_query_param(resolved_url, "utm_numbered", utm_numbered)
+
+    # 4) short-link oficial via Shopee, usando a numerada no subIds[2]
+    sub_id_api = sanitize_subid_for_shopee(utm_numbered)
+    dest = generate_short_link(final_with_number, sub_id_api)
+
+    # 5) grava snapshot no Redis (dados de clique)
+    r.setex(f"{USERDATA_KEY_PREFIX}{utm_numbered}", USERDATA_TTL_SECONDS, json.dumps({
+        "ip": ip_addr, "ua": user_agent, "referrer": referrer,
+        "event_source_url": final_with_number, "short_link": dest,
+        "vc_time": ts, "utm_original": utm_original, "utm_numbered": utm_numbered,
+        "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_val
+    }))
+
+    # 6) enfileira linha para GCS (flush em thread separada)
+    csv_row = [
+        ts, iso_time, ip_addr, user_agent, device_name, os_family, os_version, referrer,
+        incoming_url, resolved_url, final_with_number, (cat or ""),
+        utm_original, utm_numbered,
+        subids_in.get("sub_id1") or "", subids_in.get("sub_id2") or "",
+        subids_in.get("sub_id3") or "", subids_in.get("sub_id4") or "", subids_in.get("sub_id5") or "",
+        fbclid or "", fbp_cookie or "", fbc_val or ""
+    ]
+    with _buffer_lock:
+        _buffer_rows.append(csv_row)
+
+    # 7) redireciona imediatamente
+    return RedirectResponse(dest, status_code=302)
+
+# Admin flush manual
+@app.get("/admin/flush")
+def admin_flush(token: str):
+    if token != ADMIN_TOKEN:
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    sent = _flush_buffer_to_gcs()
+    return {"ok": True, "sent_rows": sent}
+
+# Upload CSV (opcional)
+@app.post("/upload_csv")
+async def upload_csv(file: UploadFile = File(...)):
+    content = await file.read()
+    text = content.decode("utf-8", errors="replace").splitlines()
+    reader = csv.DictReader(text)
+    processed: List[Dict[str, Any]] = []
+    for row in reader:
+        processed.append(row)
+    return JSONResponse({"rows": processed})
+
+@atexit.register
+def _flush_on_exit():
+    try:
+        _flush_buffer_to_gcs()
+    except Exception:
+        pass
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
