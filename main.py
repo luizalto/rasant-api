@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI – Shopee ShortLink otimizado + Redis + GCS (flush em background)
-Preserva utm_content existente e adiciona utm_numbered=<base>N<seq> ao lado.
-Gera short-link oficial (Shopee GraphQL) com subIds[2] = utm_numbered.
+FastAPI – Shopee ShortLink otimizado + Redis + GCS (flush background)
+- Preserva utm_content original
+- Adiciona utm_numbered=<base>N<seq> ao lado (sem substituir utm_content)
+- Short-link oficial Shopee com subIds[2] = utm_numbered
+- Suporte a UTM externa via ?uc=... (evita resolver Shopee → mais rápido)
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json
@@ -13,12 +15,13 @@ import redis
 from fastapi import FastAPI, Request, Query, Path, UploadFile, File
 from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse
 from google.cloud import storage
+from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode
 
-# ─────────── Config (usa env se tiver; senão, defaults seguros) ───────────
+# ─────────── Config (usa env se tiver; senão defaults) ───────────
 DEFAULT_TIMEOUT   = float(os.getenv("HTTP_TIMEOUT", "12"))
 
 # GCS
-GCS_BUCKET        = os.getenv("GCS_BUCKET")
+GCS_BUCKET        = os.getenv("GCS_BUCKET")                         # ex: "utm-click-logs"
 GCS_PREFIX        = os.getenv("GCS_PREFIX", "logs/")
 FLUSH_MAX_ROWS    = int(os.getenv("FLUSH_MAX_ROWS", "500"))
 FLUSH_MAX_SECONDS = int(os.getenv("FLUSH_MAX_SECONDS", "30"))
@@ -49,11 +52,11 @@ r = redis.from_url(REDIS_URL)
 _gcs_client: Optional[storage.Client] = None
 _bucket: Optional[storage.Bucket] = None
 if GCS_BUCKET:
-    # Usa credenciais padrão do ambiente (no Render/Cloud Run já funciona)
+    # Usa credenciais padrão do ambiente (Render/Cloud Run já funciona)
     _gcs_client = storage.Client()
     _bucket = _gcs_client.bucket(GCS_BUCKET)
 
-# Sessão HTTP global (reduz latência por reuso de conexões)
+# Sessão HTTP global (reuso de conexões → menos latência)
 session = requests.Session()
 _adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=50)
 session.mount("http://", _adapter)
@@ -125,11 +128,18 @@ def parse_subids_from_query(qs: str) -> Dict[str, Optional[str]]:
 
 def add_or_update_query_param(raw_url: str, key: str, value: str) -> str:
     """Mantém a URL e adiciona (ou atualiza) um parâmetro de query (sem tocar em utm_content)."""
-    parsed = urllib.parse.urlsplit(raw_url)
-    q = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    parsed = urlsplit(raw_url)
+    q = parse_qs(parsed.query, keep_blank_values=True)
     q[key] = [value]
-    new_query = urllib.parse.urlencode(q, doseq=True)
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
+    new_query = urlencode(q, doseq=True)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
+
+def is_shopee_url(u: str) -> bool:
+    try:
+        host = urlsplit(u).netloc.lower()
+        return ("shopee" in host) or ("s.shopee" in host)
+    except:
+        return False
 
 def resolve_short_link(short_url: str, max_hops: int = 1) -> Tuple[str, Dict[str, Optional[str]]]:
     """Resolve no máximo 1 hop para reduzir latência; retorna URL final e sub-ids/utm da query."""
@@ -175,7 +185,7 @@ def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
         "Content-Type": "application/json"
     }
     try:
-        # timeout agressivo tipo (connect=2s, read=10s) e sessão reutilizável
+        # timeout agressivo (connect=2s, read=10s) e sessão reutilizável
         resp = session.post(SHOPEE_ENDPOINT, headers=headers, data=payload, timeout=(2, 10))
         j = resp.json()
         short = (((j or {}).get("data") or {}).get("generateShortLink") or {}).get("shortLink")
@@ -245,44 +255,49 @@ def track_number_and_redirect(
         return JSONResponse({"ok": False, "error": "missing_url"}, status_code=400)
     if raw_path.startswith("//"):
         raw_path = "https:" + raw_path
-    incoming_url = raw_path
 
+    # Ex.: /https://s.shopee.com.br/9fBXK1BY6D?uc=MINHA_UTM
+    incoming_url = raw_path
+    outer_uc = request.query_params.get("uc")  # UTM original por fora (recomendado p/ velocidade)
+
+    # Dados básicos
     ts = int(time.time())
     iso_time = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(ts))
-
     headers = request.headers
     cookie_header = headers.get("cookie") or headers.get("Cookie")
     referrer = headers.get("referer") or "-"
     user_agent = headers.get("user-agent", "-")
     fbclid = request.query_params.get("fbclid")
-
-    client_host = request.client.host if request.client else None
-    if client_host and client_host.startswith("::ffff:"):
-        client_host = client_host.split("::ffff:")[-1]
-    ip_addr = client_host or headers.get("x-forwarded-for") or "0.0.0.0"
-
-    fbp_cookie = get_cookie_value(cookie_header, "_fbp")
-    fbc_val    = build_fbc_from_fbclid(fbclid, creation_ts=ts)
-
+    ip_addr = (request.client.host if request.client else "0.0.0.0")
     device_name, os_family, os_version = parse_device_info(user_agent)
 
-    # 1) resolve com 1 hop (rápido) e extrai utm/subIds originais
-    resolved_url, subids_in = resolve_short_link(incoming_url)
-    utm_original = subids_in.get("utm_content") or ""
+    # 1) Extrair utm_original SEM chamar a Shopee (se possível)
+    if outer_uc:
+        utm_original = outer_uc
+        resolved_url = incoming_url  # zero requisição
+        subids_in = parse_subids_from_query(urlsplit(incoming_url).query)
+    else:
+        # Se já for Shopee, não resolvemos; se for outro encurtador, 1 hop no máx.
+        if is_shopee_url(incoming_url):
+            resolved_url = incoming_url
+            subids_in = parse_subids_from_query(urlsplit(incoming_url).query)
+        else:
+            resolved_url, subids_in = resolve_short_link(incoming_url, max_hops=1)
+        utm_original = subids_in.get("utm_content") or ""
 
-    # 2) gera sequência e nova utm_numbered (sem tocar em utm_content)
+    # 2) Gerar numerada e ADICIONAR ao lado (não tocar em utm_content)
     clean_base = re.sub(r'[^A-Za-z0-9]', '', utm_original or "") or "n"
     seq = incr_counter()
     utm_numbered = f"{clean_base}N{seq}"
-
-    # 3) adiciona nossa utm_numbered ao lado (preserva utm_content original)
     final_with_number = add_or_update_query_param(resolved_url, "utm_numbered", utm_numbered)
 
-    # 4) short-link oficial via Shopee, usando a numerada no subIds[2]
+    # 3) Short-link oficial Shopee com subIds[2] = utm_numbered
     sub_id_api = sanitize_subid_for_shopee(utm_numbered)
     dest = generate_short_link(final_with_number, sub_id_api)
 
-    # 5) grava snapshot no Redis (dados de clique)
+    # 4) Snapshot em Redis
+    fbp_cookie = get_cookie_value(cookie_header, "_fbp")
+    fbc_val    = build_fbc_from_fbclid(fbclid, creation_ts=ts)
     r.setex(f"{USERDATA_KEY_PREFIX}{utm_numbered}", USERDATA_TTL_SECONDS, json.dumps({
         "ip": ip_addr, "ua": user_agent, "referrer": referrer,
         "event_source_url": final_with_number, "short_link": dest,
@@ -290,7 +305,7 @@ def track_number_and_redirect(
         "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_val
     }))
 
-    # 6) enfileira linha para GCS (flush em thread separada)
+    # 5) Enfileira linha p/ GCS (background)
     csv_row = [
         ts, iso_time, ip_addr, user_agent, device_name, os_family, os_version, referrer,
         incoming_url, resolved_url, final_with_number, (cat or ""),
@@ -302,7 +317,7 @@ def track_number_and_redirect(
     with _buffer_lock:
         _buffer_rows.append(csv_row)
 
-    # 7) redireciona imediatamente
+    # 6) Redirect imediato
     return RedirectResponse(dest, status_code=302)
 
 # Admin flush manual
