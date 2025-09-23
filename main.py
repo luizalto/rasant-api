@@ -499,7 +499,7 @@ def track_number_and_redirect(
     meta_sent = ""
 
     try:
-        if utm_numbered.lower().startswith("68novolink".lower()):
+        if utm_numbered.lower().startswith("68novolinks".lower()):
             geo = geo_lookup(ip_addr)
             if _model is not None:
                 feats = _features_for_model(os_family, device_name, os_version, referrer, utm_numbered, iso_time, geo)
@@ -604,3 +604,4 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
+
