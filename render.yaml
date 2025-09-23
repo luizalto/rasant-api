@@ -1,8 +1,10 @@
 services:
   - type: web
-    name: rasant-api             # (ou o nome do seu serviço no Render)
+    name: rasant-api
     env: python
     pythonVersion: 3.11.9
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
-    autoDeploy: true
+    buildCommand: |
+      poetry env use 3.11
+      poetry install --no-root --without dev
+    startCommand: |
+      poetry run uvicorn main:app --host 0.0.0.0 --port $PORT
