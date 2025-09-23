@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "rasant-api"
+version = "0.1.0"
+# ...
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "0.110.3"
+uvicorn = {version = "0.29.0", extras = ["standard"]}
+requests = "2.31.0"
+google-cloud-storage = "2.16.0"
+redis = "5.0.3"
+python-multipart = "0.0.9"
+
+# Predição local (.cbm)
+catboost = "1.2.5"
+pandas = "2.2.2"
+scikit-learn = "1.4.2"
+numpy = "1.26.4"
+scipy = "1.11.4"
