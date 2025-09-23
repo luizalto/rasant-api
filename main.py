@@ -3,7 +3,7 @@
 FastAPI – Shopee ShortLink otimizado + Redis + GCS + Geo (IP) + Predição (CatBoost) + Meta Ads
 - Mantém lógica original de UTM numerada (N<seq>) e shortlink Shopee.
 - Envia linha para GCS em background.
-- Geolocaliza IP e PREDIZ somente quando utm_numbered começa com "68novolink".
+- Geolocaliza IP e PREDIZ para TODOS os cliques.
 - Se predição == "comprou": envia AddToCart para Meta Ads; caso contrário: não envia.
 """
 
@@ -15,7 +15,7 @@ import redis
 from fastapi import FastAPI, Request, Query, Path, UploadFile, File, Header, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse
 from google.cloud import storage
-from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode
+from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode, unquote
 
 # ===================== Config (env c/ defaults) =====================
 DEFAULT_TIMEOUT   = float(os.getenv("HTTP_TIMEOUT", "12"))
@@ -375,12 +375,10 @@ def send_meta_event_add_to_cart(ip: str, user_agent: str, fbp: Optional[str], fb
                 "custom_data": {}
             }]
         }
+        data = {"data": json.dumps(payload["data"]), "access_token": META_ACCESS_TOKEN}
         if META_TEST_EVENT_CODE:
-            payload["test_event_code"] = META_TEST_EVENT_CODE
-        resp = session.post(url, data={"data": json.dumps(payload["data"]),
-                                       **({"test_event_code": META_TEST_EVENT_CODE} if META_TEST_EVENT_CODE else {}),
-                                       "access_token": META_ACCESS_TOKEN},
-                            timeout=8)
+            data["test_event_code"] = META_TEST_EVENT_CODE
+        resp = session.post(url, data=data, timeout=8)
         if resp.status_code >= 400:
             print("[meta] erro:", resp.status_code, resp.text[:200])
             return False
@@ -434,6 +432,11 @@ def health():
     return {"ok": True, "ts": int(time.time()), "bucket": GCS_BUCKET, "prefix": GCS_PREFIX,
             "video_id": VIDEO_ID, "model_loaded": bool(_model)}
 
+@app.get("/robots.txt")
+def robots():
+    # evita que bots caiam na rota de redirect e poluam logs
+    return PlainTextResponse("User-agent: *\nDisallow:\n", status_code=200)
+
 @app.get("/")
 def root():
     return PlainTextResponse("OK", status_code=200)
@@ -463,7 +466,7 @@ def track_number_and_redirect(
     ip_addr = (request.client.host if request.client else "0.0.0.0")
     device_name, os_family, os_version = parse_device_info(user_agent)
 
-    # ===== UTM otimizada (como original) =====
+    # ===== UTM otimizada =====
     resolved_url = incoming_url
     utm_original = outer_uc or ""
     if not utm_original:
@@ -478,9 +481,10 @@ def track_number_and_redirect(
     utm_numbered = f"{clean_base}N{seq}"
     final_with_number = add_or_update_query_param(resolved_url, "utm_numbered", utm_numbered)
 
-    # Short-link oficial Shopee com subIds[2] = utm_numbered
+    # Short-link oficial Shopee com subIds[2] = utm_numbered (decodifica para evitar "invalid origin url")
     sub_id_api = sanitize_subid_for_shopee(utm_numbered)
-    dest = generate_short_link(final_with_number, sub_id_api)
+    origin_url = unquote(final_with_number)
+    dest = generate_short_link(origin_url, sub_id_api)
 
     # Snapshot em Redis
     fbp_cookie = get_cookie_value(cookie_header, "_fbp")
@@ -492,36 +496,27 @@ def track_number_and_redirect(
         "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_val
     }))
 
-    # ===== Geo + Predição (apenas quando começa com 68novolink) =====
-    geo = {"geo_status":"skip"}
+    # ===== Geo + Predição (TODOS) =====
     pred_label = ""
-    p_map = {"comprou": None, "quase": None, "desinteressado": None}
+    p_map = {"comprou": 0.0, "quase": 0.0, "desinteressado": 0.0}
     meta_sent = ""
 
+    geo = geo_lookup(ip_addr)
     try:
-        if utm_numbered.lower().startswith("68novolink".lower()):
-            geo = geo_lookup(ip_addr)
-            if _model is not None:
-                feats = _features_for_model(os_family, device_name, os_version, referrer, utm_numbered, iso_time, geo)
-                # CatBoost: precisamos de lista 2D
-                proba = list(_model.predict_proba([feats])[0])
-                # reordenar para ["comprou","desinteressado","quase"] se necessário
-                classes = list(getattr(_model, "classes_", ["comprou","desinteressado","quase"]))
-                desired = ["comprou","desinteressado","quase"]
-                order = [classes.index(c) for c in desired if c in classes]
-                ordered_classes = [desired[i] for i in range(len(order))]
-                proba = [proba[i] for i in order]
-                # prob map
-                for i, c in enumerate(ordered_classes):
-                    p_map[c] = float(proba[i])
-                # decide label com thresholds
-                pred_label = predict_label(proba, ordered_classes)
-                # Se "comprou" -> AddToCart
-                if pred_label == "comprou":
-                    ok = send_meta_event_add_to_cart(ip_addr, user_agent, fbp_cookie, fbc_val, final_with_number, ts)
-                    meta_sent = "AddToCart" if ok else "error"
-            else:
-                pred_label = ""
+        if _model is not None:
+            feats = _features_for_model(os_family, device_name, os_version, referrer, utm_numbered, iso_time, geo)
+            proba = list(_model.predict_proba([feats])[0])
+            classes = list(getattr(_model, "classes_", ["comprou","desinteressado","quase"]))
+            desired = ["comprou","desinteressado","quase"]
+            order = [classes.index(c) for c in desired if c in classes]
+            ordered_classes = [desired[i] for i in range(len(order))]
+            proba = [proba[i] for i in order]
+            for i, c in enumerate(ordered_classes):
+                p_map[c] = float(proba[i])
+            pred_label = predict_label(proba, ordered_classes)
+            if pred_label == "comprou":
+                ok = send_meta_event_add_to_cart(ip_addr, user_agent, fbp_cookie, fbc_val, final_with_number, ts)
+                meta_sent = "AddToCart" if ok else "error"
     except Exception as e:
         print("[predict] erro:", e)
 
@@ -559,6 +554,7 @@ async def admin_upload_model(
     up_model = model_file or model
     if not up_model:
         raise HTTPException(status_code=400, detail="model file ausente (campo model_file ou model)")
+
     try:
         with open(MODEL_PATH, "wb") as out:
             out.write(await up_model.read())
