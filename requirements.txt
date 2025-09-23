@@ -5,3 +5,9 @@ google-cloud-storage
 redis
 python-multipart
 
+# Para rodar predição com modelo treinado (.cbm)
+catboost==1.2.5
+pandas==2.2.2
+scikit-learn==1.4.2
+numpy==1.26.4
+scipy==1.11.4
