@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 FastAPI – Shopee ShortLink otimizado + Redis + GCS + Geo (IP) + Predição (CatBoost) + Meta Ads
-- Mantém lógica original de UTM numerada (N<seq>) e shortlink Shopee.
-- Envia linha para GCS em background.
 - Geolocaliza IP e PREDIZ para TODOS os cliques.
-- Se predição == "comprou": envia AddToCart para Meta Ads; caso contrário: não envia.
+- Sempre envia ViewContent para o Meta.
+- Se predição == "comprou": envia AddToCart para o Meta.
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json
@@ -12,8 +11,8 @@ from typing import Optional, Dict, Tuple, List, Any
 
 import requests
 import redis
-from fastapi import FastAPI, Request, Query, Path, UploadFile, File, Header, HTTPException
-from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse
+from fastapi import FastAPI, Request, Query, Path, UploadFile, File, Header, HTTPException, Form
+from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse, HTMLResponse
 from google.cloud import storage
 from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode, unquote
 
@@ -44,13 +43,13 @@ SHOPEE_APP_ID     = os.getenv("SHOPEE_APP_ID", "18314810331")
 SHOPEE_APP_SECRET = os.getenv("SHOPEE_APP_SECRET", "LO3QSEG45TYP4NYQBRXLA2YYUL3ZCUPN")
 SHOPEE_ENDPOINT   = os.getenv("SHOPEE_ENDPOINT", "https://open-api.affiliate.shopee.com.br/graphql")
 
-# Meta Ads (opcional)
+# Meta Ads (CAPI)
 META_PIXEL_ID       = os.getenv("META_PIXEL_ID")            # ex: "123456789012345"
 META_ACCESS_TOKEN   = os.getenv("META_ACCESS_TOKEN")        # token do pixel
 META_GRAPH_VERSION  = os.getenv("META_GRAPH_VERSION", "v17.0")
 META_TEST_EVENT_CODE= os.getenv("META_TEST_EVENT_CODE")     # opcional para modo teste
 
-# Modelos (gravação no diretório do projeto)
+# Modelos
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -87,13 +86,15 @@ CSV_HEADERS = [
     "utm_original","utm_numbered",
     "sub_id1","sub_id2","sub_id3","sub_id4","sub_id5",
     "fbclid","fbp","fbc",
-    # geo enriquecido
+    # geo
     "geo_status","geo_country","geo_region","geo_state","geo_city","geo_zip","geo_isp","geo_org","geo_asn","geo_lat","geo_lon",
     # predição
-    "pred_label","p_comprou","p_quase","p_desinteressado","meta_event_sent"
+    "pred_label","p_comprou","p_quase","p_desinteressado",
+    # meta
+    "meta_event_sent","meta_view_sent"
 ]
 
-# ===================== Helpers gerais =====================
+# ===================== Helpers =====================
 def incr_counter() -> int:
     return int(r.incr(COUNTER_KEY))
 
@@ -213,10 +214,9 @@ def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
         print(f"[ShopeeShortLink] ERRO: {e}. Fallback para URL numerada.")
         return origin_url
 
-# ===================== Geo por IP (com cache em Redis) =====================
+# ===================== Geo por IP =====================
 IPAPI_FIELDS = "status,country,region,regionName,city,zip,lat,lon,isp,org,as,query"
 def geo_lookup(ip: str) -> Dict[str, Any]:
-    """Busca geolocalização no cache do Redis; se não houver, consulta ip-api.com/json/<ip>."""
     if not ip or ip.startswith("10.") or ip.startswith("192.168.") or ip.startswith("172.16.") or ip == "127.0.0.1":
         return {"geo_status":"fail"}
     cache_key = f"{GEO_CACHE_PREFIX}{ip}"
@@ -262,7 +262,6 @@ def _load_model_if_available():
             m = CatBoostClassifier()
             m.load_model(MODEL_PATH)
             _model = m
-            # classes e thresholds do JSON (opcional)
             if os.path.exists(MODEL_META_PATH):
                 with open(MODEL_META_PATH, "r", encoding="utf-8") as f:
                     meta = json.load(f)
@@ -279,7 +278,6 @@ def _load_model_if_available():
 
 def _features_for_model(os_family, device_name, os_version, referrer, utm_numbered,
                         iso_time=None, geo: Optional[Dict[str,Any]]=None):
-    # Pequena engenharia de atributos consistente com treino (versão mínima)
     def version_num(s):
         m = re.search(r"(\d+(\.\d+)*)", str(s or ""))
         if not m: return 0.0
@@ -293,7 +291,6 @@ def _features_for_model(os_family, device_name, os_version, referrer, utm_number
         except: return ""
     def extract_hour_from_iso(t):
         try:
-            # t no formato "YYYY-mm-ddTHH:MM:SS-0300"
             hh = str(t).split("T")[1][:2]
             return int(hh)
         except:
@@ -315,7 +312,6 @@ def _features_for_model(os_family, device_name, os_version, referrer, utm_number
     utm_prefix = utm_prefix[0] if utm_prefix else ""
 
     geo = geo or {}
-    # Ordem: categóricas primeiro
     cat = [
         device_name or "",
         os_family or "",
@@ -329,12 +325,10 @@ def _features_for_model(os_family, device_name, os_version, referrer, utm_number
         ref_domain,
         utm_prefix
     ]
-    num = [hour, 0, os_ver_num, is_android, is_ios]  # dow=0 (não usamos aqui)
-    # CatBoost aceita uma lista com [cats..., nums...]
+    num = [hour, 0, os_ver_num, is_android, is_ios]
     return cat + num
 
 def predict_label(proba: List[float], classes: List[str]) -> str:
-    # Com thresholds hierárquicos: 1) comprou 2) quase 3) desinteressado
     try:
         idx = {c:i for i,c in enumerate(classes)}
         p = {c: proba[idx[c]] for c in classes}
@@ -346,35 +340,17 @@ def predict_label(proba: List[float], classes: List[str]) -> str:
             return "quase"
         return "desinteressado"
     except Exception:
-        # fallback argmax
         j = int(max(range(len(proba)), key=lambda i: proba[i]))
         return classes[j]
 
 _load_model_if_available()
 
-# ===================== Meta Ads (opcional) =====================
-def send_meta_event_add_to_cart(ip: str, user_agent: str, fbp: Optional[str], fbc: Optional[str],
-                                event_source_url: str, event_time: int) -> bool:
-    """Envia AddToCart ao Meta Ads. Retorna True se 200 OK."""
+# ===================== Meta Ads (CAPI) =====================
+def _meta_post(payload: dict) -> bool:
     if not (META_PIXEL_ID and META_ACCESS_TOKEN):
         return False
     try:
         url = f"https://graph.facebook.com/{META_GRAPH_VERSION}/{META_PIXEL_ID}/events"
-        payload = {
-            "data": [{
-                "event_name": "AddToCart",
-                "event_time": event_time,
-                "action_source": "website",
-                "event_source_url": event_source_url,
-                "user_data": {
-                    "client_ip_address": ip,
-                    "client_user_agent": user_agent,
-                    **({"fbp": fbp} if fbp else {}),
-                    **({"fbc": fbc} if fbc else {})
-                },
-                "custom_data": {}
-            }]
-        }
         data = {"data": json.dumps(payload["data"]), "access_token": META_ACCESS_TOKEN}
         if META_TEST_EVENT_CODE:
             data["test_event_code"] = META_TEST_EVENT_CODE
@@ -386,6 +362,42 @@ def send_meta_event_add_to_cart(ip: str, user_agent: str, fbp: Optional[str], fb
     except Exception as e:
         print("[meta] exceção:", e)
         return False
+
+def send_meta_event_add_to_cart(ip: str, user_agent: str, fbp: Optional[str], fbc: Optional[str],
+                                event_source_url: str, event_time: int) -> bool:
+    payload = {
+        "data": [{
+            "event_name": "AddToCart",
+            "event_time": event_time,
+            "action_source": "website",
+            "event_source_url": event_source_url,
+            "user_data": {
+                "client_ip_address": ip,
+                "client_user_agent": user_agent,
+                **({"fbp": fbp} if fbp else {}),
+                **({"fbc": fbc} if fbc else {})
+            },
+            "custom_data": {}
+        }]}
+    return _meta_post(payload)
+
+def send_meta_event_view_content(ip: str, user_agent: str, fbp: Optional[str], fbc: Optional[str],
+                                 event_source_url: str, event_time: int) -> bool:
+    payload = {
+        "data": [{
+            "event_name": "ViewContent",
+            "event_time": event_time,
+            "action_source": "website",
+            "event_source_url": event_source_url,
+            "user_data": {
+                "client_ip_address": ip,
+                "client_user_agent": user_agent,
+                **({"fbp": fbp} if fbp else {}),
+                **({"fbc": fbc} if fbc else {})
+            },
+            "custom_data": {}
+        }]}
+    return _meta_post(payload)
 
 # ===================== GCS flush =====================
 def _day_key(ts: int) -> str:
@@ -434,7 +446,6 @@ def health():
 
 @app.get("/robots.txt")
 def robots():
-    # evita que bots caiam na rota de redirect e poluam logs
     return PlainTextResponse("User-agent: *\nDisallow:\n", status_code=200)
 
 @app.get("/")
@@ -466,7 +477,7 @@ def track_number_and_redirect(
     ip_addr = (request.client.host if request.client else "0.0.0.0")
     device_name, os_family, os_version = parse_device_info(user_agent)
 
-    # ===== UTM otimizada =====
+    # ===== UTM / resolução =====
     resolved_url = incoming_url
     utm_original = outer_uc or ""
     if not utm_original:
@@ -481,7 +492,7 @@ def track_number_and_redirect(
     utm_numbered = f"{clean_base}N{seq}"
     final_with_number = add_or_update_query_param(resolved_url, "utm_numbered", utm_numbered)
 
-    # Short-link oficial Shopee com subIds[2] = utm_numbered (decodifica para evitar "invalid origin url")
+    # Short-link Shopee (decodifica para evitar "invalid origin url")
     sub_id_api = sanitize_subid_for_shopee(utm_numbered)
     origin_url = unquote(final_with_number)
     dest = generate_short_link(origin_url, sub_id_api)
@@ -496,31 +507,55 @@ def track_number_and_redirect(
         "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_val
     }))
 
-    # ===== Geo + Predição (TODOS) =====
+    # ===== Geo + Predição =====
     pred_label = ""
     p_map = {"comprou": 0.0, "quase": 0.0, "desinteressado": 0.0}
     meta_sent = ""
+    meta_view = ""
 
     geo = geo_lookup(ip_addr)
     try:
         if _model is not None:
             feats = _features_for_model(os_family, device_name, os_version, referrer, utm_numbered, iso_time, geo)
-            proba = list(_model.predict_proba([feats])[0])
-            classes = list(getattr(_model, "classes_", ["comprou","desinteressado","quase"]))
-            desired = ["comprou","desinteressado","quase"]
-            order = [classes.index(c) for c in desired if c in classes]
-            ordered_classes = [desired[i] for i in range(len(order))]
-            proba = [proba[i] for i in order]
-            for i, c in enumerate(ordered_classes):
-                p_map[c] = float(proba[i])
-            pred_label = predict_label(proba, ordered_classes)
+            raw_proba = _model.predict_proba([feats])[0]
+            proba = list(map(float, raw_proba))
+            classes = []
+            if _model_classes:
+                classes = list(_model_classes)
+            elif hasattr(_model, "classes_"):
+                try:
+                    classes = [str(x) for x in list(_model.classes_)]
+                except Exception:
+                    classes = []
+            if not classes:
+                classes = ["comprou","desinteressado","quase"] if len(proba) >= 3 else ["desinteressado","comprou"]
+
+            tmp = {}
+            for i, cls in enumerate(classes):
+                if i < len(proba):
+                    tmp[cls] = proba[i]
+            for k in ("comprou","quase","desinteressado"):
+                if k in tmp: p_map[k] = tmp[k]
+
+            ordered_classes = [c for c in ("comprou","desinteressado","quase") if c in tmp]
+            ordered_proba   = [tmp[c] for c in ordered_classes]
+            if ordered_proba:
+                pred_label = predict_label(ordered_proba, ordered_classes)
+
             if pred_label == "comprou":
                 ok = send_meta_event_add_to_cart(ip_addr, user_agent, fbp_cookie, fbc_val, final_with_number, ts)
                 meta_sent = "AddToCart" if ok else "error"
     except Exception as e:
         print("[predict] erro:", e)
 
-    # ===== Enfileira linha para GCS =====
+    # ===== Meta: ViewContent (sempre) =====
+    try:
+        ok_vc = send_meta_event_view_content(ip_addr, user_agent, fbp_cookie, fbc_val, final_with_number, ts)
+        meta_view = "ViewContent" if ok_vc else "error"
+    except Exception as e:
+        print("[meta] viewcontent erro:", e)
+
+    # ===== CSV =====
     csv_row = [
         ts, iso_time, ip_addr, user_agent, device_name, os_family, os_version, referrer,
         incoming_url, resolved_url, final_with_number, (cat or ""),
@@ -530,20 +565,61 @@ def track_number_and_redirect(
         fbclid or "", fbp_cookie or "", fbc_val or "",
         geo.get("geo_status",""), geo.get("geo_country",""), geo.get("geo_region",""), geo.get("geo_state",""), geo.get("geo_city",""), geo.get("geo_zip",""),
         geo.get("geo_isp",""), geo.get("geo_org",""), geo.get("geo_asn",""), geo.get("geo_lat",""), geo.get("geo_lon",""),
-        pred_label or "", p_map["comprou"], p_map["quase"], p_map["desinteressado"], meta_sent
+        pred_label or "", p_map["comprou"], p_map["quase"], p_map["desinteressado"],
+        meta_sent, meta_view
     ]
     with _buffer_lock:
         _buffer_rows.append(csv_row)
 
-    # Redirect imediato
     return RedirectResponse(dest, status_code=302)
 
 # ===================== Admin =====================
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page():
+    return """
+    <html>
+      <head><meta charset="utf-8"><title>Upload do Modelo</title></head>
+      <body style="font-family: sans-serif; max-width: 640px; margin: 40px auto;">
+        <h2>Enviar modelo CatBoost</h2>
+        <form method="post" action="/admin/upload_model_simple" enctype="multipart/form-data">
+          <div>Token (X-Admin-Token): <input name="token" type="password" required /></div><br/>
+          <div>model.cbm: <input name="model" type="file" required /></div><br/>
+          <div>model_meta.json (opcional): <input name="meta" type="file" /></div><br/>
+          <button type="submit">Enviar</button>
+        </form>
+        <p>Depois de enviar, abra <code>/health</code> para conferir <b>model_loaded: true</b>.</p>
+      </body>
+    </html>
+    """
+
+@app.post("/admin/upload_model_simple")
+async def admin_upload_model_simple(
+    token: str = Form(...),
+    model: UploadFile = File(...),
+    meta: UploadFile = File(None),
+):
+    if token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    try:
+        with open(MODEL_PATH, "wb") as out:
+            out.write(await model.read())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"falha ao salvar model: {e}")
+    if meta:
+        try:
+            data = await meta.read()
+            _ = json.loads(data.decode("utf-8"))
+            with open(MODEL_META_PATH, "wb") as out:
+                out.write(data)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
+    _load_model_if_available()
+    return {"ok": True, "model_loaded": bool(_model)}
+
 @app.post("/admin/upload_model")
 async def admin_upload_model(
     model_file: UploadFile = File(None),
     meta_file: UploadFile = File(None),
-    # compatibilidade com script que usa nomes "model" / "meta"
     model: UploadFile = File(None),
     meta: UploadFile = File(None),
     x_admin_token: str = Header(None)
@@ -565,14 +641,12 @@ async def admin_upload_model(
     if up_meta:
         try:
             data = await up_meta.read()
-            # valida JSON
             _ = json.loads(data.decode("utf-8"))
             with open(MODEL_META_PATH, "wb") as out:
                 out.write(data)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
 
-    # recarrega
     _load_model_if_available()
     return {"ok": True, "saved": {"model": MODEL_PATH, "meta": (MODEL_META_PATH if up_meta else None)}, "model_loaded": bool(_model)}
 
