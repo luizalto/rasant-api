@@ -7,9 +7,10 @@ Novidades / Ajustes:
 - Suporte a entrada via ?link= (percent-encoded), via código curto no path (/60I729eb2u?uc=w19)
   e via path "antigo", com normalização de https:/ -> https://.
 - Resolve shortlink (s.shopee...) para URL longa ANTES de chamar o GraphQL.
-- Define utm_content preservando ORDEM dos parâmetros originais.
+- Define utm_content preservando ORDEM dos parâmetros originais (sem lookbehind problemático).
 - Intersticial para User-Agent do Pinterest (200ms), garantindo log e geração de short antes do deep-link.
-- Mantém TODAS as funcionalidades anteriores (GCS, Redis, Geo, Predição, CAPI, Admin).
+- Correção na função _is_allowed_long() para aceitar apex + subdomínios (com/sem www e porta).
+- Mantém TODAS as funcionalidades anteriores (Redis, GCS, Geo, Predição, CAPI, Admin).
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json
@@ -100,8 +101,24 @@ def _is_short_domain(domain: str) -> bool:
     return any(d.endswith(sd) for sd in SHORT_DOMAINS)
 
 def _is_allowed_long(domain: str) -> bool:
-    d = (domain or "").lower()
-    return any(d.endswith(suf) for suf in LONG_ALLOWED)
+    """
+    Aceita apex e subdomínios de Shopee e xiapiapp, ignorando 'www.' e porta.
+    Ex.: 'shopee.com.br', 'www.shopee.com.br', 'shopee.com.br:443', 'cf.shopee.com.br'...
+    """
+    if not domain:
+        return False
+    d = domain.strip().lower()
+    # remove porta se houver
+    if ":" in d:
+        d = d.split(":", 1)[0]
+    # remove www.
+    if d.startswith("www."):
+        d = d[4:]
+    # aceita apex exatamente
+    apex_ok = d in ("shopee.com.br", "shopee.com", "xiapiapp.com")
+    # aceita subdomínios
+    suf_ok = any(d.endswith(suf.lstrip(".")) or d.endswith(suf) for suf in LONG_ALLOWED)
+    return apex_ok or suf_ok
 
 def _resolve_short_follow(url: str) -> str:
     """
@@ -121,17 +138,23 @@ def _resolve_short_follow(url: str) -> str:
 def _set_utm_content_preserving_order(url: str, new_value: str) -> str:
     """
     Mantém a ordem original dos parâmetros; altera ou insere apenas utm_content.
+    (Implementação sem regex lookbehind para compatibilidade.)
     """
     parts = urlsplit(url)
     qs = parts.query or ""
     if qs == "":
         new_qs = f"utm_content={new_value}"
     else:
-        if re.search(r'(^|&)(utm_content)=', qs):
-            new_qs = re.sub(r'(?<=^|&)utm_content=[^&]*', f"utm_content={new_value}", qs)
-        else:
-            sep = "&" if not qs.endswith("&") else ""
-            new_qs = qs + f"{sep}utm_content={new_value}"
+        items = qs.split("&") if qs else []
+        replaced = False
+        for i, seg in enumerate(items):
+            if seg.startswith("utm_content="):
+                items[i] = "utm_content=" + new_value
+                replaced = True
+                break
+        if not replaced:
+            items.append("utm_content=" + new_value)
+        new_qs = "&".join(items)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, new_qs, parts.fragment))
 
 PIN_UA_HINTS = ("pinterest",)
@@ -627,7 +650,7 @@ def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str,
     """
     Decide qual URL de entrada usar:
     - Se houver ?link= (percent-encoded), usa e corrige esquema.
-    - Senão, se path for apenas um código short ([A-Za-z0-9]{6,20}), reconstrói s.shopee.com.br/<code> + query.
+    - Senão, se path for apenas um código short ([A-Za-z0-9]{5,20}), reconstrói s.shopee.com.br/<code> + query.
     - Senão, trata o path como URL "antiga": corrige https:/ -> https:// e aceita.
     Retorna (incoming_url, mode): mode ∈ {"query_link","code_path","raw_path"}
     """
@@ -691,8 +714,6 @@ def track_number_and_redirect(
     if _is_short_domain(parts_in.netloc):
         resolved_url = _resolve_short_follow(incoming_url)
     else:
-        # Se path "antigo" embutiu domínio Shopee na string, já está ok;
-        # Se veio um link longo direto via ?link=, só garante esquema.
         resolved_url = _fix_scheme(incoming_url)
 
     # ===== Valida domínio longo antes do GraphQL =====
@@ -707,7 +728,6 @@ def track_number_and_redirect(
     utm_original = outer_uc or extract_utm_content_from_url(incoming_url) or extract_utm_content_from_url(resolved_url) or ""
     subids_in = {}
     if not utm_original and _is_short_domain(parts_in.netloc):
-        # fallback ao parser leve
         _, subids_in = resolve_short_link(incoming_url, max_hops=1)
         utm_original = subids_in.get("utm_content") or ""
 
@@ -718,12 +738,11 @@ def track_number_and_redirect(
     # Define utm_content preservando ordem
     url_with_utm = _set_utm_content_preserving_order(resolved_url, utm_numbered)
 
-    # Mantém utm_numbered adicional sem reordenar demais
+    # Mantém utm_numbered adicional
     url_final_qs_plus = add_or_update_query_param(url_with_utm, "utm_numbered", utm_numbered)
 
     # ===== Prepara origin_url (LONGA) p/ GraphQL =====
     origin_url = url_final_qs_plus
-    # Se ainda for short (caso raro), força resolver novamente
     if _is_short_domain(urlsplit(origin_url).netloc):
         origin_url = _resolve_short_follow(origin_url)
 
