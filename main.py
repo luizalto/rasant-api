@@ -11,7 +11,8 @@ Ajustes importantes:
    (usado como _comprou_threshold)
 2) Alinha features com o pipeline de treino:
    - usa utm_original (não utm_prefix)
-   - calcula dow a partir do iso_time (antes estava 0)
+   - calcula dow a partir do iso_time
+3) LOG: adicionadas as colunas derivadas no CSV (part_of_day, hour, dow, ref_domain, os_version_num, is_android, is_ios).
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json
@@ -100,6 +101,8 @@ CSV_HEADERS = [
     "geo_isp","geo_org","geo_asn","geo_lat","geo_lon",
     # predição
     "pred_label","p_comprou","p_quase","p_desinteressado",
+    # ==== NOVAS FEATURES LOGADAS (alinhadas ao treino) ====
+    "part_of_day","hour","dow","ref_domain","os_version_num","is_android","is_ios",
     # meta
     "meta_event_sent","meta_view_sent"
 ]
@@ -277,9 +280,7 @@ def _load_model_if_available():
             if os.path.exists(MODEL_META_PATH):
                 with open(MODEL_META_PATH, "r", encoding="utf-8") as f:
                     meta = json.load(f)
-                # classes no treino binário geralmente ["desinteressado","comprou"]
                 _model_classes = meta.get("classes") or ["desinteressado","comprou"]
-                # ordem de preferência do threshold
                 thr = meta.get("best_f1_threshold")
                 if thr is None:
                     thr = (meta.get("deploy") or {}).get("threshold")
@@ -325,7 +326,6 @@ def _features_for_model(os_family, device_name, os_version, referrer, utm_origin
             return 0
     def extract_dow_from_iso(t):
         try:
-            # iso_time ex: 2025-09-24T12:34:56-0300 -> usamos os 19 primeiros chars (sem tz)
             dt = datetime.strptime(str(t)[:19], "%Y-%m-%dT%H:%M:%S")
             return dt.weekday()  # 0=segunda ... 6=domingo
         except:
@@ -391,6 +391,42 @@ def predict_label(proba: List[float], classes: List[str]) -> str:
 
 _load_model_if_available()
 
+# ===================== LOG Helpers (novas colunas) =====================
+def _version_num_for_log(s):
+    m = re.search(r"(\d+(\.\d+)*)", str(s or ""))
+    if not m: return 0.0
+    try: return float(m.group(1).split(".")[0])
+    except: return 0.0
+
+def _get_first_domain_for_log(url):
+    try:
+        from urllib.parse import urlparse
+        netloc = urlparse(str(url)).netloc.lower()
+        return netloc[4:] if netloc.startswith("www.") else netloc
+    except: return ""
+
+def _extract_hour_from_iso_for_log(t):
+    try:
+        hh = str(t).split("T")[1][:2]
+        return int(hh)
+    except:
+        return 0
+
+def _extract_dow_from_iso_for_log(t):
+    try:
+        dt = datetime.strptime(str(t)[:19], "%Y-%m-%dT%H:%M:%S")
+        return dt.weekday()
+    except:
+        return time.localtime().tm_wday
+
+def _part_of_day_for_log(hour):
+    h = int(hour)
+    if 0<=h<6: return "dawn"
+    if 6<=h<12: return "morning"
+    if 12<=h<18: return "afternoon"
+    if 18<=h<=23: return "evening"
+    return "unknown"
+
 # ===================== GCS flush =====================
 def _day_key(ts: int) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts))
@@ -415,7 +451,7 @@ def _flush_buffer_to_gcs() -> int:
     w.writerows(rows)
     data = output.getvalue().encode("utf-8")
     part = int(time.time() * 1000) % 10_000_000
-    blob_name = _gcs_object_name(int(time.time()), part)
+    blob_name = _._gcs_object_name(int(time.time()), part) if False else _gcs_object_name(int(time.time()), part)
     _bucket.blob(blob_name).upload_from_string(data, content_type="text/csv")
     print(f"[FLUSH] {len(rows)} linha(s) → gs://{GCS_BUCKET}/{blob_name}")
     return len(rows)
@@ -470,6 +506,15 @@ def track_number_and_redirect(
     ip_addr = (request.client.host if request.client else "0.0.0.0")
     device_name, os_family, os_version = parse_device_info(user_agent)
 
+    # ===== Deriva features para LOG (iguais às do treino) =====
+    hour_log = _extract_hour_from_iso_for_log(iso_time)
+    dow_log  = _extract_dow_from_iso_for_log(iso_time)
+    ref_domain_log = _get_first_domain_for_log(referrer)
+    os_version_num_log = _version_num_for_log(os_version)
+    is_android_log = 1 if "android" in (os_family or "").lower() else 0
+    is_ios_log     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
+    part_of_day_log = _part_of_day_for_log(hour_log)
+
     # ----- extrai/resolve UTM + numeração -----
     resolved_url = incoming_url
     outer_uc = request.query_params.get("uc")
@@ -521,7 +566,7 @@ def track_number_and_redirect(
             raw_proba = _model.predict_proba([feats])[0]
             proba = list(map(float, raw_proba))
 
-            # classes (ordem) – binário normalmente ["desinteressado","comprou"]
+            # classes (ordem)
             if _model_classes:
                 classes = list(_model_classes)
             elif hasattr(_model, "classes_"):
@@ -531,11 +576,9 @@ def track_number_and_redirect(
                     classes = []
             else:
                 classes = []
-
             if not classes:
                 classes = ["desinteressado","comprou"] if len(proba) == 2 else ["comprou","desinteressado","quase"]
 
-            # mapa de probabilidades nomeado
             tmp = {}
             for i, cls in enumerate(classes):
                 if i < len(proba):
@@ -543,7 +586,6 @@ def track_number_and_redirect(
             for k in ("comprou","quase","desinteressado"):
                 if k in tmp: p_map[k] = tmp[k]
 
-            # Ordena para função de decisão
             ordered_classes = [c for c in ("comprou","desinteressado","quase") if c in tmp]
             ordered_proba   = [tmp[c] for c in ordered_classes]
             if ordered_proba:
@@ -611,6 +653,10 @@ def track_number_and_redirect(
         geo.get("geo_city",""), geo.get("geo_zip",""),
         geo.get("geo_isp",""), geo.get("geo_org",""), geo.get("geo_asn",""), geo.get("geo_lat",""), geo.get("geo_lon",""),
         pred_label or "", p_map["comprou"], p_map["quase"], p_map["desinteressado"],
+        # ==== NOVAS FEATURES (ordem = CSV_HEADERS) ====
+        part_of_day_log, hour_log, dow_log, ref_domain_log,
+        os_version_num_log, is_android_log, is_ios_log,
+        # meta
         meta_sent, meta_view
     ]
     with _buffer_lock:
