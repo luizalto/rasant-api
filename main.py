@@ -1,18 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost) + Meta Ads (CAPI)
-- Gera UTM numerada, resolve/genera shortlink, registra clique e manda eventos para o Meta.
-- Sempre envia ViewContent.
-- Se o modelo prever "comprou", envia AddToCart.
+Ajustado para alinhar com o pipeline de treino (comprou binário + QVC/ATC thresholds).
 
-Ajustes importantes:
-1) Lê de model_meta.json o threshold de produção, priorizando:
-   best_f1_threshold  >  deploy.threshold  >  thresholds.max_f1  >  0.5 (fallback)
-   (usado como _comprou_threshold)
-2) Alinha features com o pipeline de treino:
-   - usa utm_original (não utm_prefix)
-   - calcula dow a partir do iso_time
-3) LOG: adicionadas as colunas derivadas no CSV (part_of_day, hour, dow, ref_domain, os_version_num, is_android, is_ios).
+Mudanças chave:
+- Espera arquivos do treino: models/model_comprou.cbm e models/model_meta_comprou.json
+- Lê thresholds: thresholds.atc_high (produção) > thresholds.qvc_mid > 0.5
+- Reproduz TODAS as features do treino e respeita a ORDEM de feature_names + cat_idx
+- TE opcional via models/te_stats.json (senão preenche enc_cols com 0.0)
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json
@@ -59,12 +54,13 @@ META_ACCESS_TOKEN    = os.getenv("META_ACCESS_TOKEN") or os.getenv("FB_ACCESS_TO
 META_GRAPH_VERSION   = os.getenv("META_GRAPH_VERSION", "v17.0")
 META_TEST_EVENT_CODE = os.getenv("META_TEST_EVENT_CODE")  # opcional
 
-# Modelos
+# Modelos (padronizados com o treino)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
-MODEL_PATH = os.path.join(MODELS_DIR, "model.cbm")
-MODEL_META_PATH = os.path.join(MODELS_DIR, "model_meta.json")
+MODEL_PATH = os.path.join(MODELS_DIR, "model_comprou.cbm")
+MODEL_META_PATH = os.path.join(MODELS_DIR, "model_meta_comprou.json")
+TE_STATS_PATH = os.path.join(MODELS_DIR, "te_stats.json")  # opcional
 
 # ===================== App / Clients =====================
 app = FastAPI(title="Shopee UTM Numbered → ShortLink + Redis + GCS + Geo + Predict")
@@ -265,133 +261,71 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
 # ===================== Predição (CatBoost) =====================
 _model = None
 _model_classes: List[str] = []
-_thresholds: Dict[str, float] = {}   # legado
-_comprou_threshold: float = 0.5      # threshold efetivo p/ classe "comprou"
+_thresholds: Dict[str, float] = {}   # {"qvc_mid":..., "atc_high":...}
+_comprou_threshold: float = 0.5      # corte efetivo (ATC por padrão)
 
-def _load_model_if_available():
-    global _model, _model_classes, _thresholds, _comprou_threshold
-    try:
-        from catboost import CatBoostClassifier
-        if os.path.exists(MODEL_PATH):
-            m = CatBoostClassifier()
-            m.load_model(MODEL_PATH)
-            _model = m
-            # meta
-            if os.path.exists(MODEL_META_PATH):
-                with open(MODEL_META_PATH, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-                _model_classes = meta.get("classes") or ["desinteressado","comprou"]
-                thr = meta.get("best_f1_threshold")
-                if thr is None:
-                    thr = (meta.get("deploy") or {}).get("threshold")
-                if thr is None:
-                    thr = (meta.get("thresholds") or {}).get("max_f1")
-                _comprou_threshold = float(thr) if thr is not None else 0.5
-                _thresholds = meta.get("thresholds") or {}
-            else:
-                _model_classes = ["desinteressado","comprou"]
-                _comprou_threshold = 0.5
-                _thresholds = {}
-            print(f"[model] carregado com sucesso. thr_comprou={_comprou_threshold}")
-        else:
-            print("[model] arquivo não encontrado:", MODEL_PATH)
-    except Exception as e:
-        print("[model] erro ao carregar:", e)
+# meta → nomes/índices de features para ordenar corretamente
+_FEATURE_NAMES_FROM_META: List[str] = []
+_CAT_IDX_FROM_META: List[int] = []
 
-def _features_for_model(os_family, device_name, os_version, referrer, utm_original,
-                        iso_time=None, geo: Optional[Dict[str,Any]]=None):
-    """
-    Alinha com o pipeline do treino (binário):
-      Categóricas: device_name, os_family, part_of_day,
-                   geo_country, geo_region, geo_city, geo_zip, geo_isp, geo_org,
-                   ref_domain, utm_original
-      Numéricas:   hour, dow, os_version_num, is_android, is_ios
-    """
-    def version_num(s):
-        m = re.search(r"(\d+(\.\d+)*)", str(s or ""))
-        if not m: return 0.0
-        try: return float(m.group(1).split(".")[0])
-        except: return 0.0
-    def get_first_domain(url):
+# Target Encoding opcional
+_TE_STATS = None  # {"utm_original": {"val":{"count":..,"buy_rate":..},...}, ...}
+_TE_PRIORS = None # {"utm_original": prior_float, ...}
+
+def _load_te_if_available():
+    global _TE_STATS, _TE_PRIORS
+    if os.path.exists(TE_STATS_PATH):
         try:
-            from urllib.parse import urlparse
-            netloc = urlparse(str(url)).netloc.lower()
-            return netloc[4:] if netloc.startswith("www.") else netloc
-        except: return ""
-    def extract_hour_from_iso(t):
-        try:
-            hh = str(t).split("T")[1][:2]
-            return int(hh)
-        except:
-            return 0
-    def extract_dow_from_iso(t):
-        try:
-            dt = datetime.strptime(str(t)[:19], "%Y-%m-%dT%H:%M:%S")
-            return dt.weekday()  # 0=segunda ... 6=domingo
-        except:
-            return time.localtime().tm_wday
-    def part_of_day(hour):
-        h = int(hour)
-        if 0<=h<6: return "dawn"
-        if 6<=h<12: return "morning"
-        if 12<=h<18: return "afternoon"
-        if 18<=h<=23: return "evening"
-        return "unknown"
+            obj = json.load(open(TE_STATS_PATH, "r", encoding="utf-8"))
+            _TE_STATS = obj.get("stats", {})
+            _TE_PRIORS = obj.get("priors", {})
+            print("[TE] stats carregadas.")
+        except Exception as e:
+            print("[TE] erro ao carregar:", e)
 
-    hour = extract_hour_from_iso(iso_time or "")
-    dow  = extract_dow_from_iso(iso_time or "")
-    is_android = 1 if str(os_family).lower().find("android")>=0 else 0
-    is_ios     = 1 if re.search(r"ios|iphone|ipad", str(os_family), re.I) else 0
-    os_ver_num = version_num(os_version)
-    ref_domain = get_first_domain(referrer or "")
+def _norm_text(s: str) -> str:
+    s = (s or "").strip().lower()
+    import unicodedata
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(ch for ch in s if not unicodedata.combining(ch))
 
-    geo = geo or {}
-    cat = [
-        device_name or "",
-        os_family or "",
-        part_of_day(hour),
-        (geo.get("geo_country") or ""),
-        (geo.get("geo_region") or ""),
-        (geo.get("geo_city") or ""),
-        (geo.get("geo_zip") or ""),
-        (geo.get("geo_isp") or ""),
-        (geo.get("geo_org") or ""),
-        ref_domain,
-        utm_original or ""
-    ]
-    num = [hour, dow, os_ver_num, is_android, is_ios]
-    return cat + num
+def _device_bucket_from_name(name: str) -> str:
+    s = _norm_text(name)
+    if any(k in s for k in ["iphone 13","iphone 14","iphone 15","iphone 16","pro max","s24","s23","ultra","pixel 7","pixel 8","pixel 9"]):
+        return "high"
+    if any(k in s for k in ["iphone 11","iphone 12","s22","s21","pixel 6","a54","a53","m54","m53","redmi note 12"]):
+        return "mid"
+    if any(k in s for k in ["j2","j5","j7","moto e","moto g5","galaxy a10","a20","redmi 9","a01","k10","k11"]):
+        return "low"
+    if any(k in s for k in ["iphone","galaxy","moto","redmi","pixel"]):
+        return "mid"
+    return "unknown"
 
-def predict_label(proba: List[float], classes: List[str]) -> str:
-    """
-    Aplica threshold de 'comprou' (binário) vindo do model_meta.json.
-    Se existir classe 'quase' e threshold, aplica na sequência.
-    Caso contrário, fallback para argmax.
-    """
-    try:
-        idx = {c:i for i,c in enumerate(classes)}
-        p = {c: proba[idx[c]] for c in classes}
+def _br_region_macro(uf_or_region: str) -> str:
+    s = _norm_text(uf_or_region)
+    macro = {
+        "sp":"sudeste","rj":"sudeste","mg":"sudeste","es":"sudeste",
+        "pr":"sul","sc":"sul","rs":"sul",
+        "df":"centro-oeste","go":"centro-oeste","mt":"centro-oeste","ms":"centro-oeste",
+        "ba":"nordeste","pe":"nordeste","ce":"nordeste","ma":"nordeste","pb":"nordeste","rn":"nordeste","al":"nordeste","se":"nordeste","pi":"nordeste",
+        "am":"norte","pa":"norte","ro":"norte","rr":"norte","ap":"norte","ac":"norte","to":"norte"
+    }
+    for m in ["sudeste","sul","centro-oeste","nordeste","norte"]:
+        if m in s: return m
+    uf = s[-2:]
+    return macro.get(uf, "unknown")
 
-        # Threshold principal para "comprou"
-        thr_c = _comprou_threshold
-        if "comprou" in classes and p.get("comprou", 0.0) >= thr_c:
-            return "comprou"
+def _is_weekend_from_dow(dow: int) -> int:
+    return 1 if int(dow) in (5,6) else 0
 
-        # Se for 3 classes, aplica "quase" se houver threshold (opcional)
-        if "quase" in classes:
-            thr_q = float(_thresholds.get("quase", 1.1))  # 1.1 = nunca ativa se não houver
-            if p.get("quase", 0.0) >= thr_q:
-                return "quase"
+def _part_of_day_from_hour(h: int) -> str:
+    h = int(h)
+    if 0<=h<6: return "dawn"
+    if 6<=h<12: return "morning"
+    if 12<=h<18: return "afternoon"
+    if 18<=h<=23: return "evening"
+    return "unknown"
 
-        return "desinteressado"
-    except Exception:
-        # Fallback: argmax
-        j = int(max(range(len(proba)), key=lambda i: proba[i]))
-        return classes[j]
-
-_load_model_if_available()
-
-# ===================== LOG Helpers (novas colunas) =====================
 def _version_num_for_log(s):
     m = re.search(r"(\d+(\.\d+)*)", str(s or ""))
     if not m: return 0.0
@@ -419,13 +353,171 @@ def _extract_dow_from_iso_for_log(t):
     except:
         return time.localtime().tm_wday
 
-def _part_of_day_for_log(hour):
-    h = int(hour)
-    if 0<=h<6: return "dawn"
-    if 6<=h<12: return "morning"
-    if 12<=h<18: return "afternoon"
-    if 18<=h<=23: return "evening"
-    return "unknown"
+def _apply_te(colname: str, value: str) -> Tuple[float,float]:
+    """Retorna (n, buy_rate) com TE, se disponível; senão (0.0, 0.0)."""
+    if not _TE_STATS or colname not in _TE_STATS:
+        return 0.0, 0.0
+    stats_map = _TE_STATS[colname]  # dict: value -> {"count": int, "buy_rate": float}
+    prior = 0.0
+    if _TE_PRIORS: prior = float(_TE_PRIORS.get(colname, 0.0))
+    rec = stats_map.get(value)
+    if rec:
+        return float(rec.get("count", 0.0)), float(rec.get("buy_rate", prior))
+    return 0.0, float(prior)
+
+def _features_full_dict(os_family, device_name, os_version, referrer, utm_original,
+                        iso_time=None, geo: Optional[Dict[str,Any]]=None) -> Dict[str, Any]:
+    # base temporais / sistemas
+    hour = _extract_hour_from_iso_for_log(iso_time)
+    dow  = _extract_dow_from_iso_for_log(iso_time)
+    is_android = 1 if "android" in (os_family or "").lower() else 0
+    is_ios     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
+    os_ver_num = _version_num_for_log(os_version)
+    ref_domain = _get_first_domain_for_log(referrer or "")
+
+    # novas/derivadas p/ alinhar com treino
+    device_bucket = _device_bucket_from_name(device_name)
+    part_of_day   = _part_of_day_from_hour(hour)
+    is_weekend    = _is_weekend_from_dow(dow)
+
+    geo = geo or {}
+    geo_country = (geo.get("geo_country") or "")
+    geo_region  = (geo.get("geo_region")  or "")
+    geo_city    = (geo.get("geo_city")    or "")
+    geo_zip     = (geo.get("geo_zip")     or "")
+    geo_isp     = (geo.get("geo_isp")     or "")
+    geo_org     = (geo.get("geo_org")     or "")
+
+    geo_macro = _br_region_macro(geo_region or geo.get("geo_state") or "")
+
+    device_city_combo   = (f"{device_bucket}__{geo_city}").lower()
+    utm_partofday_combo = (f"{utm_original}__{part_of_day}").lower()
+
+    # Target Encoding (opcional)
+    utm_n,  utm_br  = _apply_te("utm_original", str(utm_original or ""))
+    ref_n,  ref_br  = _apply_te("ref_domain",   str(ref_domain))
+    devb_n, devb_br = _apply_te("device_bucket",str(device_bucket))
+    city_n, city_br = _apply_te("geo_city",     str(geo_city))
+
+    feats = {
+        # CATEGÓRICAS (como no treino)
+        "device_bucket": device_bucket,
+        "os_family": os_family or "",
+        "part_of_day": part_of_day,
+        "geo_macro": geo_macro,
+        "geo_region": geo_region,
+        "geo_city": geo_city,
+        "geo_zip": geo_zip,
+        "geo_isp": geo_isp,
+        "geo_org": geo_org,
+        "ref_domain": ref_domain,
+        "utm_original": utm_original or "",
+        "device_city_combo": device_city_combo,
+        "utm_partofday_combo": utm_partofday_combo,
+        # NUMÉRICAS
+        "hour": float(hour),
+        "dow": float(dow),
+        "is_weekend": float(is_weekend),
+        "os_version_num": float(os_ver_num),
+        "is_android": float(is_android),
+        "is_ios": float(is_ios),
+        # ENCODINGS
+        "utm_n": float(utm_n), "utm_br": float(utm_br),
+        "ref_n": float(ref_n), "ref_br": float(ref_br),
+        "devb_n": float(devb_n), "devb_br": float(devb_br),
+        "city_n": float(city_n), "city_br": float(city_br),
+    }
+    return feats
+
+def _row_in_meta_order(feats_dict: Dict[str, Any]) -> Tuple[List[Any], List[int]]:
+    """
+    Retorna lista de valores na ORDEM de _FEATURE_NAMES_FROM_META.
+    Preenche faltantes: categ='' ; num=0.0 .
+    """
+    ordered = []
+    for col in _FEATURE_NAMES_FROM_META:
+        v = feats_dict.get(col)
+        if v is None:
+            # heurística: nomes típicos
+            if col in ("hour","dow","is_weekend","os_version_num","is_android","is_ios",
+                       "utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br"):
+                v = 0.0
+            else:
+                v = ""
+        ordered.append(v)
+    return ordered, _CAT_IDX_FROM_META
+
+def _load_model_if_available():
+    global _model, _model_classes, _thresholds, _comprou_threshold
+    global _FEATURE_NAMES_FROM_META, _CAT_IDX_FROM_META
+    try:
+        from catboost import CatBoostClassifier
+        if os.path.exists(MODEL_PATH):
+            m = CatBoostClassifier()
+            m.load_model(MODEL_PATH)
+            _model = m
+
+            # meta do treino
+            if os.path.exists(MODEL_META_PATH):
+                meta = json.load(open(MODEL_META_PATH, "r", encoding="utf-8"))
+                _model_classes = meta.get("classes") or meta.get("classes_binary") or ["desinteressado","comprou"]
+
+                thr_qvc = ((meta.get("thresholds") or {}).get("qvc_mid"))
+                thr_atc = ((meta.get("thresholds") or {}).get("atc_high"))
+                _thresholds = {"qvc_mid": thr_qvc, "atc_high": thr_atc}
+
+                # threshold de produção (ATC por padrão; fallback QVC; senão 0.5)
+                if thr_atc is not None:
+                    _comprou_threshold = float(thr_atc)
+                elif thr_qvc is not None:
+                    _comprou_threshold = float(thr_qvc)
+                else:
+                    _comprou_threshold = 0.5
+
+                _FEATURE_NAMES_FROM_META = list(meta.get("feature_names", []))
+                _CAT_IDX_FROM_META = list(meta.get("cat_idx", []))
+            else:
+                _model_classes = ["desinteressado","comprou"]
+                _comprou_threshold = 0.5
+                _thresholds = {}
+                _FEATURE_NAMES_FROM_META = []
+                _CAT_IDX_FROM_META = []
+
+            _load_te_if_available()
+            print(f"[model] OK. thr_atc={_thresholds.get('atc_high')} thr_qvc={_thresholds.get('qvc_mid')} thr_prod={_comprou_threshold}")
+        else:
+            print("[model] arquivo não encontrado:", MODEL_PATH)
+    except Exception as e:
+        print("[model] erro ao carregar:", e)
+
+def predict_label_from_probs(proba: List[float], classes: List[str]) -> str:
+    """
+    Produção: aplica _comprou_threshold para 'comprou' (binário).
+    Se houver 'quase' e threshold no meta (opcional), aplica depois.
+    Senão, fallback argmax.
+    """
+    try:
+        idx = {c:i for i,c in enumerate(classes)}
+        p = {c: proba[idx[c]] for c in classes}
+
+        # corte principal (ATC / produção)
+        thr_c = _comprou_threshold
+        if "comprou" in classes and p.get("comprou", 0.0) >= thr_c:
+            return "comprou"
+
+        # opcional "quase"
+        if "quase" in classes:
+            thr_q = float((_thresholds or {}).get("quase", 1.1))  # 1.1 => nunca ativa se não houver
+            if p.get("quase", 0.0) >= thr_q:
+                return "quase"
+
+        return "desinteressado"
+    except Exception:
+        # Fallback: argmax
+        j = int(max(range(len(proba)), key=lambda i: proba[i]))
+        return classes[j]
+
+_load_model_if_available()
 
 # ===================== GCS flush =====================
 def _day_key(ts: int) -> str:
@@ -451,7 +543,7 @@ def _flush_buffer_to_gcs() -> int:
     w.writerows(rows)
     data = output.getvalue().encode("utf-8")
     part = int(time.time() * 1000) % 10_000_000
-    blob_name = _._gcs_object_name(int(time.time()), part) if False else _gcs_object_name(int(time.time()), part)
+    blob_name = _gcs_object_name(int(time.time()), part)
     _bucket.blob(blob_name).upload_from_string(data, content_type="text/csv")
     print(f"[FLUSH] {len(rows)} linha(s) → gs://{GCS_BUCKET}/{blob_name}")
     return len(rows)
@@ -469,9 +561,20 @@ threading.Thread(target=_background_flusher, daemon=True).start()
 # ===================== Rotas =====================
 @app.get("/health")
 def health():
-    return {"ok": True, "ts": int(time.time()), "bucket": GCS_BUCKET, "prefix": GCS_PREFIX,
-            "video_id": VIDEO_ID, "model_loaded": bool(_model),
-            "classes": _model_classes, "comprou_threshold": _comprou_threshold}
+    return {
+        "ok": True,
+        "ts": int(time.time()),
+        "bucket": GCS_BUCKET,
+        "prefix": GCS_PREFIX,
+        "video_id": VIDEO_ID,
+        "model_loaded": bool(_model),
+        "classes": _model_classes,
+        "comprou_threshold_prod": _comprou_threshold,
+        "thr_atc": (_thresholds or {}).get("atc_high"),
+        "thr_qvc": (_thresholds or {}).get("qvc_mid"),
+        "n_features_meta": len(_FEATURE_NAMES_FROM_META),
+        "cat_idx_meta": _CAT_IDX_FROM_META,
+    }
 
 @app.get("/robots.txt")
 def robots():
@@ -513,7 +616,7 @@ def track_number_and_redirect(
     os_version_num_log = _version_num_for_log(os_version)
     is_android_log = 1 if "android" in (os_family or "").lower() else 0
     is_ios_log     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
-    part_of_day_log = _part_of_day_for_log(hour_log)
+    part_of_day_log = _part_of_day_from_hour(hour_log)
 
     # ----- extrai/resolve UTM + numeração -----
     resolved_url = incoming_url
@@ -560,25 +663,25 @@ def track_number_and_redirect(
 
     geo = geo_lookup(ip_addr)
     try:
-        if _model is not None:
-            # Usa utm_original e calcula dow/hora conforme treino
-            feats = _features_for_model(os_family, device_name, os_version, referrer, utm_original, iso_time, geo)
-            raw_proba = _model.predict_proba([feats])[0]
-            proba = list(map(float, raw_proba))
+        if _model is not None and _FEATURE_NAMES_FROM_META:
+            feats_dict = _features_full_dict(os_family, device_name, os_version, referrer, utm_original, iso_time, geo)
+            row_values, cat_idx = _row_in_meta_order(feats_dict)
+
+            # monta Pool com cat_features corretos
+            from catboost import Pool
+            import pandas as pd
+            X_df = pd.DataFrame([row_values], columns=_FEATURE_NAMES_FROM_META)
+            pool = Pool(X_df, cat_features=cat_idx)
+
+            raw_proba = _model.predict_proba(pool)[0]
+            proba = [float(x) for x in raw_proba]
 
             # classes (ordem)
-            if _model_classes:
-                classes = list(_model_classes)
-            elif hasattr(_model, "classes_"):
-                try:
-                    classes = [str(x) for x in list(_model.classes_)]
-                except Exception:
-                    classes = []
-            else:
-                classes = []
-            if not classes:
-                classes = ["desinteressado","comprou"] if len(proba) == 2 else ["comprou","desinteressado","quase"]
+            classes = list(_model_classes) if _model_classes else (
+                [str(x) for x in getattr(_model, "classes_", [])] or ["desinteressado","comprou"]
+            )
 
+            # mapeia para p_map conhecido
             tmp = {}
             for i, cls in enumerate(classes):
                 if i < len(proba):
@@ -589,7 +692,7 @@ def track_number_and_redirect(
             ordered_classes = [c for c in ("comprou","desinteressado","quase") if c in tmp]
             ordered_proba   = [tmp[c] for c in ordered_classes]
             if ordered_proba:
-                pred_label = predict_label(ordered_proba, ordered_classes)
+                pred_label = predict_label_from_probs(ordered_proba, ordered_classes)
 
             # Se o ML previu "comprou", envia AddToCart
             if pred_label == "comprou" and META_PIXEL_ID and META_ACCESS_TOKEN:
@@ -671,14 +774,15 @@ def admin_page():
     <html>
       <head><meta charset="utf-8"><title>Upload do Modelo</title></head>
       <body style="font-family: sans-serif; max-width: 640px; margin: 40px auto;">
-        <h2>Enviar modelo CatBoost</h2>
+        <h2>Enviar modelo CatBoost (alinhado ao treino)</h2>
+        <p><b>Arquivos esperados:</b> model_comprou.cbm e model_meta_comprou.json</p>
         <form method="post" action="/admin/upload_model_simple" enctype="multipart/form-data">
           <div>Token (X-Admin-Token): <input name="token" type="password" required /></div><br/>
-          <div>model.cbm: <input name="model" type="file" required /></div><br/>
-          <div>model_meta.json (opcional): <input name="meta" type="file" /></div><br/>
+          <div>model_comprou.cbm: <input name="model" type="file" required /></div><br/>
+          <div>model_meta_comprou.json (opcional): <input name="meta" type="file" /></div><br/>
           <button type="submit">Enviar</button>
         </form>
-        <p>Depois de enviar, abra <code>/health</code> para conferir <b>model_loaded: true</b>.</p>
+        <p>Depois de enviar, abra <code>/health</code> para conferir <b>model_loaded: true</b> e os thresholds.</p>
       </body>
     </html>
     """
@@ -705,7 +809,7 @@ async def admin_upload_model_simple(
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
     _load_model_if_available()
-    return {"ok": True, "model_loaded": bool(_model), "comprou_threshold": _comprou_threshold}
+    return {"ok": True, "model_loaded": bool(_model), "comprou_threshold_prod": _comprou_threshold}
 
 @app.post("/admin/upload_model")
 async def admin_upload_model(
@@ -739,15 +843,19 @@ async def admin_upload_model(
             raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
 
     _load_model_if_available()
-    return {"ok": True, "saved": {"model": MODEL_PATH, "meta": (MODEL_META_PATH if up_meta else None)},
-            "model_loaded": bool(_model), "comprou_threshold": _comprou_threshold}
+    return {
+        "ok": True,
+        "saved": {"model": MODEL_PATH, "meta": (MODEL_META_PATH if up_meta else None)},
+        "model_loaded": bool(_model),
+        "comprou_threshold_prod": _comprou_threshold
+    }
 
 @app.post("/admin/reload_model")
 def admin_reload_model(x_admin_token: str = Header(None)):
     if x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
     _load_model_if_available()
-    return {"ok": True, "model_loaded": bool(_model), "comprou_threshold": _comprou_threshold}
+    return {"ok": True, "model_loaded": bool(_model), "comprou_threshold_prod": _comprou_threshold}
 
 @app.get("/admin/flush")
 def admin_flush(token: str):
