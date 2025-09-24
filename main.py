@@ -3,11 +3,13 @@
 FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost) + Meta Ads (CAPI)
 Ajustado para alinhar com o pipeline de treino (comprou binário + QVC/ATC thresholds).
 
-Mudanças chave:
-- Espera arquivos do treino: models/model_comprou.cbm e models/model_meta_comprou.json
-- Lê thresholds: thresholds.atc_high (produção) > thresholds.qvc_mid > 0.5
-- Reproduz TODAS as features do treino e respeita a ORDEM de feature_names + cat_idx
-- TE opcional via models/te_stats.json (senão preenche enc_cols com 0.0)
+Novidades / Ajustes:
+- Suporte a entrada via ?link= (percent-encoded), via código curto no path (/60I729eb2u?uc=w19)
+  e via path "antigo", com normalização de https:/ -> https://.
+- Resolve shortlink (s.shopee...) para URL longa ANTES de chamar o GraphQL.
+- Define utm_content preservando ORDEM dos parâmetros originais.
+- Intersticial para User-Agent do Pinterest (200ms), garantindo log e geração de short antes do deep-link.
+- Mantém TODAS as funcionalidades anteriores (GCS, Redis, Geo, Predição, CAPI, Admin).
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json
@@ -81,6 +83,62 @@ _adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=50)
 session.mount("http://", _adapter)
 session.mount("https://", _adapter)
 
+# ===================== Constantes/Helpers de URL =====================
+SHORT_DOMAINS = ("s.shopee.com.br", "s.shopee.com")
+LONG_ALLOWED  = (".shopee.com.br", ".shopee.com", ".xiapiapp.com")
+
+def _fix_scheme(url: str) -> str:
+    # Corrige https:/ -> https:// ; http:/ -> http://
+    if url.startswith("https:/") and not url.startswith("https://"):
+        return "https://" + url[len("https:/"):]
+    if url.startswith("http:/") and not url.startswith("http://"):
+        return "http://" + url[len("http:/"):]
+    return url
+
+def _is_short_domain(domain: str) -> bool:
+    d = (domain or "").lower()
+    return any(d.endswith(sd) for sd in SHORT_DOMAINS)
+
+def _is_allowed_long(domain: str) -> bool:
+    d = (domain or "").lower()
+    return any(d.endswith(suf) for suf in LONG_ALLOWED)
+
+def _resolve_short_follow(url: str) -> str:
+    """
+    Resolve shortlink (s.shopee...) até a URL longa final do produto.
+    Tenta HEAD e depois GET com allow_redirects=True.
+    """
+    try:
+        resp = session.head(url, allow_redirects=True, timeout=DEFAULT_TIMEOUT)
+        final_url = resp.url
+        if _is_short_domain(urlsplit(final_url).netloc):
+            resp = session.get(url, allow_redirects=True, timeout=DEFAULT_TIMEOUT)
+            final_url = resp.url
+        return final_url
+    except Exception:
+        return url  # fallback: devolve a própria
+
+def _set_utm_content_preserving_order(url: str, new_value: str) -> str:
+    """
+    Mantém a ordem original dos parâmetros; altera ou insere apenas utm_content.
+    """
+    parts = urlsplit(url)
+    qs = parts.query or ""
+    if qs == "":
+        new_qs = f"utm_content={new_value}"
+    else:
+        if re.search(r'(^|&)(utm_content)=', qs):
+            new_qs = re.sub(r'(?<=^|&)utm_content=[^&]*', f"utm_content={new_value}", qs)
+        else:
+            sep = "&" if not qs.endswith("&") else ""
+            new_qs = qs + f"{sep}utm_content={new_value}"
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_qs, parts.fragment))
+
+PIN_UA_HINTS = ("pinterest",)
+def _is_pinterest(ua: str) -> bool:
+    ua = (ua or "").lower()
+    return any(h in ua for h in PIN_UA_HINTS)
+
 # ===================== Buffer CSV =====================
 _buffer_lock = threading.Lock()
 _buffer_rows: List[List[str]] = []
@@ -103,7 +161,7 @@ CSV_HEADERS = [
     "meta_event_sent","meta_view_sent"
 ]
 
-# ===================== Helpers =====================
+# ===================== Helpers já existentes =====================
 def incr_counter() -> int:
     return int(r.incr(COUNTER_KEY))
 
@@ -197,6 +255,9 @@ def sanitize_subid_for_shopee(value: str) -> str:
     return cleaned[:_SUBID_MAXLEN] if cleaned else "na"
 
 def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
+    """
+    origin_url deve ser a URL LONGA do produto, não shortlink.
+    """
     payload_obj = {
         "query": (
             "mutation{generateShortLink(input:{"
@@ -269,8 +330,8 @@ _FEATURE_NAMES_FROM_META: List[str] = []
 _CAT_IDX_FROM_META: List[int] = []
 
 # Target Encoding opcional
-_TE_STATS = None  # {"utm_original": {"val":{"count":..,"buy_rate":..},...}, ...}
-_TE_PRIORS = None # {"utm_original": prior_float, ...}
+_TE_STATS = None
+_TE_PRIORS = None
 
 def _load_te_if_available():
     global _TE_STATS, _TE_PRIORS
@@ -354,10 +415,9 @@ def _extract_dow_from_iso_for_log(t):
         return time.localtime().tm_wday
 
 def _apply_te(colname: str, value: str) -> Tuple[float,float]:
-    """Retorna (n, buy_rate) com TE, se disponível; senão (0.0, 0.0)."""
     if not _TE_STATS or colname not in _TE_STATS:
         return 0.0, 0.0
-    stats_map = _TE_STATS[colname]  # dict: value -> {"count": int, "buy_rate": float}
+    stats_map = _TE_STATS[colname]
     prior = 0.0
     if _TE_PRIORS: prior = float(_TE_PRIORS.get(colname, 0.0))
     rec = stats_map.get(value)
@@ -367,7 +427,6 @@ def _apply_te(colname: str, value: str) -> Tuple[float,float]:
 
 def _features_full_dict(os_family, device_name, os_version, referrer, utm_original,
                         iso_time=None, geo: Optional[Dict[str,Any]]=None) -> Dict[str, Any]:
-    # base temporais / sistemas
     hour = _extract_hour_from_iso_for_log(iso_time)
     dow  = _extract_dow_from_iso_for_log(iso_time)
     is_android = 1 if "android" in (os_family or "").lower() else 0
@@ -375,7 +434,6 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
     os_ver_num = _version_num_for_log(os_version)
     ref_domain = _get_first_domain_for_log(referrer or "")
 
-    # novas/derivadas p/ alinhar com treino
     device_bucket = _device_bucket_from_name(device_name)
     part_of_day   = _part_of_day_from_hour(hour)
     is_weekend    = _is_weekend_from_dow(dow)
@@ -393,14 +451,13 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
     device_city_combo   = (f"{device_bucket}__{geo_city}").lower()
     utm_partofday_combo = (f"{utm_original}__{part_of_day}").lower()
 
-    # Target Encoding (opcional)
     utm_n,  utm_br  = _apply_te("utm_original", str(utm_original or ""))
     ref_n,  ref_br  = _apply_te("ref_domain",   str(ref_domain))
     devb_n, devb_br = _apply_te("device_bucket",str(device_bucket))
     city_n, city_br = _apply_te("geo_city",     str(geo_city))
 
     feats = {
-        # CATEGÓRICAS (como no treino)
+        # CATEGÓRICAS
         "device_bucket": device_bucket,
         "os_family": os_family or "",
         "part_of_day": part_of_day,
@@ -430,15 +487,10 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
     return feats
 
 def _row_in_meta_order(feats_dict: Dict[str, Any]) -> Tuple[List[Any], List[int]]:
-    """
-    Retorna lista de valores na ORDEM de _FEATURE_NAMES_FROM_META.
-    Preenche faltantes: categ='' ; num=0.0 .
-    """
     ordered = []
     for col in _FEATURE_NAMES_FROM_META:
         v = feats_dict.get(col)
         if v is None:
-            # heurística: nomes típicos
             if col in ("hour","dow","is_weekend","os_version_num","is_android","is_ios",
                        "utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br"):
                 v = 0.0
@@ -457,7 +509,6 @@ def _load_model_if_available():
             m.load_model(MODEL_PATH)
             _model = m
 
-            # meta do treino
             if os.path.exists(MODEL_META_PATH):
                 meta = json.load(open(MODEL_META_PATH, "r", encoding="utf-8"))
                 _model_classes = meta.get("classes") or meta.get("classes_binary") or ["desinteressado","comprou"]
@@ -466,7 +517,6 @@ def _load_model_if_available():
                 thr_atc = ((meta.get("thresholds") or {}).get("atc_high"))
                 _thresholds = {"qvc_mid": thr_qvc, "atc_high": thr_atc}
 
-                # threshold de produção (ATC por padrão; fallback QVC; senão 0.5)
                 if thr_atc is not None:
                     _comprou_threshold = float(thr_atc)
                 elif thr_qvc is not None:
@@ -491,29 +541,18 @@ def _load_model_if_available():
         print("[model] erro ao carregar:", e)
 
 def predict_label_from_probs(proba: List[float], classes: List[str]) -> str:
-    """
-    Produção: aplica _comprou_threshold para 'comprou' (binário).
-    Se houver 'quase' e threshold no meta (opcional), aplica depois.
-    Senão, fallback argmax.
-    """
     try:
         idx = {c:i for i,c in enumerate(classes)}
         p = {c: proba[idx[c]] for c in classes}
-
-        # corte principal (ATC / produção)
         thr_c = _comprou_threshold
         if "comprou" in classes and p.get("comprou", 0.0) >= thr_c:
             return "comprou"
-
-        # opcional "quase"
         if "quase" in classes:
-            thr_q = float((_thresholds or {}).get("quase", 1.1))  # 1.1 => nunca ativa se não houver
+            thr_q = float((_thresholds or {}).get("quase", 1.1))
             if p.get("quase", 0.0) >= thr_q:
                 return "quase"
-
         return "desinteressado"
     except Exception:
-        # Fallback: argmax
         j = int(max(range(len(proba)), key=lambda i: proba[i]))
         return classes[j]
 
@@ -584,19 +623,47 @@ def robots():
 def root():
     return PlainTextResponse("OK", status_code=200)
 
+def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str, str]:
+    """
+    Decide qual URL de entrada usar:
+    - Se houver ?link= (percent-encoded), usa e corrige esquema.
+    - Senão, se path for apenas um código short ([A-Za-z0-9]{6,20}), reconstrói s.shopee.com.br/<code> + query.
+    - Senão, trata o path como URL "antiga": corrige https:/ -> https:// e aceita.
+    Retorna (incoming_url, mode): mode ∈ {"query_link","code_path","raw_path"}
+    """
+    link_q = request.query_params.get("link")
+    if link_q:
+        raw = unquote(link_q).strip()
+        return _fix_scheme(raw), "query_link"
+
+    raw_path = urllib.parse.unquote(full_path or "").strip()
+    if not raw_path or raw_path == "favicon.ico":
+        raise HTTPException(status_code=400, detail="missing_url")
+
+    # Apenas código curto? (evita deep-link do Pinterest)
+    if re.fullmatch(r"[A-Za-z0-9]{5,20}", raw_path):
+        qs = request.url.query
+        url = f"https://s.shopee.com.br/{raw_path}"
+        if qs:
+            url += "?" + qs
+        return url, "code_path"
+
+    # Caso antigo: path contendo uma URL; corrige https:/ -> https://
+    if raw_path.startswith("//"):
+        raw_path = "https:" + raw_path
+    return _fix_scheme(raw_path), "raw_path"
+
 @app.get("/{full_path:path}")
 def track_number_and_redirect(
     request: Request,
     full_path: str = Path(...),
     cat: Optional[str] = Query(None),
 ):
-    # ----- normalização do path / entrada -----
-    raw_path = urllib.parse.unquote(full_path or "").strip()
-    if not raw_path or raw_path == "favicon.ico":
-        return JSONResponse({"ok": False, "error": "missing_url"}, status_code=400)
-    if raw_path.startswith("//"):
-        raw_path = "https:" + raw_path
-    incoming_url = raw_path
+    # ===== Determina URL de entrada conforme regras novas =====
+    try:
+        incoming_url, mode = _build_incoming_from_request(request, full_path)
+    except HTTPException as he:
+        return JSONResponse({"ok": False, "error": he.detail}, status_code=he.status_code)
 
     # ----- headers / contexto -----
     ts = int(time.time())
@@ -618,36 +685,66 @@ def track_number_and_redirect(
     is_ios_log     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
     part_of_day_log = _part_of_day_from_hour(hour_log)
 
-    # ----- extrai/resolve UTM + numeração -----
+    # ===== Resolve shortlink para URL LONGA =====
+    parts_in = urlsplit(incoming_url)
     resolved_url = incoming_url
+    if _is_short_domain(parts_in.netloc):
+        resolved_url = _resolve_short_follow(incoming_url)
+    else:
+        # Se path "antigo" embutiu domínio Shopee na string, já está ok;
+        # Se veio um link longo direto via ?link=, só garante esquema.
+        resolved_url = _fix_scheme(incoming_url)
+
+    # ===== Valida domínio longo antes do GraphQL =====
+    parts_res = urlsplit(resolved_url)
+    if not parts_res.scheme or not parts_res.netloc:
+        return JSONResponse({"ok": False, "error": f"URL inválida: {resolved_url}"}, status_code=400)
+    if not _is_allowed_long(parts_res.netloc) and not _is_short_domain(parts_res.netloc):
+        return JSONResponse({"ok": False, "error": f"Domínio não permitido: {parts_res.netloc}"}, status_code=400)
+
+    # ===== Extrai/gera UTM =====
     outer_uc = request.query_params.get("uc")
-    utm_original = outer_uc or extract_utm_content_from_url(incoming_url) or ""
+    utm_original = outer_uc or extract_utm_content_from_url(incoming_url) or extract_utm_content_from_url(resolved_url) or ""
     subids_in = {}
-    if not utm_original:
-        resolved_url, subids_in = resolve_short_link(incoming_url, max_hops=1)
-        utm_original = subids_in.get("utm_content") or extract_utm_content_from_url(resolved_url)
+    if not utm_original and _is_short_domain(parts_in.netloc):
+        # fallback ao parser leve
+        _, subids_in = resolve_short_link(incoming_url, max_hops=1)
+        utm_original = subids_in.get("utm_content") or ""
 
     clean_base = re.sub(r'[^A-Za-z0-9]', '', utm_original or "") or "n"
     seq = incr_counter()
     utm_numbered = f"{clean_base}N{seq}"
-    final_with_number = add_or_update_query_param(resolved_url, "utm_numbered", utm_numbered)
 
-    # ----- Short-link Shopee -----
+    # Define utm_content preservando ordem
+    url_with_utm = _set_utm_content_preserving_order(resolved_url, utm_numbered)
+
+    # Mantém utm_numbered adicional sem reordenar demais
+    url_final_qs_plus = add_or_update_query_param(url_with_utm, "utm_numbered", utm_numbered)
+
+    # ===== Prepara origin_url (LONGA) p/ GraphQL =====
+    origin_url = url_final_qs_plus
+    # Se ainda for short (caso raro), força resolver novamente
+    if _is_short_domain(urlsplit(origin_url).netloc):
+        origin_url = _resolve_short_follow(origin_url)
+
+    # Sanitiza sub_id3 (Shopee)
     sub_id_api = sanitize_subid_for_shopee(utm_numbered)
-    origin_url = unquote(final_with_number)
+
+    # ===== Gera short oficial (ou fallback) =====
     dest = generate_short_link(origin_url, sub_id_api)
 
-    # ----- snapshot em Redis -----
+    # ===== Snapshot em Redis =====
     fbp_cookie = get_cookie_value(cookie_header, "_fbp")
     fbc_val    = build_fbc_from_fbclid(fbclid, creation_ts=ts)
     r.setex(f"{USERDATA_KEY_PREFIX}{utm_numbered}", USERDATA_TTL_SECONDS, json.dumps({
         "ip": ip_addr, "ua": user_agent, "referrer": referrer,
-        "event_source_url": final_with_number, "short_link": dest,
+        "event_source_url": origin_url, "short_link": dest,
         "vc_time": ts, "utm_original": utm_original, "utm_numbered": utm_numbered,
-        "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_val
+        "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_val,
+        "mode": mode
     }))
 
-    # ----- construir user_data Meta -----
+    # ===== Construir user_data Meta =====
     user_data_meta = {
         "client_ip_address": ip_addr,
         "client_user_agent": user_agent,
@@ -655,19 +752,17 @@ def track_number_and_redirect(
         **({"fbc": fbc_val} if fbc_val else {})
     }
 
-    # ----- Geo + Predição (CatBoost) -----
+    # ===== Geo + Predição (CatBoost) =====
     pred_label = ""
     p_map = {"comprou": 0.0, "quase": 0.0, "desinteressado": 0.0}
-    meta_sent = ""  # AddToCart enviado?
-    meta_view = ""  # ViewContent enviado?
+    meta_sent = ""
+    meta_view = ""
 
     geo = geo_lookup(ip_addr)
     try:
         if _model is not None and _FEATURE_NAMES_FROM_META:
             feats_dict = _features_full_dict(os_family, device_name, os_version, referrer, utm_original, iso_time, geo)
             row_values, cat_idx = _row_in_meta_order(feats_dict)
-
-            # monta Pool com cat_features corretos
             from catboost import Pool
             import pandas as pd
             X_df = pd.DataFrame([row_values], columns=_FEATURE_NAMES_FROM_META)
@@ -676,12 +771,9 @@ def track_number_and_redirect(
             raw_proba = _model.predict_proba(pool)[0]
             proba = [float(x) for x in raw_proba]
 
-            # classes (ordem)
             classes = list(_model_classes) if _model_classes else (
                 [str(x) for x in getattr(_model, "classes_", [])] or ["desinteressado","comprou"]
             )
-
-            # mapeia para p_map conhecido
             tmp = {}
             for i, cls in enumerate(classes):
                 if i < len(proba):
@@ -694,7 +786,6 @@ def track_number_and_redirect(
             if ordered_proba:
                 pred_label = predict_label_from_probs(ordered_proba, ordered_classes)
 
-            # Se o ML previu "comprou", envia AddToCart
             if pred_label == "comprou" and META_PIXEL_ID and META_ACCESS_TOKEN:
                 atc_payload = {
                     "data": [{
@@ -702,7 +793,7 @@ def track_number_and_redirect(
                         "event_time": ts,
                         "event_id": utm_numbered,
                         "action_source": "website",
-                        "event_source_url": final_with_number,
+                        "event_source_url": origin_url,
                         "user_data": user_data_meta,
                         "custom_data": {"currency": "BRL", "value": 0, "content_type": "product"}
                     }]
@@ -720,7 +811,7 @@ def track_number_and_redirect(
     except Exception as e:
         print("[predict] erro:", e)
 
-    # ----- ViewContent (sempre) -----
+    # ===== ViewContent (sempre) =====
     if META_PIXEL_ID and META_ACCESS_TOKEN:
         vc_payload = {
             "data": [{
@@ -728,7 +819,7 @@ def track_number_and_redirect(
                 "event_time": ts,
                 "event_id": utm_numbered,
                 "action_source": "website",
-                "event_source_url": final_with_number,
+                "event_source_url": origin_url,
                 "user_data": user_data_meta,
                 "custom_data": {"content_type": "product"}
             }]
@@ -744,10 +835,10 @@ def track_number_and_redirect(
             print("[meta] VC exceção:", e)
             meta_view = "error"
 
-    # ----- CSV (buffer local → flush GCS assíncrono) -----
+    # ===== CSV (buffer local → flush GCS assíncrono) =====
     csv_row = [
         ts, iso_time, ip_addr, user_agent, device_name, os_family, os_version, referrer,
-        incoming_url, resolved_url, final_with_number, (cat or ""),
+        incoming_url, resolved_url, origin_url, (cat or ""),
         utm_original, utm_numbered,
         subids_in.get("sub_id1") or "", subids_in.get("sub_id2") or "",
         subids_in.get("sub_id3") or "", subids_in.get("sub_id4") or "", subids_in.get("sub_id5") or "",
@@ -756,16 +847,31 @@ def track_number_and_redirect(
         geo.get("geo_city",""), geo.get("geo_zip",""),
         geo.get("geo_isp",""), geo.get("geo_org",""), geo.get("geo_asn",""), geo.get("geo_lat",""), geo.get("geo_lon",""),
         pred_label or "", p_map["comprou"], p_map["quase"], p_map["desinteressado"],
-        # ==== NOVAS FEATURES (ordem = CSV_HEADERS) ====
         part_of_day_log, hour_log, dow_log, ref_domain_log,
         os_version_num_log, is_android_log, is_ios_log,
-        # meta
         meta_sent, meta_view
     ]
     with _buffer_lock:
         _buffer_rows.append(csv_row)
 
-    return RedirectResponse(dest, status_code=302)
+    # ===== Intersticial para Pinterest =====
+    if _is_pinterest(user_agent):
+        html = f"""<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="0.2;url={dest}">
+<title>Redirecionando…</title>
+<script>
+  setTimeout(function(){{ window.location.replace("{dest}"); }}, 200);
+</script>
+</head>
+<body>Redirecionando…</body></html>"""
+        return HTMLResponse(content=html, status_code=200, headers={
+            "Cache-Control": "no-store, max-age=0",
+            "X-Content-Type-Options": "nosniff",
+        })
+
+    return RedirectResponse(dest, status_code=302, headers={"Cache-Control": "no-store, max-age=0"})
 
 # ===================== Admin =====================
 @app.get("/admin", response_class=HTMLResponse)
