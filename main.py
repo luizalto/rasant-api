@@ -4,6 +4,14 @@ FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost) + 
 - Gera UTM numerada, resolve/genera shortlink, registra clique e manda eventos para o Meta.
 - Sempre envia ViewContent.
 - Se o modelo prever "comprou", envia AddToCart.
+
+Ajustes importantes:
+1) Lê de model_meta.json o threshold de produção, priorizando:
+   best_f1_threshold  >  deploy.threshold  >  thresholds.max_f1  >  0.5 (fallback)
+   (usado como _comprou_threshold)
+2) Alinha features com o pipeline de treino:
+   - usa utm_original (não utm_prefix)
+   - calcula dow a partir do iso_time (antes estava 0)
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json
@@ -15,6 +23,7 @@ from fastapi import FastAPI, Request, Query, Path, UploadFile, File, Header, HTT
 from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse, HTMLResponse
 from google.cloud import storage
 from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode, unquote
+from datetime import datetime
 
 # ===================== Config (env c/ defaults) =====================
 DEFAULT_TIMEOUT   = float(os.getenv("HTTP_TIMEOUT", "12"))
@@ -253,32 +262,50 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
 # ===================== Predição (CatBoost) =====================
 _model = None
 _model_classes: List[str] = []
-_thresholds: Dict[str, float] = {}
+_thresholds: Dict[str, float] = {}   # legado
+_comprou_threshold: float = 0.5      # threshold efetivo p/ classe "comprou"
 
 def _load_model_if_available():
-    global _model, _model_classes, _thresholds
+    global _model, _model_classes, _thresholds, _comprou_threshold
     try:
         from catboost import CatBoostClassifier
         if os.path.exists(MODEL_PATH):
             m = CatBoostClassifier()
             m.load_model(MODEL_PATH)
             _model = m
+            # meta
             if os.path.exists(MODEL_META_PATH):
                 with open(MODEL_META_PATH, "r", encoding="utf-8") as f:
                     meta = json.load(f)
-                _model_classes = meta.get("classes") or ["comprou","desinteressado","quase"]
+                # classes no treino binário geralmente ["desinteressado","comprou"]
+                _model_classes = meta.get("classes") or ["desinteressado","comprou"]
+                # ordem de preferência do threshold
+                thr = meta.get("best_f1_threshold")
+                if thr is None:
+                    thr = (meta.get("deploy") or {}).get("threshold")
+                if thr is None:
+                    thr = (meta.get("thresholds") or {}).get("max_f1")
+                _comprou_threshold = float(thr) if thr is not None else 0.5
                 _thresholds = meta.get("thresholds") or {}
             else:
-                _model_classes = ["comprou","desinteressado","quase"]
+                _model_classes = ["desinteressado","comprou"]
+                _comprou_threshold = 0.5
                 _thresholds = {}
-            print("[model] carregado com sucesso.")
+            print(f"[model] carregado com sucesso. thr_comprou={_comprou_threshold}")
         else:
             print("[model] arquivo não encontrado:", MODEL_PATH)
     except Exception as e:
         print("[model] erro ao carregar:", e)
 
-def _features_for_model(os_family, device_name, os_version, referrer, utm_numbered,
+def _features_for_model(os_family, device_name, os_version, referrer, utm_original,
                         iso_time=None, geo: Optional[Dict[str,Any]]=None):
+    """
+    Alinha com o pipeline do treino (binário):
+      Categóricas: device_name, os_family, part_of_day,
+                   geo_country, geo_region, geo_city, geo_zip, geo_isp, geo_org,
+                   ref_domain, utm_original
+      Numéricas:   hour, dow, os_version_num, is_android, is_ios
+    """
     def version_num(s):
         m = re.search(r"(\d+(\.\d+)*)", str(s or ""))
         if not m: return 0.0
@@ -296,6 +323,13 @@ def _features_for_model(os_family, device_name, os_version, referrer, utm_number
             return int(hh)
         except:
             return 0
+    def extract_dow_from_iso(t):
+        try:
+            # iso_time ex: 2025-09-24T12:34:56-0300 -> usamos os 19 primeiros chars (sem tz)
+            dt = datetime.strptime(str(t)[:19], "%Y-%m-%dT%H:%M:%S")
+            return dt.weekday()  # 0=segunda ... 6=domingo
+        except:
+            return time.localtime().tm_wday
     def part_of_day(hour):
         h = int(hour)
         if 0<=h<6: return "dawn"
@@ -305,42 +339,53 @@ def _features_for_model(os_family, device_name, os_version, referrer, utm_number
         return "unknown"
 
     hour = extract_hour_from_iso(iso_time or "")
+    dow  = extract_dow_from_iso(iso_time or "")
     is_android = 1 if str(os_family).lower().find("android")>=0 else 0
     is_ios     = 1 if re.search(r"ios|iphone|ipad", str(os_family), re.I) else 0
     os_ver_num = version_num(os_version)
     ref_domain = get_first_domain(referrer or "")
-    utm_prefix = re.findall(r"^([A-Za-z0-9]+)", str(utm_numbered or ""))[:1]
-    utm_prefix = utm_prefix[0] if utm_prefix else ""
 
     geo = geo or {}
     cat = [
         device_name or "",
         os_family or "",
         part_of_day(hour),
-        geo.get("geo_country") or "",
-        geo.get("geo_region") or "",
-        geo.get("geo_city") or "",
-        geo.get("geo_zip") or "",
-        geo.get("geo_isp") or "",
-        geo.get("geo_org") or "",
+        (geo.get("geo_country") or ""),
+        (geo.get("geo_region") or ""),
+        (geo.get("geo_city") or ""),
+        (geo.get("geo_zip") or ""),
+        (geo.get("geo_isp") or ""),
+        (geo.get("geo_org") or ""),
         ref_domain,
-        utm_prefix
+        utm_original or ""
     ]
-    num = [hour, 0, os_ver_num, is_android, is_ios]
+    num = [hour, dow, os_ver_num, is_android, is_ios]
     return cat + num
 
 def predict_label(proba: List[float], classes: List[str]) -> str:
+    """
+    Aplica threshold de 'comprou' (binário) vindo do model_meta.json.
+    Se existir classe 'quase' e threshold, aplica na sequência.
+    Caso contrário, fallback para argmax.
+    """
     try:
         idx = {c:i for i,c in enumerate(classes)}
         p = {c: proba[idx[c]] for c in classes}
-        thr_c = float(_thresholds.get("comprou", 0.0))
-        thr_q = float(_thresholds.get("quase", 0.0))
-        if "comprou" in classes and p.get("comprou",0.0) >= thr_c:
+
+        # Threshold principal para "comprou"
+        thr_c = _comprou_threshold
+        if "comprou" in classes and p.get("comprou", 0.0) >= thr_c:
             return "comprou"
-        if "quase" in classes and p.get("quase",0.0) >= thr_q:
-            return "quase"
+
+        # Se for 3 classes, aplica "quase" se houver threshold (opcional)
+        if "quase" in classes:
+            thr_q = float(_thresholds.get("quase", 1.1))  # 1.1 = nunca ativa se não houver
+            if p.get("quase", 0.0) >= thr_q:
+                return "quase"
+
         return "desinteressado"
     except Exception:
+        # Fallback: argmax
         j = int(max(range(len(proba)), key=lambda i: proba[i]))
         return classes[j]
 
@@ -389,7 +434,8 @@ threading.Thread(target=_background_flusher, daemon=True).start()
 @app.get("/health")
 def health():
     return {"ok": True, "ts": int(time.time()), "bucket": GCS_BUCKET, "prefix": GCS_PREFIX,
-            "video_id": VIDEO_ID, "model_loaded": bool(_model)}
+            "video_id": VIDEO_ID, "model_loaded": bool(_model),
+            "classes": _model_classes, "comprou_threshold": _comprou_threshold}
 
 @app.get("/robots.txt")
 def robots():
@@ -470,10 +516,12 @@ def track_number_and_redirect(
     geo = geo_lookup(ip_addr)
     try:
         if _model is not None:
-            feats = _features_for_model(os_family, device_name, os_version, referrer, utm_numbered, iso_time, geo)
+            # Usa utm_original e calcula dow/hora conforme treino
+            feats = _features_for_model(os_family, device_name, os_version, referrer, utm_original, iso_time, geo)
             raw_proba = _model.predict_proba([feats])[0]
             proba = list(map(float, raw_proba))
-            classes = []
+
+            # classes (ordem) – binário normalmente ["desinteressado","comprou"]
             if _model_classes:
                 classes = list(_model_classes)
             elif hasattr(_model, "classes_"):
@@ -481,9 +529,13 @@ def track_number_and_redirect(
                     classes = [str(x) for x in list(_model.classes_)]
                 except Exception:
                     classes = []
-            if not classes:
-                classes = ["comprou","desinteressado","quase"] if len(proba) >= 3 else ["desinteressado","comprou"]
+            else:
+                classes = []
 
+            if not classes:
+                classes = ["desinteressado","comprou"] if len(proba) == 2 else ["comprou","desinteressado","quase"]
+
+            # mapa de probabilidades nomeado
             tmp = {}
             for i, cls in enumerate(classes):
                 if i < len(proba):
@@ -491,13 +543,14 @@ def track_number_and_redirect(
             for k in ("comprou","quase","desinteressado"):
                 if k in tmp: p_map[k] = tmp[k]
 
+            # Ordena para função de decisão
             ordered_classes = [c for c in ("comprou","desinteressado","quase") if c in tmp]
             ordered_proba   = [tmp[c] for c in ordered_classes]
             if ordered_proba:
                 pred_label = predict_label(ordered_proba, ordered_classes)
 
             # Se o ML previu "comprou", envia AddToCart
-            if pred_label == "comprou":
+            if pred_label == "comprou" and META_PIXEL_ID and META_ACCESS_TOKEN:
                 atc_payload = {
                     "data": [{
                         "event_name": "AddToCart",
@@ -523,27 +576,28 @@ def track_number_and_redirect(
         print("[predict] erro:", e)
 
     # ----- ViewContent (sempre) -----
-    vc_payload = {
-        "data": [{
-            "event_name": "ViewContent",
-            "event_time": ts,
-            "event_id": utm_numbered,
-            "action_source": "website",
-            "event_source_url": final_with_number,
-            "user_data": user_data_meta,
-            "custom_data": {"content_type": "product"}
-        }]
-    }
-    try:
-        url = f"https://graph.facebook.com/{META_GRAPH_VERSION}/{META_PIXEL_ID}/events"
-        params = {"access_token": META_ACCESS_TOKEN}
-        if META_TEST_EVENT_CODE:
-            vc_payload["test_event_code"] = META_TEST_EVENT_CODE
-        resp_vc = session.post(url, params=params, json=vc_payload, timeout=8)
-        meta_view = "ViewContent" if resp_vc.status_code < 400 else f"error:{resp_vc.status_code}"
-    except Exception as e:
-        print("[meta] VC exceção:", e)
-        meta_view = "error"
+    if META_PIXEL_ID and META_ACCESS_TOKEN:
+        vc_payload = {
+            "data": [{
+                "event_name": "ViewContent",
+                "event_time": ts,
+                "event_id": utm_numbered,
+                "action_source": "website",
+                "event_source_url": final_with_number,
+                "user_data": user_data_meta,
+                "custom_data": {"content_type": "product"}
+            }]
+        }
+        try:
+            url = f"https://graph.facebook.com/{META_GRAPH_VERSION}/{META_PIXEL_ID}/events"
+            params = {"access_token": META_ACCESS_TOKEN}
+            if META_TEST_EVENT_CODE:
+                vc_payload["test_event_code"] = META_TEST_EVENT_CODE
+            resp_vc = session.post(url, params=params, json=vc_payload, timeout=8)
+            meta_view = "ViewContent" if resp_vc.status_code < 400 else f"error:{resp_vc.status_code}"
+        except Exception as e:
+            print("[meta] VC exceção:", e)
+            meta_view = "error"
 
     # ----- CSV (buffer local → flush GCS assíncrono) -----
     csv_row = [
@@ -552,7 +606,7 @@ def track_number_and_redirect(
         utm_original, utm_numbered,
         subids_in.get("sub_id1") or "", subids_in.get("sub_id2") or "",
         subids_in.get("sub_id3") or "", subids_in.get("sub_id4") or "", subids_in.get("sub_id5") or "",
-        fbclid or "", fbp_cookie or "", fbc_val or "",
+        fbclid or "", get_cookie_value(cookie_header, "_fbp") or "", build_fbc_from_fbclid(fbclid, ts) or "",
         geo.get("geo_status",""), geo.get("geo_country",""), geo.get("geo_region",""), geo.get("geo_state",""),
         geo.get("geo_city",""), geo.get("geo_zip",""),
         geo.get("geo_isp",""), geo.get("geo_org",""), geo.get("geo_asn",""), geo.get("geo_lat",""), geo.get("geo_lon",""),
@@ -605,7 +659,7 @@ async def admin_upload_model_simple(
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
     _load_model_if_available()
-    return {"ok": True, "model_loaded": bool(_model)}
+    return {"ok": True, "model_loaded": bool(_model), "comprou_threshold": _comprou_threshold}
 
 @app.post("/admin/upload_model")
 async def admin_upload_model(
@@ -639,14 +693,15 @@ async def admin_upload_model(
             raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
 
     _load_model_if_available()
-    return {"ok": True, "saved": {"model": MODEL_PATH, "meta": (MODEL_META_PATH if up_meta else None)}, "model_loaded": bool(_model)}
+    return {"ok": True, "saved": {"model": MODEL_PATH, "meta": (MODEL_META_PATH if up_meta else None)},
+            "model_loaded": bool(_model), "comprou_threshold": _comprou_threshold}
 
 @app.post("/admin/reload_model")
 def admin_reload_model(x_admin_token: str = Header(None)):
     if x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
     _load_model_if_available()
-    return {"ok": True, "model_loaded": bool(_model)}
+    return {"ok": True, "model_loaded": bool(_model), "comprou_threshold": _comprou_threshold}
 
 @app.get("/admin/flush")
 def admin_flush(token: str):
@@ -708,7 +763,8 @@ def admin_test_event(
             jr = resp.json()
         except Exception:
             jr = {"text": resp.text}
-        return {"ok": resp.status_code < 400, "status": resp.status_code, "resp": jr, "sent": {"event_name": event_name, "event_id": eid}}
+        return {"ok": resp.status_code < 400, "status": resp.status_code, "resp": jr,
+                "sent": {"event_name": event_name, "event_id": eid}}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
