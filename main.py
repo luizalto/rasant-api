@@ -11,6 +11,11 @@ Novidades / Ajustes:
 - Intersticial para User-Agent do Pinterest (200ms), garantindo log e geração de short antes do deep-link.
 - Correção na função _is_allowed_long() para aceitar apex + subdomínios (com/sem www e porta).
 - Mantém TODAS as funcionalidades anteriores (Redis, GCS, Geo, Predição, CAPI, Admin).
+
+Anti-reset do contador (NÃO RESETA, mesmo após redeploy do app):
+- incr_counter() usa INCR + PERSIST (remove TTL acidental).
+- No startup, forçamos PERSIST no COUNTER_KEY.
+- Endpoint /admin/counter para inspecionar valor e TTL.
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json
@@ -70,6 +75,11 @@ app = FastAPI(title="Shopee UTM Numbered → ShortLink + Redis + GCS + Geo + Pre
 
 # Redis
 r = redis.from_url(REDIS_URL)
+# >>> Anti-reset: garante que o contador NÃO tenha TTL logo no startup
+try:
+    r.persist(COUNTER_KEY)
+except Exception:
+    pass
 
 # GCS
 _gcs_client: Optional[storage.Client] = None
@@ -89,7 +99,6 @@ SHORT_DOMAINS = ("s.shopee.com.br", "s.shopee.com")
 LONG_ALLOWED  = (".shopee.com.br", ".shopee.com", ".xiapiapp.com")
 
 def _fix_scheme(url: str) -> str:
-    # Corrige https:/ -> https:// ; http:/ -> http://
     if url.startswith("https:/") and not url.startswith("https://"):
         return "https://" + url[len("https:/"):]
     if url.startswith("http:/") and not url.startswith("http://"):
@@ -101,30 +110,18 @@ def _is_short_domain(domain: str) -> bool:
     return any(d.endswith(sd) for sd in SHORT_DOMAINS)
 
 def _is_allowed_long(domain: str) -> bool:
-    """
-    Aceita apex e subdomínios de Shopee e xiapiapp, ignorando 'www.' e porta.
-    Ex.: 'shopee.com.br', 'www.shopee.com.br', 'shopee.com.br:443', 'cf.shopee.com.br'...
-    """
     if not domain:
         return False
     d = domain.strip().lower()
-    # remove porta se houver
     if ":" in d:
         d = d.split(":", 1)[0]
-    # remove www.
     if d.startswith("www."):
         d = d[4:]
-    # aceita apex exatamente
     apex_ok = d in ("shopee.com.br", "shopee.com", "xiapiapp.com")
-    # aceita subdomínios
     suf_ok = any(d.endswith(suf.lstrip(".")) or d.endswith(suf) for suf in LONG_ALLOWED)
     return apex_ok or suf_ok
 
 def _resolve_short_follow(url: str) -> str:
-    """
-    Resolve shortlink (s.shopee...) até a URL longa final do produto.
-    Tenta HEAD e depois GET com allow_redirects=True.
-    """
     try:
         resp = session.head(url, allow_redirects=True, timeout=DEFAULT_TIMEOUT)
         final_url = resp.url
@@ -133,13 +130,9 @@ def _resolve_short_follow(url: str) -> str:
             final_url = resp.url
         return final_url
     except Exception:
-        return url  # fallback: devolve a própria
+        return url
 
 def _set_utm_content_preserving_order(url: str, new_value: str) -> str:
-    """
-    Mantém a ordem original dos parâmetros; altera ou insere apenas utm_content.
-    (Implementação sem regex lookbehind para compatibilidade.)
-    """
     parts = urlsplit(url)
     qs = parts.query or ""
     if qs == "":
@@ -186,7 +179,15 @@ CSV_HEADERS = [
 
 # ===================== Helpers já existentes =====================
 def incr_counter() -> int:
-    return int(r.incr(COUNTER_KEY))
+    """
+    Contador monotônico e sem TTL (não expira). Nunca reseta por si só.
+    Usa pipeline: INCR + PERSIST para remover TTL acidental.
+    """
+    pipe = r.pipeline()
+    pipe.incr(COUNTER_KEY)
+    pipe.persist(COUNTER_KEY)
+    val, _ = pipe.execute()
+    return int(val)
 
 def get_cookie_value(cookie_header: Optional[str], name: str) -> Optional[str]:
     if not cookie_header: return None
@@ -278,9 +279,6 @@ def sanitize_subid_for_shopee(value: str) -> str:
     return cleaned[:_SUBID_MAXLEN] if cleaned else "na"
 
 def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
-    """
-    origin_url deve ser a URL LONGA do produto, não shortlink.
-    """
     payload_obj = {
         "query": (
             "mutation{generateShortLink(input:{"
@@ -348,11 +346,9 @@ _model_classes: List[str] = []
 _thresholds: Dict[str, float] = {}   # {"qvc_mid":..., "atc_high":...}
 _comprou_threshold: float = 0.5      # corte efetivo (ATC por padrão)
 
-# meta → nomes/índices de features para ordenar corretamente
 _FEATURE_NAMES_FROM_META: List[str] = []
 _CAT_IDX_FROM_META: List[int] = []
 
-# Target Encoding opcional
 _TE_STATS = None
 _TE_PRIORS = None
 
@@ -480,7 +476,6 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
     city_n, city_br = _apply_te("geo_city",     str(geo_city))
 
     feats = {
-        # CATEGÓRICAS
         "device_bucket": device_bucket,
         "os_family": os_family or "",
         "part_of_day": part_of_day,
@@ -494,14 +489,12 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
         "utm_original": utm_original or "",
         "device_city_combo": device_city_combo,
         "utm_partofday_combo": utm_partofday_combo,
-        # NUMÉRICAS
         "hour": float(hour),
         "dow": float(dow),
         "is_weekend": float(is_weekend),
         "os_version_num": float(os_ver_num),
         "is_android": float(is_android),
         "is_ios": float(is_ios),
-        # ENCODINGS
         "utm_n": float(utm_n), "utm_br": float(utm_br),
         "ref_n": float(ref_n), "ref_br": float(ref_br),
         "devb_n": float(devb_n), "devb_br": float(devb_br),
@@ -623,6 +616,11 @@ threading.Thread(target=_background_flusher, daemon=True).start()
 # ===================== Rotas =====================
 @app.get("/health")
 def health():
+    ttl = None
+    try:
+        ttl = r.ttl(COUNTER_KEY)
+    except Exception:
+        ttl = None
     return {
         "ok": True,
         "ts": int(time.time()),
@@ -636,6 +634,7 @@ def health():
         "thr_qvc": (_thresholds or {}).get("qvc_mid"),
         "n_features_meta": len(_FEATURE_NAMES_FROM_META),
         "cat_idx_meta": _CAT_IDX_FROM_META,
+        "counter_ttl": ttl  # deve ser -1 quando sem expiração
     }
 
 @app.get("/robots.txt")
@@ -647,13 +646,6 @@ def root():
     return PlainTextResponse("OK", status_code=200)
 
 def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str, str]:
-    """
-    Decide qual URL de entrada usar:
-    - Se houver ?link= (percent-encoded), usa e corrige esquema.
-    - Senão, se path for apenas um código short ([A-Za-z0-9]{5,20}), reconstrói s.shopee.com.br/<code> + query.
-    - Senão, trata o path como URL "antiga": corrige https:/ -> https:// e aceita.
-    Retorna (incoming_url, mode): mode ∈ {"query_link","code_path","raw_path"}
-    """
     link_q = request.query_params.get("link")
     if link_q:
         raw = unquote(link_q).strip()
@@ -663,7 +655,6 @@ def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str,
     if not raw_path or raw_path == "favicon.ico":
         raise HTTPException(status_code=400, detail="missing_url")
 
-    # Apenas código curto? (evita deep-link do Pinterest)
     if re.fullmatch(r"[A-Za-z0-9]{5,20}", raw_path):
         qs = request.url.query
         url = f"https://s.shopee.com.br/{raw_path}"
@@ -671,7 +662,6 @@ def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str,
             url += "?" + qs
         return url, "code_path"
 
-    # Caso antigo: path contendo uma URL; corrige https:/ -> https://
     if raw_path.startswith("//"):
         raw_path = "https:" + raw_path
     return _fix_scheme(raw_path), "raw_path"
@@ -682,13 +672,12 @@ def track_number_and_redirect(
     full_path: str = Path(...),
     cat: Optional[str] = Query(None),
 ):
-    # ===== Determina URL de entrada conforme regras novas =====
+    # ===== Determina URL de entrada =====
     try:
         incoming_url, mode = _build_incoming_from_request(request, full_path)
     except HTTPException as he:
         return JSONResponse({"ok": False, "error": he.detail}, status_code=he.status_code)
 
-    # ----- headers / contexto -----
     ts = int(time.time())
     iso_time = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(ts))
     headers = request.headers
@@ -699,7 +688,7 @@ def track_number_and_redirect(
     ip_addr = (request.client.host if request.client else "0.0.0.0")
     device_name, os_family, os_version = parse_device_info(user_agent)
 
-    # ===== Deriva features para LOG (iguais às do treino) =====
+    # ===== Features de log =====
     hour_log = _extract_hour_from_iso_for_log(iso_time)
     dow_log  = _extract_dow_from_iso_for_log(iso_time)
     ref_domain_log = _get_first_domain_for_log(referrer)
@@ -708,7 +697,7 @@ def track_number_and_redirect(
     is_ios_log     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
     part_of_day_log = _part_of_day_from_hour(hour_log)
 
-    # ===== Resolve shortlink para URL LONGA =====
+    # ===== Resolve shortlink =====
     parts_in = urlsplit(incoming_url)
     resolved_url = incoming_url
     if _is_short_domain(parts_in.netloc):
@@ -716,14 +705,14 @@ def track_number_and_redirect(
     else:
         resolved_url = _fix_scheme(incoming_url)
 
-    # ===== Valida domínio longo antes do GraphQL =====
+    # ===== Valida domínio longo =====
     parts_res = urlsplit(resolved_url)
     if not parts_res.scheme or not parts_res.netloc:
         return JSONResponse({"ok": False, "error": f"URL inválida: {resolved_url}"}, status_code=400)
     if not _is_allowed_long(parts_res.netloc) and not _is_short_domain(parts_res.netloc):
         return JSONResponse({"ok": False, "error": f"Domínio não permitido: {parts_res.netloc}"}, status_code=400)
 
-    # ===== Extrai/gera UTM =====
+    # ===== UTM / numeração =====
     outer_uc = request.query_params.get("uc")
     utm_original = outer_uc or extract_utm_content_from_url(incoming_url) or extract_utm_content_from_url(resolved_url) or ""
     subids_in = {}
@@ -732,24 +721,20 @@ def track_number_and_redirect(
         utm_original = subids_in.get("utm_content") or ""
 
     clean_base = re.sub(r'[^A-Za-z0-9]', '', utm_original or "") or "n"
-    seq = incr_counter()
+    seq = incr_counter()  # <<< contador monotônico sem TTL (não reseta)
     utm_numbered = f"{clean_base}N{seq}"
 
-    # Define utm_content preservando ordem
     url_with_utm = _set_utm_content_preserving_order(resolved_url, utm_numbered)
-
-    # Mantém utm_numbered adicional
     url_final_qs_plus = add_or_update_query_param(url_with_utm, "utm_numbered", utm_numbered)
 
-    # ===== Prepara origin_url (LONGA) p/ GraphQL =====
+    # ===== origin_url (LONGA) p/ GraphQL =====
     origin_url = url_final_qs_plus
     if _is_short_domain(urlsplit(origin_url).netloc):
         origin_url = _resolve_short_follow(origin_url)
 
-    # Sanitiza sub_id3 (Shopee)
     sub_id_api = sanitize_subid_for_shopee(utm_numbered)
 
-    # ===== Gera short oficial (ou fallback) =====
+    # ===== Short oficial =====
     dest = generate_short_link(origin_url, sub_id_api)
 
     # ===== Snapshot em Redis =====
@@ -763,7 +748,7 @@ def track_number_and_redirect(
         "mode": mode
     }))
 
-    # ===== Construir user_data Meta =====
+    # ===== Meta user data =====
     user_data_meta = {
         "client_ip_address": ip_addr,
         "client_user_agent": user_agent,
@@ -771,7 +756,7 @@ def track_number_and_redirect(
         **({"fbc": fbc_val} if fbc_val else {})
     }
 
-    # ===== Geo + Predição (CatBoost) =====
+    # ===== Geo + Predição =====
     pred_label = ""
     p_map = {"comprou": 0.0, "quase": 0.0, "desinteressado": 0.0}
     meta_sent = ""
@@ -988,6 +973,18 @@ def admin_flush(token: str):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     sent = _flush_buffer_to_gcs()
     return {"ok": True, "sent_rows": sent}
+
+# ====== Admin: inspecionar o contador (valor + TTL) ======
+@app.get("/admin/counter")
+def admin_counter(x_admin_token: str = Header(None)):
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    try:
+        v = r.get(COUNTER_KEY)
+        ttl = r.ttl(COUNTER_KEY)
+        return {"counter": int(v or 0), "ttl": ttl}  # ttl esperado: -1 (sem expiração)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 # ===================== Admin: Teste de Evento CAPI =====================
 @app.get("/admin/test")
