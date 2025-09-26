@@ -17,14 +17,14 @@ Anti-reset do contador (NÃO RESETA, mesmo após redeploy do app):
 - No startup, forçamos PERSIST no COUNTER_KEY.
 - Endpoint /admin/counter para inspecionar valor e TTL.
 
-+++ Melhorias Meta CAPI (Advanced Matching + Conteúdos):
-- Captura de em/ph/eid via querystring e endpoint /identify (armazenados com hash SHA-256 no Redis).
-- external_id com fallback estável (hash de fbp|ua|ip) quando não informado.
-- Extração automática de shop_id/item_id da URL Shopee → content_ids/contents.
-- Enriquecimento dos eventos ViewContent/AddToCart com esses dados.
++++ Melhorias Meta CAPI (sem precisar e-mail/telefone):
+- external_id PRIORITÁRIO = SHA-256(utm_numbered)  •  fallback = SHA-256(fbp|ua|ip)
+- Geração de cookie _fbp quando ausente (eleva match rate)
+- Extração automática de shop_id/item_id da URL Shopee → content_ids/contents
+- Enriquecimento de ViewContent/AddToCart (custom_data)
 """
 
-import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json
+import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
 from typing import Optional, Dict, Tuple, List, Any
 
 import requests
@@ -81,9 +81,8 @@ app = FastAPI(title="Shopee UTM Numbered → ShortLink + Redis + GCS + Geo + Pre
 
 # Redis
 r = redis.from_url(REDIS_URL)
-# >>> Anti-reset: garante que o contador NÃO tenha TTL logo no startup
 try:
-    r.persist(COUNTER_KEY)
+    r.persist(COUNTER_KEY)  # Anti-reset de TTL
 except Exception:
     pass
 
@@ -161,50 +160,23 @@ def _is_pinterest(ua: str) -> bool:
     ua = (ua or "").lower()
     return any(h in ua for h in PIN_UA_HINTS)
 
-# ===================== Advanced Matching Helpers (Meta) =====================
-EMAIL_RE = re.compile(r"\s+", re.I)
-PHONE_RE = re.compile(r"[^\d]+")
-
+# ===================== Helpers de AM (sem PII) =====================
 def _sha256_lower(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-def _norm_email(e: str) -> Optional[str]:
-    if not e: return None
-    e = EMAIL_RE.sub("", e.strip().lower())
-    return e if "@" in e and "." in e.split("@")[-1] else None
-
-def _norm_phone_br(ph: str) -> Optional[str]:
-    if not ph: return None
-    digits = PHONE_RE.sub("", ph)
-    if len(digits) < 8: return None
-    if digits.startswith("0"): digits = digits.lstrip("0")
-    if not digits.startswith("55") and len(digits) in (10,11):
-        digits = "55" + digits
-    return digits
-
-def _hash_for_meta_email(email_raw: Optional[str]) -> Optional[str]:
-    e = _norm_email(email_raw or "")
-    return _sha256_lower(e) if e else None
-
-def _hash_for_meta_phone(phone_raw: Optional[str]) -> Optional[str]:
-    p = _norm_phone_br(phone_raw or "")
-    return _sha256_lower(p) if p else None
-
-def _stable_external_id(fbp: Optional[str], ua: str, ip: str) -> str:
-    base = f"{fbp or '-'}|{ua or '-'}|{ip or '-'}"
-    return _sha256_lower(base)
-
 def _extract_shopee_ids(u: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Retorna (shop_id, item_id) se a URL contiver /i.<shop_id>.<item_id>, senão (None, None)
-    """
+    """Retorna (shop_id, item_id) quando a URL contiver /i.<shop>.<item>."""
     try:
         m = re.search(r"/i\.(\d+)\.(\d+)", u)
         if m:
             return m.group(1), m.group(2)
-        return None, None
-    except:
-        return None, None
+    except Exception:
+        pass
+    return None, None
+
+def _gen_fbp(ts: int) -> str:
+    # padrão do Meta: fb.1.<timestamp>.<random>
+    return f"fb.1.{ts}.{random.randint(10**15, 10**16 - 1)}"
 
 # ===================== Buffer CSV =====================
 _buffer_lock = threading.Lock()
@@ -222,7 +194,7 @@ CSV_HEADERS = [
     "geo_isp","geo_org","geo_asn","geo_lat","geo_lon",
     # predição
     "pred_label","p_comprou","p_quase","p_desinteressado",
-    # ==== NOVAS FEATURES LOGADAS (alinhadas ao treino) ====
+    # novas features logadas
     "part_of_day","hour","dow","ref_domain","os_version_num","is_android","is_ios",
     # meta
     "meta_event_sent","meta_view_sent"
@@ -230,10 +202,6 @@ CSV_HEADERS = [
 
 # ===================== Helpers já existentes =====================
 def incr_counter() -> int:
-    """
-    Contador monotônico e sem TTL (não expira). Nunca reseta por si só.
-    Usa pipeline: INCR + PERSIST para remover TTL acidental.
-    """
     pipe = r.pipeline()
     pipe.incr(COUNTER_KEY)
     pipe.persist(COUNTER_KEY)
@@ -394,8 +362,8 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
 # ===================== Predição (CatBoost) =====================
 _model = None
 _model_classes: List[str] = []
-_thresholds: Dict[str, float] = {}   # {"qvc_mid":..., "atc_high":...}
-_comprou_threshold: float = 0.5      # corte efetivo (ATC por padrão)
+_thresholds: Dict[str, float] = {}
+_comprou_threshold: float = 0.5
 
 _FEATURE_NAMES_FROM_META: List[str] = []
 _CAT_IDX_FROM_META: List[int] = []
@@ -717,38 +685,6 @@ def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str,
         raw_path = "https:" + raw_path
     return _fix_scheme(raw_path), "raw_path"
 
-# ===================== Endpoint para AM manual =====================
-@app.post("/identify")
-async def identify(
-    utm: str = Query(...),
-    em: Optional[str] = Query(None),
-    ph: Optional[str] = Query(None),
-    eid: Optional[str] = Query(None),
-):
-    """
-    Associa hashes (em/ph/eid) ao utm_numbered informado. Armazena em Redis por USERDATA_TTL_SECONDS.
-    """
-    key = f"{USERDATA_KEY_PREFIX}am:{utm}"
-    payload = {}
-    if em:
-        h = _hash_for_meta_email(em)
-        if h: payload["em"] = h
-    if ph:
-        h = _hash_for_meta_phone(ph)
-        if h: payload["ph"] = h
-    if eid:
-        payload["external_id"] = _sha256_lower(eid.strip().lower())
-    if not payload:
-        return {"ok": False, "error": "nenhum campo válido"}
-    try:
-        prev = r.get(key)
-        merged = json.loads(prev) if prev else {}
-        merged.update(payload)
-        r.setex(key, USERDATA_TTL_SECONDS, json.dumps(merged))
-        return {"ok": True, "stored": list(payload.keys())}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
 # ===================== Handler principal =====================
 @app.get("/{full_path:path}")
 def track_number_and_redirect(
@@ -771,20 +707,6 @@ def track_number_and_redirect(
     fbclid = request.query_params.get("fbclid")
     ip_addr = (request.client.host if request.client else "0.0.0.0")
     device_name, os_family, os_version = parse_device_info(user_agent)
-
-    # ==== Captura AM via querystring (em/ph/eid) ====
-    em_q  = request.query_params.get("em")
-    ph_q  = request.query_params.get("ph")
-    eid_q = request.query_params.get("eid")
-
-    # ===== Features de log =====
-    hour_log = _extract_hour_from_iso_for_log(iso_time)
-    dow_log  = _extract_dow_from_iso_for_log(iso_time)
-    ref_domain_log = _get_first_domain_for_log(referrer)
-    os_version_num_log = _version_num_for_log(os_version)
-    is_android_log = 1 if "android" in (os_family or "").lower() else 0
-    is_ios_log     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
-    part_of_day_log = _part_of_day_from_hour(hour_log)
 
     # ===== Resolve shortlink =====
     parts_in = urlsplit(incoming_url)
@@ -816,10 +738,17 @@ def track_number_and_redirect(
     url_with_utm = _set_utm_content_preserving_order(resolved_url, utm_numbered)
     url_final_qs_plus = add_or_update_query_param(url_with_utm, "utm_numbered", utm_numbered)
 
-    # ===== origin_url (LONGA) p/ GraphQL =====
+    # ===== origin_url (LONGA) p/ GraphQL / conteúdo =====
     origin_url = url_final_qs_plus
     if _is_short_domain(urlsplit(origin_url).netloc):
         origin_url = _resolve_short_follow(origin_url)
+
+    shop_id, item_id = _extract_shopee_ids(origin_url)
+    if shop_id and item_id:
+        content_ids = [f"{shop_id}.{item_id}"]
+        contents_payload = [{"id": f"{shop_id}.{item_id}", "quantity": 1}]
+    else:
+        content_ids, contents_payload = [], []
 
     sub_id_api = sanitize_subid_for_shopee(utm_numbered)
 
@@ -828,7 +757,10 @@ def track_number_and_redirect(
 
     # ===== Snapshot em Redis =====
     fbp_cookie = get_cookie_value(cookie_header, "_fbp")
-    fbc_val    = build_fbc_from_fbclid(fbclid, creation_ts=ts)
+    if not fbp_cookie:
+        # gera um _fbp próprio para elevar match rate
+        fbp_cookie = _gen_fbp(ts)
+    fbc_val = build_fbc_from_fbclid(fbclid, creation_ts=ts)
     r.setex(f"{USERDATA_KEY_PREFIX}{utm_numbered}", USERDATA_TTL_SECONDS, json.dumps({
         "ip": ip_addr, "ua": user_agent, "referrer": referrer,
         "event_source_url": origin_url, "short_link": dest,
@@ -837,52 +769,19 @@ def track_number_and_redirect(
         "mode": mode
     }))
 
-    # ===== Advanced Matching: consolidar em/ph/eid (query + storage) =====
-    # 1) Hash a partir da querystring
-    em_hash_q  = _hash_for_meta_email(em_q) if em_q else None
-    ph_hash_q  = _hash_for_meta_phone(ph_q) if ph_q else None
-    eid_hash_q = _sha256_lower(eid_q.strip().lower()) if eid_q else None
-
-    # 2) Lê valores já persistidos via /identify (se existirem)
-    am_key = f"{USERDATA_KEY_PREFIX}am:{utm_numbered}"
-    em_hash_s, ph_hash_s, eid_hash_s = None, None, None
-    try:
-        am = r.get(am_key)
-        if am:
-            am_j = json.loads(am)
-            em_hash_s  = am_j.get("em")
-            ph_hash_s  = am_j.get("ph")
-            eid_hash_s = am_j.get("external_id")
-    except Exception:
-        pass
-
-    # 3) Se vier em/ph/eid na query, persiste para reuso futuro
-    try:
-        if em_hash_q or ph_hash_q or eid_hash_q:
-            merged = {"em": em_hash_q or em_hash_s, "ph": ph_hash_q or ph_hash_s, "external_id": eid_hash_q or eid_hash_s}
-            # remove None
-            merged = {k:v for k,v in merged.items() if v}
-            if merged:
-                r.setex(am_key, USERDATA_TTL_SECONDS, json.dumps(merged))
-    except Exception:
-        pass
-
-    # 4) Fallback para external_id estável
-    eid_fallback = _stable_external_id(fbp_cookie, user_agent, ip_addr)
+    # ===== external_id (PRIORIDADE: utm_numbered; fallback: fbp|ua|ip) =====
+    external_id_from_utm = _sha256_lower(utm_numbered.lower()) if utm_numbered else None
+    external_id_fallback  = _sha256_lower(f"{fbp_cookie or '-'}|{user_agent or '-'}|{ip_addr or '-'}")
+    external_id_use = external_id_from_utm or external_id_fallback
 
     # ===== Meta user data =====
     user_data_meta = {
         "client_ip_address": ip_addr,
         "client_user_agent": user_agent,
         **({"fbp": fbp_cookie} if fbp_cookie else {}),
-        **({"fbc": fbc_val} if fbc_val else {})
+        **({"fbc": fbc_val} if fbc_val else {}),
+        "external_id": external_id_use
     }
-    em_use  = em_hash_q or em_hash_s
-    ph_use  = ph_hash_q or ph_hash_s
-    eid_use = eid_hash_q or eid_hash_s or eid_fallback
-    if em_use:  user_data_meta["em"] = em_use
-    if ph_use:  user_data_meta["ph"] = ph_use
-    if eid_use: user_data_meta["external_id"] = eid_use
 
     # ===== Geo + Predição =====
     pred_label = ""
@@ -918,12 +817,7 @@ def track_number_and_redirect(
             if ordered_proba:
                 pred_label = predict_label_from_probs(ordered_proba, ordered_classes)
 
-            # ===== Conteúdo de produto (shop_id.item_id) =====
-            shop_id, item_id = _extract_shopee_ids(origin_url)
-            content_ids = [f"{shop_id}.{item_id}"] if (shop_id and item_id) else []
-            contents_payload = [{"id": f"{shop_id}.{item_id}", "quantity": 1}] if content_ids else []
-
-            # ===== AddToCart se "comprou" (regra ATC) =====
+            # ===== AddToCart (quando alta intenção) =====
             if pred_label == "comprou" and META_PIXEL_ID and META_ACCESS_TOKEN:
                 atc_payload = {
                     "data": [{
@@ -956,11 +850,6 @@ def track_number_and_redirect(
 
     # ===== ViewContent (sempre) =====
     if META_PIXEL_ID and META_ACCESS_TOKEN:
-        # Conteúdo de produto (parse independente para garantir)
-        shop_id_vc, item_id_vc = _extract_shopee_ids(origin_url)
-        content_ids_vc = [f"{shop_id_vc}.{item_id_vc}"] if (shop_id_vc and item_id_vc) else []
-        contents_payload_vc = [{"id": f"{shop_id_vc}.{item_id_vc}", "quantity": 1}] if content_ids_vc else []
-
         vc_payload = {
             "data": [{
                 "event_name": "ViewContent",
@@ -971,7 +860,7 @@ def track_number_and_redirect(
                 "user_data": user_data_meta,
                 "custom_data": {
                     "content_type": "product",
-                    **({"content_ids": content_ids_vc, "contents": contents_payload_vc} if content_ids_vc else {})
+                    **({"content_ids": content_ids, "contents": contents_payload} if content_ids else {})
                 }
             }]
         }
@@ -987,13 +876,21 @@ def track_number_and_redirect(
             meta_view = "error"
 
     # ===== CSV (buffer local → flush GCS assíncrono) =====
+    hour_log = _extract_hour_from_iso_for_log(iso_time)
+    dow_log  = _extract_dow_from_iso_for_log(iso_time)
+    ref_domain_log = _get_first_domain_for_log(referrer)
+    os_version_num_log = _version_num_for_log(os_version)
+    is_android_log = 1 if "android" in (os_family or "").lower() else 0
+    is_ios_log     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
+    part_of_day_log = _part_of_day_from_hour(hour_log)
+
     csv_row = [
         ts, iso_time, ip_addr, user_agent, device_name, os_family, os_version, referrer,
         incoming_url, resolved_url, origin_url, (cat or ""),
         utm_original, utm_numbered,
         subids_in.get("sub_id1") or "", subids_in.get("sub_id2") or "",
         subids_in.get("sub_id3") or "", subids_in.get("sub_id4") or "", subids_in.get("sub_id5") or "",
-        fbclid or "", get_cookie_value(cookie_header, "_fbp") or "", build_fbc_from_fbclid(fbclid, ts) or "",
+        fbclid or "", fbp_cookie or "", build_fbc_from_fbclid(fbclid, ts) or "",
         geo.get("geo_status",""), geo.get("geo_country",""), geo.get("geo_region",""), geo.get("geo_state",""),
         geo.get("geo_city",""), geo.get("geo_zip",""),
         geo.get("geo_isp",""), geo.get("geo_org",""), geo.get("geo_asn",""), geo.get("geo_lat",""), geo.get("geo_lon",""),
@@ -1022,7 +919,12 @@ def track_number_and_redirect(
             "X-Content-Type-Options": "nosniff",
         })
 
-    return RedirectResponse(dest, status_code=302, headers={"Cache-Control": "no-store, max-age=0"})
+    # ===== Redireciona e garante o cookie _fbp no navegador =====
+    return RedirectResponse(dest, status_code=302, headers={
+        "Cache-Control": "no-store, max-age=0",
+        # reforça o _fbp no browser mesmo se já existia (idempotente)
+        "Set-Cookie": f"_fbp={fbp_cookie}; Path=/; Max-Age=63072000; SameSite=Lax"
+    })
 
 # ===================== Admin =====================
 @app.get("/admin", response_class=HTMLResponse)
