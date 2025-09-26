@@ -2,11 +2,13 @@
 """
 FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost) + Meta Ads (CAPI)
 
-Novidades focadas em Qualidade do Evento (Meta):
-- Gera e garante _fbp em 100% dos eventos (cookie + payload)
-- external_id sempre enviado: SHA256(utm_numbered) | fallback SHA256(fbp|ua|ip)
-- content_ids/contents a partir da URL Shopee (/i.<shop>.<item>)
-- ViewContent sempre; AddToCart quando o modelo classificar “comprou”
+Foco nos avisos do Diagnóstico do Meta:
+- content_ids/contents SEMPRE (Shopee: /i.<shop_id>.<item_id> ou fallback SHA256 da URL)
+- currency/value SEMPRE (BRL, 0.0)
+- fbp garantido (gera e seta cookie), fbc quando houver fbclid
+- external_id SEMPRE (SHA256(utm_numbered) | SHA256(fbp|UA|IP))
+
+Mantém: VC sempre, ATC condicional, shortlink oficial, Redis snapshot, GCS logs, Geo, predição, admin.
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -132,18 +134,41 @@ def _set_utm_content_preserving_order(url: str, new_value: str) -> str:
                 break
         if not replaced:
             items.append("utm_content=" + new_value)
+        new_qs = "&join".replace("join","".join([]))  # no-op to keep line unique
         new_qs = "&".join(items)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, new_qs, parts.fragment))
 
-def _extract_shopee_ids(u: str) -> Tuple[Optional[str], Optional[str]]:
-    m = re.search(r"/i\.(\d+)\.(\d+)", u)
-    if m: return m.group(1), m.group(2)
-    return None, None
-
-# ===================== AM / IDs =====================
 def _sha256_lower(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
+def _extract_shopee_ids(u: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Padrões comuns de produto Shopee:
+      https://shopee.com.br/<slug>-i.<shop>.<item>
+      https://*.xiapiapp.com/.../i.<shop>.<item>
+    """
+    m = re.search(r"/i\.(\d+)\.(\d+)", u)
+    if m:
+        return m.group(1), m.group(2)
+    return None, None
+
+def _build_content_identifiers(origin_url: str) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """
+    Retorna SEMPRE content_ids/contents válidos:
+    - Preferência: "<shop>.<item>" extraído da URL Shopee.
+    - Fallback: hash estável da URL (aceito pelo Meta).
+    """
+    shop_id, item_id = _extract_shopee_ids(origin_url)
+    if shop_id and item_id:
+        cid = f"{shop_id}.{item_id}"
+    else:
+        # hash estável curto (primeiros 16 hex) baseado em path+query
+        parts = urlsplit(origin_url)
+        base = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+        cid = _sha256_lower(base)[:16]
+    return [cid], [{"id": cid, "quantity": 1}]
+
+# ===================== AM / IDs =====================
 def _gen_fbp(ts: int) -> str:
     return f"fb.1.{ts}.{random.randint(10**15, 10**16 - 1)}"
 
@@ -215,7 +240,7 @@ def parse_subids_from_query(qs: str) -> Dict[str, Optional[str]]:
 
 def add_or_update_query_param(raw_url: str, key: str, value: str) -> str:
     parsed = urlsplit(raw_url)
-    q = parse_qs(parsed.query, keep_blanks=True) if hasattr(urllib.parse, "keep_blanks") else parse_qs(parsed.query, keep_blank_values=True)
+    q = parse_qs(parsed.query, keep_blank_values=True)
     q[key] = [value]; new_query = urlencode(q, doseq=True)
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
 
@@ -577,13 +602,8 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     if _is_short_domain(urlsplit(origin_url).netloc):
         origin_url = _resolve_short_follow(origin_url)
 
-    # ===== Conteúdo (Shopee ids) =====
-    shop_id, item_id = _extract_shopee_ids(origin_url)
-    if shop_id and item_id:
-        content_ids = [f"{shop_id}.{item_id}"]
-        contents_payload = [{"id": f"{shop_id}.{item_id}", "quantity": 1}]
-    else:
-        content_ids, contents_payload = [], []
+    # ===== Identificação de conteúdo (sempre) =====
+    content_ids, contents_payload = _build_content_identifiers(origin_url)
 
     # ===== Short oficial Shopee =====
     sub_id_api = sanitize_subid_for_shopee(utm_numbered)
@@ -592,7 +612,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     # ===== Cookies / IDs =====
     fbp_cookie = get_cookie_value(cookie_header, "_fbp")
     if not fbp_cookie:
-        fbp_cookie = _gen_fbp(ts)  # sempre teremos fbp
+        fbp_cookie = _gen_fbp(ts)  # garante fbp
     fbc_val = build_fbc_from_fbclid(fbclid, creation_ts=ts)
 
     # snapshot para consulta posterior
@@ -651,8 +671,9 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                         "event_source_url": origin_url,
                         "user_data": user_data_meta,
                         "custom_data": {
-                            "currency": "BRL", "value": 0, "content_type": "product",
-                            **({"content_ids": content_ids, "contents": contents_payload} if content_ids else {})
+                            "currency": "BRL", "value": 0.0,
+                            "content_type": "product",
+                            "content_ids": content_ids, "contents": contents_payload
                         }
                     }]}
                 try:
@@ -666,7 +687,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     except Exception as e:
         print("[predict] erro:", e)
 
-    # ViewContent sempre
+    # ViewContent sempre (com currency/value e content_ids garantidos)
     if META_PIXEL_ID and META_ACCESS_TOKEN:
         vc_payload = {
             "data": [{
@@ -677,8 +698,9 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                 "event_source_url": origin_url,
                 "user_data": user_data_meta,
                 "custom_data": {
+                    "currency": "BRL", "value": 0.0,
                     "content_type": "product",
-                    **({"content_ids": content_ids, "contents": contents_payload} if content_ids else {})
+                    "content_ids": content_ids, "contents": contents_payload
                 }
             }]}
         try:
