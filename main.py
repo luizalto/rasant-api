@@ -6,7 +6,8 @@ O que faz:
 - Resolve short-link da Shopee, numera UTM (utm_numbered) e preserva utm_content.
 - Gera content_ids/contents sempre (Meta CAPI).
 - Envia ViewContent SEMPRE; AddToCart APENAS se p_comprou >= thr_atc (do arquivo meta).
-- Loga cada clique em CSV (buffer -> GCS) com colunas de probas e thresholds (p_comprou, thr_qvc, thr_atc, is_qvc, is_atc).
+- Loga cada clique em CSV (buffer -> GCS) com colunas de probas e thresholds (p_comprou, thr_qvc, thr_atc, is_qvc, is_atc),
+  e métricas derivadas (pcomprou_pct, thr_qvc_pct, thr_atc_pct, gap_qvc, gap_atc, pct_of_atc).
 - Predição alinhada ao treino: usa "feature_names" e "cat_idx" do model_meta_comprou.json.
 - Suporta Target Encoding opcional (arquivo te_stats.json).
 
@@ -200,6 +201,8 @@ CSV_HEADERS = [
     "pred_label","p_comprou","p_quase","p_desinteressado",
     # thresholds (do meta do modelo) e flags
     "thr_qvc","thr_atc","is_qvc","is_atc",
+    # métricas derivadas (para ver o quão perto/longe do threshold)
+    "pcomprou_pct","thr_qvc_pct","thr_atc_pct","gap_qvc","gap_atc","pct_of_atc",
     # eventos meta
     "meta_event_sent","meta_view_sent"
 ]
@@ -870,6 +873,18 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     is_ios_log     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
     part_of_day_log = _part_of_day_from_hour(hour_log)
 
+    # métricas derivadas vs thresholds
+    p_c = float(p_map.get("comprou", 0.0))
+    thr_q = float(_thr_qvc or 0.5)
+    thr_a = float(_thr_atc or thr_q or 0.5)
+
+    pcomprou_pct = p_c * 100.0
+    thr_qvc_pct  = thr_q * 100.0
+    thr_atc_pct  = thr_a * 100.0
+    gap_qvc      = p_c - thr_q             # positivo = passou do QVC
+    gap_atc      = p_c - thr_a             # positivo = passou do ATC
+    pct_of_atc   = (p_c / thr_a * 100.0) if thr_a > 0 else 0.0
+
     csv_row = [
         ts, iso_time, ip_addr, user_agent, referrer,
         incoming_url, resolved_url, origin_url, (cat or ""),
@@ -879,8 +894,9 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         geo.get("geo_city",""), geo.get("geo_zip",""), geo.get("geo_lat",""), geo.get("geo_lon",""),
         geo.get("geo_isp",""), geo.get("geo_org",""), geo.get("geo_asn",""),
         part_of_day_log, hour_log, dow_log, ref_domain_log, os_version_num_log, is_android_log, is_ios_log,
-        pred_label, float(p_map.get("comprou",0.0)), float(p_map.get("quase",0.0)), float(p_map.get("desinteressado",0.0)),
-        float(_thr_qvc or 0.5), float(_thr_atc or _thr_qvc or 0.5), int(is_qvc_flag), int(is_atc_flag),
+        pred_label, p_c, float(p_map.get("quase",0.0)), float(p_map.get("desinteressado",0.0)),
+        thr_q, thr_a, int(is_qvc_flag), int(is_atc_flag),
+        pcomprou_pct, thr_qvc_pct, thr_atc_pct, gap_qvc, gap_atc, pct_of_atc,
         meta_sent, meta_view
     ]
     with _buffer_lock:
