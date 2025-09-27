@@ -8,7 +8,8 @@ Foco nos avisos do Diagnóstico do Meta:
 - fbp garantido (gera e seta cookie), fbc quando houver fbclid
 - external_id SEMPRE (SHA256(utm_numbered) | SHA256(fbp|UA|IP))
 
-Mantém: VC sempre, ATC condicional, shortlink oficial, Redis snapshot, GCS logs, Geo, predição, admin.
+Mantém: VC sempre, ATC condicional (p>=thr_atc), shortlink oficial, Redis snapshot, GCS logs, Geo, predição, admin.
+QVC (p>=thr_qvc) é apenas interno para qualificar VC (NÃO envia evento para Meta).
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -134,7 +135,6 @@ def _set_utm_content_preserving_order(url: str, new_value: str) -> str:
                 break
         if not replaced:
             items.append("utm_content=" + new_value)
-        new_qs = "&join".replace("join","".join([]))  # no-op to keep line unique
         new_qs = "&".join(items)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, new_qs, parts.fragment))
 
@@ -187,7 +187,7 @@ CSV_HEADERS = [
     "geo_isp","geo_org","geo_asn","geo_lat","geo_lon",
     "pred_label","p_comprou","p_quase","p_desinteressado",
     "part_of_day","hour","dow","ref_domain","os_version_num","is_android","is_ios",
-    "meta_event_sent","meta_view_sent"
+    "thr_qvc","thr_atc","is_qvc","meta_event_sent","meta_view_sent"
 ]
 
 # ===================== Utils existentes =====================
@@ -272,7 +272,10 @@ def sanitize_subid_for_shopee(value: str) -> str:
 
 def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
     payload_obj = {
-        "query": ("mutation{generateShortLink(input:{" f"originUrl:\"{origin_url}\"," f"subIds:[\"\",\"\",\"{utm_content_for_api}\",\"\",\"\"]" "}){shortLink}}")
+        "query": ("mutation{generateShortLink(input:{"
+                  f"originUrl:\"{origin_url}\","
+                  f"subIds:[\"\",\"\",\"{utm_content_for_api}\",\"\",\"\"]"
+                  "}){shortLink}}")
     }
     payload = json.dumps(payload_obj, separators=(',', ':'), ensure_ascii=False)
     ts = str(int(time.time()))
@@ -323,11 +326,9 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
 _model = None
 _model_classes: List[str] = []
 _thresholds: Dict[str, float] = {}
-_comprou_threshold: float = 0.5
-
+_comprou_threshold: float = 0.5  # ATC
 _FEATURE_NAMES_FROM_META: List[str] = []
 _CAT_IDX_FROM_META: List[int] = []
-
 _TE_STATS = None
 _TE_PRIORS = None
 
@@ -400,6 +401,13 @@ def _extract_dow_from_iso_for_log(t):
         return dt.weekday()
     except: return time.localtime().tm_wday
 
+def _apply_te(colname: str, value: str) -> Tuple[float,float]:
+    if not _TE_STATS or colname not in _TE_STATS: return 0.0, 0.0
+    stats_map = _TE_STATS[colname]; prior = float((_TE_PRIORS or {}).get(colname, 0.0))
+    rec = stats_map.get(value); 
+    if rec: return float(rec.get("count", 0.0)), float(rec.get("buy_rate", prior))
+    return 0.0, prior
+
 def _features_full_dict(os_family, device_name, os_version, referrer, utm_original,
                         iso_time=None, geo: Optional[Dict[str,Any]]=None) -> Dict[str, Any]:
     hour = _extract_hour_from_iso_for_log(iso_time); dow  = _extract_dow_from_iso_for_log(iso_time)
@@ -417,13 +425,6 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
 
     device_city_combo   = (f"{device_bucket}__{geo_city}").lower()
     utm_partofday_combo = (f"{utm_original}__{part_of_day}").lower()
-
-    def _apply_te(colname: str, value: str) -> Tuple[float,float]:
-        if not _TE_STATS or colname not in _TE_STATS: return 0.0, 0.0
-        stats_map = _TE_STATS[colname]; prior = float((_TE_PRIORS or {}).get(colname, 0.0))
-        rec = stats_map.get(value); 
-        if rec: return float(rec.get("count", 0.0)), float(rec.get("buy_rate", prior))
-        return 0.0, prior
 
     utm_n,  utm_br  = _apply_te("utm_original", str(utm_original or ""))
     ref_n,  ref_br  = _apply_te("ref_domain",   str(ref_domain))
@@ -468,6 +469,7 @@ def _load_model_if_available():
                 _model_classes = meta.get("classes") or meta.get("classes_binary") or ["desinteressado","comprou"]
                 _thresholds = {"qvc_mid": (meta.get("thresholds") or {}).get("qvc_mid"),
                                "atc_high": (meta.get("thresholds") or {}).get("atc_high")}
+                # Em produção: usar ATC como threshold de "comprou"
                 _comprou_threshold = float(_thresholds.get("atc_high") or _thresholds.get("qvc_mid") or 0.5)
                 _FEATURE_NAMES_FROM_META = list(meta.get("feature_names", []))
                 _CAT_IDX_FROM_META = list(meta.get("cat_idx", []))
@@ -484,11 +486,8 @@ def _load_model_if_available():
 def predict_label_from_probs(proba: List[float], classes: List[str]) -> str:
     try:
         idx = {c:i for i,c in enumerate(classes)}; p = {c: proba[idx[c]] for c in classes}
-        thr_c = _comprou_threshold
+        thr_c = _comprou_threshold  # ATC
         if "comprou" in classes and p.get("comprou", 0.0) >= thr_c: return "comprou"
-        if "quase" in classes:
-            thr_q = float((_thresholds or {}).get("quase", 1.1))
-            if p.get("quase", 0.0) >= thr_q: return "quase"
         return "desinteressado"
     except Exception:
         j = int(max(range(len(proba)), key=lambda i: proba[i])); return classes[j]
@@ -641,6 +640,9 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     pred_label = ""
     p_map = {"comprou": 0.0, "quase": 0.0, "desinteressado": 0.0}
     meta_sent = ""; meta_view = ""
+    thr_atc = float((_thresholds or {}).get("atc_high") or 0.5)
+    thr_qvc = float((_thresholds or {}).get("qvc_mid") or 0.5)
+    is_qvc = 0
 
     geo = geo_lookup(ip_addr)
     try:
@@ -650,17 +652,24 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             from catboost import Pool; import pandas as pd
             X_df = pd.DataFrame([row_values], columns=_FEATURE_NAMES_FROM_META); pool = Pool(X_df, cat_features=cat_idx)
             raw_proba = _model.predict_proba(pool)[0]; proba = [float(x) for x in raw_proba]
+
+            # mapeia para nomes (ordem conhecida do treino/servidor)
             classes = list(_model_classes) if _model_classes else ([str(x) for x in getattr(_model,"classes_",[])] or ["desinteressado","comprou"])
-            tmp = {}; 
+            tmp = {}
             for i, cls in enumerate(classes):
                 if i < len(proba): tmp[cls] = proba[i]
             for k in ("comprou","quase","desinteressado"):
                 if k in tmp: p_map[k] = tmp[k]
             ordered_classes = [c for c in ("comprou","desinteressado","quase") if c in tmp]
             ordered_proba   = [tmp[c] for c in ordered_classes]
-            if ordered_proba: pred_label = predict_label_from_probs(ordered_proba, ordered_classes)
 
-            # AddToCart quando alta intenção
+            # classificação em produção:
+            # - 'comprou' => p>=thr_atc (ATC)
+            # - QVC interno => p>=thr_qvc (sem envio ao Meta)
+            if p_map["comprou"] >= thr_qvc: is_qvc = 1
+            pred_label = predict_label_from_probs(ordered_proba, ordered_classes)
+
+            # AddToCart quando alta intenção (ATC)
             if pred_label == "comprou" and META_PIXEL_ID and META_ACCESS_TOKEN:
                 atc_payload = {
                     "data": [{
@@ -731,10 +740,13 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         geo.get("geo_isp",""), geo.get("geo_org",""), geo.get("geo_asn",""), geo.get("geo_lat",""), geo.get("geo_lon",""),
         pred_label or "", p_map["comprou"], p_map["quase"], p_map["desinteressado"],
         part_of_day_log, hour_log, dow_log, ref_domain_log, os_version_num_log, is_android_log, is_ios_log,
-        meta_sent, meta_view
+        thr_qvc, thr_atc, is_qvc, meta_sent, meta_view
     ]
     with _buffer_lock:
         _buffer_rows.append(csv_row)
+        if len(_buffer_rows) >= FLUSH_MAX_ROWS:
+            try: _flush_buffer_to_gcs()
+            except Exception as e: print("[flush-now] erro:", e)
 
     # ===== Intersticial Pinterest =====
     def _is_pinterest(ua: str) -> bool: return "pinterest" in (ua or "").lower()
