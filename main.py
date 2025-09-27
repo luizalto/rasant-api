@@ -74,8 +74,10 @@ app = FastAPI(title="Shopee UTM → ShortLink + Geo + Predict + CAPI")
 
 # Redis
 r = redis.from_url(REDIS_URL)
-try: r.persist(COUNTER_KEY)
-except Exception: pass
+try:
+    r.persist(COUNTER_KEY)
+except Exception:
+    pass
 
 # GCS (lazy: só importa client se GCS_BUCKET existir)
 _bucket = None
@@ -110,10 +112,13 @@ def _is_short_domain(domain: str) -> bool:
     return any(d.endswith(sd) for sd in SHORT_DOMAINS)
 
 def _is_allowed_long(domain: str) -> bool:
-    if not domain: return False
+    if not domain:
+        return False
     d = domain.strip().lower()
-    if ":" in d: d = d.split(":", 1)[0]
-    if d.startswith("www."): d = d[4:]
+    if ":" in d:
+        d = d.split(":", 1)[0]
+    if d.startswith("www."):
+        d = d[4:]
     apex_ok = d in ("shopee.com.br", "shopee.com", "xiapiapp.com")
     suf_ok  = any(d.endswith(suf.lstrip(".")) or d.endswith(suf) for suf in LONG_ALLOWED)
     return apex_ok or suf_ok
@@ -138,7 +143,8 @@ def _set_utm_content_preserving_order(url: str, new_value: str) -> str:
             items[i] = "utm_content=" + new_value
             replaced = True
             break
-    if not replaced: items.append("utm_content=" + new_value)
+    if not replaced:
+        items.append("utm_content=" + new_value)
     new_qs = "&".join([s for s in items if s])
     return urlunsplit((parts.scheme, parts.netloc, parts.path, new_qs, parts.fragment))
 
@@ -154,7 +160,8 @@ def _sha256_lower(s: str) -> str:
 
 def _extract_shopee_ids(u: str) -> Tuple[Optional[str], Optional[str]]:
     m = re.search(r"/i\.(\d+)\.(\d+)", u)
-    if m: return m.group(1), m.group(2)
+    if m:
+        return m.group(1), m.group(2)
     return None, None
 
 def _build_content_identifiers(origin_url: str) -> Tuple[List[str], List[Dict[str, Any]]]:
@@ -199,20 +206,28 @@ CSV_HEADERS = [
 
 # ===================== Utils =====================
 def incr_counter() -> int:
-    pipe = r.pipeline(); pipe.incr(COUNTER_KEY); pipe.persist(COUNTER_KEY)
-    val, _ = pipe.execute(); return int(val)
+    pipe = r.pipeline()
+    pipe.incr(COUNTER_KEY)
+    pipe.persist(COUNTER_KEY)
+    val, _ = pipe.execute()
+    return int(val)
 
 def get_cookie_value(cookie_header: Optional[str], name: str) -> Optional[str]:
-    if not cookie_header: return None
+    if not cookie_header:
+        return None
     try:
         for it in [c.strip() for c in cookie_header.split(";")]:
-            if it.startswith(name + "="): return it.split("=", 1)[1]
-    except Exception: pass
+            if it.startswith(name + "="):
+                return it.split("=", 1)[1]
+    except Exception:
+        pass
     return None
 
 def build_fbc_from_fbclid(fbclid: Optional[str], creation_ts: Optional[int] = None) -> Optional[str]:
-    if not fbclid: return None
-    if creation_ts is None: creation_ts = int(time.time())
+    if not fbclid:
+        return None
+    if creation_ts is None:
+        creation_ts = int(time.time())
     return f"fb.1.{creation_ts}.{fbclid}"
 
 def parse_device_info(ua: str):
@@ -225,27 +240,35 @@ def parse_device_info(ua: str):
     elif re.search(r"Android", ua, re.I):
         m = re.search(r"Android\s(\d+)", ua, re.I)
         os_family, os_version = "Android", (m.group(1) if m else "-")
-    elif "Windows" in ua: os_family = "Windows"
-    elif "Mac OS X" in ua or "Macintosh" in ua: os_family = "macOS"
-    elif "Linux" in ua: os_family = "Linux"
+    elif "Windows" in ua:
+        os_family = "Windows"
+    elif "Mac OS X" in ua or "Macintosh" in ua:
+        os_family = "macOS"
+    elif "Linux" in ua:
+        os_family = "Linux"
     device_name = "iPhone" if "iphone" in ua_l else ("Android" if "android" in ua_l else "Desktop")
     return device_name, os_family, os_version
 
 def extract_utm_content_from_url(u: str) -> str:
     try:
         qs = urlsplit(u).query
-        if not qs: return ""
+        if not qs:
+            return ""
         q = parse_qs(qs, keep_blank_values=True)
         return (q.get("utm_content") or [""])[0]
-    except: return ""
+    except:
+        return ""
 
 def resolve_short_link(short_url: str) -> Tuple[str, Dict[str, Optional[str]]]:
-    current = short_url; final_url = short_url
+    current = short_url
+    final_url = short_url
     subids = {}
     try:
-        resp = session.get(current, allow_redirects=False, timeout=DEFAULT_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (resolver/1.0)"})
+        resp = session.get(current, allow_redirects=False, timeout=DEFAULT_TIMEOUT,
+                           headers={"User-Agent": "Mozilla/5.0 (resolver/1.0)"})
         if 300 <= resp.status_code < 400 and "Location" in resp.headers:
-            location = resp.headers["Location"]; final_url = urllib.parse.urljoin(current, location)
+            location = resp.headers["Location"]
+            final_url = urllib.parse.urljoin(current, location)
     except Exception:
         pass
     return final_url, subids
@@ -254,7 +277,8 @@ def resolve_short_link(short_url: str) -> Tuple[str, Dict[str, Optional[str]]]:
 _SUBID_MAXLEN = int(os.getenv("SHOPEE_SUBID_MAXLEN", "50"))
 _SUBID_REGEX  = re.compile(r"[^A-Za-z0-9]")
 def sanitize_subid_for_shopee(value: str) -> str:
-    if not value: return "na"
+    if not value:
+        return "na"
     cleaned = _SUBID_REGEX.sub("", value)
     return cleaned[:_SUBID_MAXLEN] if cleaned else "na"
 
@@ -270,12 +294,14 @@ def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
     payload = json.dumps(payload_obj, separators=(',', ':'), ensure_ascii=False)
     ts = str(int(time.time()))
     signature = hashlib.sha256((SHOPEE_APP_ID + ts + payload + SHOPEE_APP_SECRET).encode("utf-8")).hexdigest()
-    headers = {"Authorization": f"SHA256 Credential={SHOPEE_APP_ID}, Timestamp={ts}, Signature={signature}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"SHA256 Credential={SHOPEE_APP_ID}, Timestamp={ts}, Signature={signature}",
+               "Content-Type": "application/json"}
     try:
         resp = session.post(SHOPEE_ENDPOINT, headers=headers, data=payload, timeout=(2, 10))
         j = resp.json()
         short = (((j or {}).get("data") or {}).get("generateShortLink") or {}).get("shortLink")
-        if not short: raise ValueError(f"Resposta Shopee sem shortLink: {j}")
+        if not short:
+            raise ValueError(f"Resposta Shopee sem shortLink: {j}")
         return short
     except Exception as e:
         print(f"[ShopeeShortLink] ERRO: {e}. Fallback para URL numerada.")
@@ -289,11 +315,14 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
     cache_key = f"{GEO_CACHE_PREFIX}{ip}"
     try:
         cached = r.get(cache_key)
-        if cached: return json.loads(cached)
-    except Exception: pass
+        if cached:
+            return json.loads(cached)
+    except Exception:
+        pass
     try:
         url = f"http://ip-api.com/json/{ip}?fields={IPAPI_FIELDS}&lang=pt-BR"
-        resp = session.get(url, timeout=5); data = resp.json()
+        resp = session.get(url, timeout=5)
+        data = resp.json()
         norm = {
             "geo_status": data.get("status","fail"),
             "geo_country": data.get("country"),
@@ -310,11 +339,12 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
         r.setex(cache_key, GEO_CACHE_TTL_SECONDS, json.dumps(norm, ensure_ascii=False))
         return norm
     except Exception as e:
-        print("[geo_lookup] erro:", e); return {"geo_status":"fail"}
+        print("[geo_lookup] erro:", e)
+        return {"geo_status":"fail"}
 
 # ===================== Predição (CatBoost) =====================
 _model = None
-_model_classes: List[str] = []  # ordem das classes do modelo
+_model_classes: List[str] = []  # nomes (string) das classes reportadas pelo modelo
 _thresholds: Dict[str, float] = {}  # qvc_mid / atc_high
 _thr_qvc = None
 _thr_atc = None
@@ -324,6 +354,11 @@ _CAT_IDX_FROM_META: List[int] = []
 
 _TE_STATS = None
 _TE_PRIORS = None
+
+# --- NOVO: metadados da classe positiva (para modelo binário) ---
+_POS_LABEL_NAME = "comprou"  # nome lógico
+_POS_LABEL_ID = 1            # ID mapeado no treino (conforme 'mapping' do JSON)
+_POS_IDX = None              # índice da classe positiva dentro de model.classes_
 
 def _load_te_if_available():
     global _TE_STATS, _TE_PRIORS
@@ -360,14 +395,19 @@ def _br_region_macro(uf_or_region: str) -> str:
         "am":"norte","pa":"norte","ro":"norte","rr":"norte","ap":"norte","ac":"norte","to":"norte"
     }
     for m in ["sudeste","sul","centro-oeste","nordeste","norte"]:
-        if m in s: return m
-    uf = s[-2:]; return macro.get(uf, "unknown")
+        if m in s:
+            return m
+    uf = s[-2:]
+    return macro.get(uf, "unknown")
 
-def _is_weekend_from_dow(dow: int) -> int: return 1 if int(dow) in (5,6) else 0
+def _is_weekend_from_dow(dow: int) -> int:
+    return 1 if int(dow) in (5,6) else 0
 
 def _part_of_day_from_hour(h: int) -> str:
-    try: h = int(h)
-    except: return "unknown"
+    try:
+        h = int(h)
+    except:
+        return "unknown"
     if 0<=h<6: return "dawn"
     if 6<=h<12: return "morning"
     if 12<=h<18: return "afternoon"
@@ -375,27 +415,34 @@ def _part_of_day_from_hour(h: int) -> str:
     return "unknown"
 
 def _version_num_for_log(s):
-    m = re.search(r"(\d+(\.\d+)*)", str(s or "")); 
-    if not m: return 0.0
-    try: return float(m.group(1).split(".")[0])
-    except: return 0.0
+    m = re.search(r"(\d+(\.\d+)*)", str(s or ""))
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1).split(".")[0])
+    except:
+        return 0.0
 
 def _get_first_domain_for_log(url):
     try:
         from urllib.parse import urlparse
         netloc = urlparse(str(url)).netloc.lower()
         return netloc[4:] if netloc.startswith("www.") else netloc
-    except: return ""
+    except:
+        return ""
 
 def _extract_hour_from_iso_for_log(t):
-    try: return int(str(t).split("T")[1][:2])
-    except: return 0
+    try:
+        return int(str(t).split("T")[1][:2])
+    except:
+        return 0
 
 def _extract_dow_from_iso_for_log(t):
     try:
         dt = datetime.strptime(str(t)[:19], "%Y-%m-%dT%H:%M:%S")
         return dt.weekday()
-    except: return time.localtime().tm_wday
+    except:
+        return time.localtime().tm_wday
 
 def _apply_te(colname: str, value: str) -> Tuple[float,float]:
     if not _TE_STATS or colname not in _TE_STATS:
@@ -403,25 +450,47 @@ def _apply_te(colname: str, value: str) -> Tuple[float,float]:
     stats_map = _TE_STATS[colname]
     prior = float((_TE_PRIORS or {}).get(colname, 0.0))
     rec = stats_map.get(value)
-    if rec: return float(rec.get("count", 0.0)), float(rec.get("buy_rate", prior))
+    if rec:
+        return float(rec.get("count", 0.0)), float(rec.get("buy_rate", prior))
     return 0.0, prior
 
 def _features_full_dict(os_family, device_name, os_version, referrer, utm_original,
                         iso_time=None, geo: Optional[Dict[str,Any]]=None) -> Dict[str, Any]:
-    hour = _extract_hour_from_iso_for_log(iso_time); dow  = _extract_dow_from_iso_for_log(iso_time)
+    hour = _extract_hour_from_iso_for_log(iso_time)
+    dow  = _extract_dow_from_iso_for_log(iso_time)
+    month = int(str(iso_time)[5:7]) if iso_time else time.localtime().tm_mon
+
     is_android = 1 if "android" in (os_family or "").lower() else 0
     is_ios     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
-    os_ver_num = _version_num_for_log(os_version); ref_domain = _get_first_domain_for_log(referrer or "")
-    device_bucket = _device_bucket_from_name(device_name); part_of_day = _part_of_day_from_hour(hour)
+    os_ver_num = _version_num_for_log(os_version)
+    ref_domain = _get_first_domain_for_log(referrer or "")
+    device_bucket = _device_bucket_from_name(device_name)
+    part_of_day = _part_of_day_from_hour(hour)
     is_weekend = _is_weekend_from_dow(dow)
 
     geo = geo or {}
-    geo_region  = (geo.get("geo_region")  or ""); geo_city = (geo.get("geo_city") or "")
-    geo_zip     = (geo.get("geo_zip")     or ""); geo_isp  = (geo.get("geo_isp")  or "")
-    geo_org     = (geo.get("geo_org")     or ""); geo_macro = _br_region_macro(geo_region or geo.get("geo_state") or "")
+    geo_region = (geo.get("geo_region") or "")
+    geo_city   = (geo.get("geo_city") or "")
+    geo_zip    = (geo.get("geo_zip") or "")
+    geo_isp    = (geo.get("geo_isp") or "")
+    geo_org    = (geo.get("geo_org") or "")
+    geo_macro  = _br_region_macro(geo_region or geo.get("geo_state") or "")
+    geo_fail_flag = 0 if (geo.get("geo_status") == "success") else 1
 
     device_city_combo   = (f"{device_bucket}__{geo_city}").lower()
     utm_partofday_combo = (f"{utm_original}__{part_of_day}").lower()
+
+    # flags simples
+    def _is_private_ip(ip: str) -> int:
+        try:
+            import ipaddress
+            return 1 if ipaddress.ip_address(ip).is_private else 0
+        except Exception:
+            return 0
+
+    def _is_bot(ua: str) -> int:
+        s = (ua or "").lower()
+        return 1 if any(x in s for x in ["bot", "crawl", "spider", "facebookexternalhit", "whatsapp"]) else 0
 
     # Target encodings opcionais
     utm_n,  utm_br  = _apply_te("utm_original", str(utm_original or ""))
@@ -434,8 +503,13 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
         "geo_macro": geo_macro, "geo_region": geo_region, "geo_city": geo_city, "geo_zip": geo_zip,
         "geo_isp": geo_isp, "geo_org": geo_org, "ref_domain": ref_domain, "utm_original": utm_original or "",
         "device_city_combo": device_city_combo, "utm_partofday_combo": utm_partofday_combo,
-        "hour": float(hour), "dow": float(dow), "is_weekend": float(is_weekend),
+        "hour": float(hour), "dow": float(dow), "month": float(month),
+        "is_weekend": float(is_weekend),
         "os_version_num": float(os_ver_num), "is_android": float(is_android), "is_ios": float(is_ios),
+        "is_private_ip_flag": float(_is_private_ip((os.getenv("FORWARDED_IP") or ""))),
+        "is_bot_flag": float(_is_bot(referrer)),
+        "geo_fail_flag": float(geo_fail_flag),
+        "has_utm_flag": float(1 if utm_original else 0),
         "utm_n": float(utm_n), "utm_br": float(utm_br),
         "ref_n": float(ref_n), "ref_br": float(ref_br),
         "devb_n": float(devb_n), "devb_br": float(devb_br),
@@ -443,70 +517,106 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
     }
 
 def _row_in_meta_order(feats_dict: Dict[str, Any]) -> Tuple[List[Any], List[int]]:
+    # defaults numéricos p/ colunas novas vindas do meta
+    numeric_defaults = {
+        "hour","dow","month","is_weekend","os_version_num","is_android","is_ios",
+        "utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br",
+        "is_private_ip_flag","is_bot_flag","geo_fail_flag","has_utm_flag"
+    }
     ordered = []
     for col in _FEATURE_NAMES_FROM_META:
         v = feats_dict.get(col)
         if v is None:
-            if col in ("hour","dow","is_weekend","os_version_num","is_android","is_ios",
-                       "utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br"):
-                v = 0.0
-            else:
-                v = ""
+            v = 0.0 if col in numeric_defaults else ""
         ordered.append(v)
     return ordered, _CAT_IDX_FROM_META
 
 def _load_model_if_available():
-    """Carrega CatBoost + meta (features/cats/thresholds)."""
+    """Carrega CatBoost + meta (features/cats/thresholds) e configura classe positiva."""
     global _model, _model_classes, _thresholds, _thr_qvc, _thr_atc
     global _FEATURE_NAMES_FROM_META, _CAT_IDX_FROM_META
+    global _POS_LABEL_NAME, _POS_LABEL_ID, _POS_IDX
     try:
         from catboost import CatBoostClassifier
         if os.path.exists(MODEL_PATH):
-            m = CatBoostClassifier(); m.load_model(MODEL_PATH); _model = m
-            _model_classes = ["desinteressado","comprou","quase"]  # fallback seguro
-            if hasattr(m, "classes_"):
-                _model_classes = [str(x) for x in m.classes_]  # se existir
+            m = CatBoostClassifier()
+            m.load_model(MODEL_PATH)
+            _model = m
+
+            # classes do catboost (binário usualmente [0,1])
+            _model_classes = [str(x) for x in getattr(m, "classes_", [])] or ["0", "1"]
+
+            # defaults safe
+            _POS_LABEL_NAME = "comprou"
+            _POS_LABEL_ID = 1
+            _POS_IDX = None
 
             if os.path.exists(MODEL_META_PATH):
                 meta = json.load(open(MODEL_META_PATH, "r", encoding="utf-8"))
                 _FEATURE_NAMES_FROM_META = list(meta.get("feature_names", []))
                 _CAT_IDX_FROM_META = list(meta.get("cat_idx", []))
+
                 thr = meta.get("thresholds") or {}
                 _thresholds = {"qvc_mid": thr.get("qvc_mid"), "atc_high": thr.get("atc_high")}
                 _thr_qvc = float(_thresholds.get("qvc_mid") or 0.5)
                 _thr_atc = float(_thresholds.get("atc_high") or _thr_qvc or 0.5)
+
+                _POS_LABEL_NAME = meta.get("positive_label") or "comprou"
+                mapping = meta.get("mapping") or {}
+                try:
+                    _POS_LABEL_ID = int(mapping.get(_POS_LABEL_NAME, 1))
+                except Exception:
+                    _POS_LABEL_ID = 1
             else:
                 _FEATURE_NAMES_FROM_META = []
                 _CAT_IDX_FROM_META = []
-                _thr_qvc = 0.5; _thr_atc = 0.5
+                _thr_qvc = 0.5
+                _thr_atc = 0.5
+
+            # descobrir índice da classe positiva dentro de model.classes_
+            try:
+                classes_raw = list(getattr(_model, "classes_", [0, 1]))
+                _POS_IDX = classes_raw.index(_POS_LABEL_ID) if _POS_LABEL_ID in classes_raw else (1 if len(classes_raw) == 2 else None)
+            except Exception:
+                _POS_IDX = 1
+
             _load_te_if_available()
-            print(f"[model] carregado. thr_qvc={_thr_qvc} thr_atc={_thr_atc} n_feats={len(_FEATURE_NAMES_FROM_META)}")
+            print(f"[model] carregado. thr_qvc={_thr_qvc} thr_atc={_thr_atc} n_feats={len(_FEATURE_NAMES_FROM_META)} pos_id={_POS_LABEL_ID} pos_idx={_POS_IDX}")
         else:
             print("[model] arquivo não encontrado:", MODEL_PATH)
     except Exception as e:
         print("[model] erro ao carregar:", e)
 
 def predict_proba_single(row_values: List[Any], cat_idx: List[int]) -> Dict[str, float]:
-    """Retorna dict com probabilidades por classe."""
+    """Retorna dict com probabilidades por classe (binário ou multi)."""
     try:
         from catboost import Pool
         import pandas as pd
-        if not _model: return {}
+        if not _model:
+            return {}
         X_df  = pd.DataFrame([row_values], columns=_FEATURE_NAMES_FROM_META)
         pool  = Pool(X_df, cat_features=cat_idx)
         probs = _model.predict_proba(pool)[0]
-        # CatBoost pode retornar:
-        #  - binário: [p0, p1] (ordem fixa)
-        #  - multi:   [p_class0, p_class1, ...] na ordem de _model_classes
-        out = {}
-        if len(probs) == 2 and "comprou" in _model_classes:
-            idx1 = _model_classes.index("comprou")
-            # Remap se necessário (catboost binário geralmente retorna [p0,p1] com p da classe 1)
-            out["comprou"] = float(probs[idx1 if idx1 < 2 else 1])
-            out["desinteressado"] = float(probs[1-idx1 if idx1 < 2 else 0])
-        else:
-            for i, cls in enumerate(_model_classes):
-                if i < len(probs): out[cls] = float(probs[i])
+
+        # Binário (2 saídas): p_pos no índice da classe positiva detectada
+        if len(probs) == 2:
+            pos_idx = _POS_IDX if _POS_IDX is not None else 1
+            p_pos = float(probs[pos_idx])
+            p_neg = float(probs[1 - pos_idx])
+            return {"comprou": p_pos, "quase": 0.0, "desinteressado": p_neg}
+
+        # Multiclasse: tenta casar nomes
+        out = {"comprou": 0.0, "quase": 0.0, "desinteressado": 0.0}
+        for i, cls in enumerate(_model_classes):
+            if i >= len(probs):
+                break
+            name = str(cls).lower()
+            if "comprou" in name or name in ("1",):
+                out["comprou"] = float(probs[i])
+            elif "quase" in name:
+                out["quase"] = float(probs[i])
+            elif "desinteress" in name or name in ("0",):
+                out["desinteressado"] = float(probs[i])
         return out
     except Exception as e:
         print("[predict] erro:", e)
@@ -515,19 +625,27 @@ def predict_proba_single(row_values: List[Any], cat_idx: List[int]) -> Dict[str,
 _load_model_if_available()
 
 # ===================== GCS flush =====================
-def _day_key(ts: int) -> str: return time.strftime("%Y-%m-%d", time.localtime(ts))
+def _day_key(ts: int) -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
 def _gcs_object_name(ts: int, part: int) -> str:
-    d = _day_key(ts); return f"{GCS_PREFIX}date={d}/clicks_{d}_part-{part:04d}.csv"
+    d = _day_key(ts)
+    return f"{GCS_PREFIX}date={d}/clicks_{d}_part-{part:04d}.csv"
 
 def _flush_buffer_to_gcs() -> int:
     global _buffer_rows, _last_flush_ts
-    if not _bucket: return 0
+    if not _bucket:
+        return 0
     with _buffer_lock:
         rows = list(_buffer_rows)
-        if len(rows) == 0: return 0
-        _buffer_rows = []; _last_flush_ts = time.time()
-    output = io.StringIO(); w = csv.writer(output)
-    w.writerow(CSV_HEADERS); w.writerows(rows)
+        if len(rows) == 0:
+            return 0
+        _buffer_rows = []
+        _last_flush_ts = time.time()
+    output = io.StringIO()
+    w = csv.writer(output)
+    w.writerow(CSV_HEADERS)
+    w.writerows(rows)
     data = output.getvalue().encode("utf-8")
     part = int(time.time() * 1000) % 10_000_000
     blob_name = _gcs_object_name(int(time.time()), part)
@@ -537,8 +655,10 @@ def _flush_buffer_to_gcs() -> int:
 
 def _background_flusher():
     while True:
-        try: _flush_buffer_to_gcs()
-        except Exception as e: print("[FLUSH-ERR]", e)
+        try:
+            _flush_buffer_to_gcs()
+        except Exception as e:
+            print("[FLUSH-ERR]", e)
         time.sleep(FLUSH_MAX_SECONDS)
 
 threading.Thread(target=_background_flusher, daemon=True).start()
@@ -547,8 +667,10 @@ threading.Thread(target=_background_flusher, daemon=True).start()
 @app.get("/health")
 def health():
     ttl = None
-    try: ttl = r.ttl(COUNTER_KEY)
-    except Exception: ttl = None
+    try:
+        ttl = r.ttl(COUNTER_KEY)
+    except Exception:
+        ttl = None
     return {
         "ok": True, "ts": int(time.time()), "bucket": GCS_BUCKET, "prefix": GCS_PREFIX,
         "video_id": VIDEO_ID, "model_loaded": bool(_model), "classes": _model_classes,
@@ -557,22 +679,29 @@ def health():
     }
 
 @app.get("/robots.txt")
-def robots(): return PlainTextResponse("User-agent: *\nDisallow:\n", status_code=200)
+def robots():
+    return PlainTextResponse("User-agent: *\nDisallow:\n", status_code=200)
 
 @app.get("/")
-def root(): return PlainTextResponse("OK", status_code=200)
+def root():
+    return PlainTextResponse("OK", status_code=200)
 
 def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str, str]:
     link_q = request.query_params.get("link")
     if link_q:
-        raw = unquote(link_q).strip(); return _fix_scheme(raw), "query_link"
+        raw = unquote(link_q).strip()
+        return _fix_scheme(raw), "query_link"
     raw_path = urllib.parse.unquote(full_path or "").strip()
-    if not raw_path or raw_path == "favicon.ico": raise HTTPException(status_code=400, detail="missing_url")
+    if not raw_path or raw_path == "favicon.ico":
+        raise HTTPException(status_code=400, detail="missing_url")
     if re.fullmatch(r"[A-Za-z0-9]{5,20}", raw_path):
-        qs = request.url.query; url = f"https://s.shopee.com.br/{raw_path}"
-        if qs: url += "?" + qs
+        qs = request.url.query
+        url = f"https://s.shopee.com.br/{raw_path}"
+        if qs:
+            url += "?" + qs
         return url, "code_path"
-    if raw_path.startswith("//"): raw_path = "https:" + raw_path
+    if raw_path.startswith("//"):
+        raw_path = "https:" + raw_path
     return _fix_scheme(raw_path), "raw_path"
 
 # ===================== Handler principal =====================
@@ -661,6 +790,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             # normaliza chaves
             for k in list(probs.keys()):
                 p_map[k] = float(probs[k])
+
             # decide QVC/ATC
             p_c = float(p_map.get("comprou", 0.0))
             is_qvc_flag = 1 if p_c >= (_thr_qvc or 0.5) else 0
@@ -670,7 +800,8 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         print("[predict] erro:", e)
 
     # ===== Meta: ViewContent sempre =====
-    meta_sent = ""; meta_view = ""
+    meta_sent = ""
+    meta_view = ""
     if META_PIXEL_ID and META_ACCESS_TOKEN:
         vc_payload = {
             "data": [{
@@ -692,11 +823,13 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         try:
             url = f"https://graph.facebook.com/{META_GRAPH_VERSION}/{META_PIXEL_ID}/events"
             params = {"access_token": META_ACCESS_TOKEN}
-            if META_TEST_EVENT_CODE: vc_payload["test_event_code"] = META_TEST_EVENT_CODE
+            if META_TEST_EVENT_CODE:
+                vc_payload["test_event_code"] = META_TEST_EVENT_CODE
             resp_vc = session.post(url, params=params, json=vc_payload, timeout=8)
             meta_view = "ViewContent" if resp_vc.status_code < 400 else f"error:{resp_vc.status_code}"
         except Exception as e:
-            print("[meta] VC exceção:", e); meta_view = "error"
+            print("[meta] VC exceção:", e)
+            meta_view = "error"
 
     # ===== Meta: AddToCart somente quando p_comprou >= thr_atc =====
     if META_PIXEL_ID and META_ACCESS_TOKEN and is_atc_flag == 1:
@@ -720,15 +853,19 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         try:
             url = f"https://graph.facebook.com/{META_GRAPH_VERSION}/{META_PIXEL_ID}/events"
             params = {"access_token": META_ACCESS_TOKEN}
-            if META_TEST_EVENT_CODE: atc_payload["test_event_code"] = META_TEST_EVENT_CODE
+            if META_TEST_EVENT_CODE:
+                atc_payload["test_event_code"] = META_TEST_EVENT_CODE
             resp_atc = session.post(url, params=params, json=atc_payload, timeout=8)
             meta_sent = "AddToCart" if resp_atc.status_code < 400 else f"error:{resp_atc.status_code}"
         except Exception as e:
-            print("[meta] ATC exceção:", e); meta_sent = "error"
+            print("[meta] ATC exceção:", e)
+            meta_sent = "error"
 
     # ===== Log CSV =====
-    hour_log = _extract_hour_from_iso_for_log(iso_time); dow_log = _extract_dow_from_iso_for_log(iso_time)
-    ref_domain_log = _get_first_domain_for_log(referrer); os_version_num_log = _version_num_for_log(os_version)
+    hour_log = _extract_hour_from_iso_for_log(iso_time)
+    dow_log = _extract_dow_from_iso_for_log(iso_time)
+    ref_domain_log = _get_first_domain_for_log(referrer)
+    os_version_num_log = _version_num_for_log(os_version)
     is_android_log = 1 if "android" in (os_family or "").lower() else 0
     is_ios_log     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
     part_of_day_log = _part_of_day_from_hour(hour_log)
@@ -750,7 +887,9 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         _buffer_rows.append(csv_row)
 
     # ===== Intersticial Pinterest (evita bloqueio) =====
-    def _is_pinterest(ua: str) -> bool: return "pinterest" in (ua or "").lower()
+    def _is_pinterest(ua: str) -> bool:
+        return "pinterest" in (ua or "").lower()
+
     if _is_pinterest(user_agent):
         html = f"""<!doctype html>
 <html><head>
@@ -791,15 +930,21 @@ def admin_page():
 
 @app.post("/admin/upload_model_simple")
 async def admin_upload_model_simple(token: str = Form(...), model: UploadFile = File(...), meta: UploadFile = File(None)):
-    if token != ADMIN_TOKEN: raise HTTPException(status_code=401, detail="unauthorized")
+    if token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
     try:
-        with open(MODEL_PATH, "wb") as out: out.write(await model.read())
-    except Exception as e: raise HTTPException(status_code=500, detail=f"falha ao salvar model: {e}")
+        with open(MODEL_PATH, "wb") as out:
+            out.write(await model.read())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"falha ao salvar model: {e}")
     if meta:
         try:
-            data = await meta.read(); _ = json.loads(data.decode("utf-8"))
-            with open(MODEL_META_PATH, "wb") as out: out.write(data)
-        except Exception as e: raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
+            data = await meta.read()
+            _ = json.loads(data.decode("utf-8"))
+            with open(MODEL_META_PATH, "wb") as out:
+                out.write(data)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
     _load_model_if_available()
     return {"ok": True, "model_loaded": bool(_model), "thr_qvc": _thr_qvc, "thr_atc": _thr_atc}
 
@@ -809,38 +954,50 @@ async def admin_upload_model(
     model: UploadFile = File(None), meta: UploadFile = File(None),
     x_admin_token: str = Header(None)
 ):
-    if x_admin_token != ADMIN_TOKEN: raise HTTPException(status_code=401, detail="unauthorized")
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
     up_model = model_file or model
-    if not up_model: raise HTTPException(status_code=400, detail="model file ausente (campo model_file ou model)")
+    if not up_model:
+        raise HTTPException(status_code=400, detail="model file ausente (campo model_file ou model)")
     try:
-        with open(MODEL_PATH, "wb") as out: out.write(await up_model.read())
-    except Exception as e: raise HTTPException(status_code=500, detail=f"falha ao salvar model: {e}")
+        with open(MODEL_PATH, "wb") as out:
+            out.write(await up_model.read())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"falha ao salvar model: {e}")
     up_meta = meta_file or meta
     if up_meta:
         try:
-            data = await up_meta.read(); _ = json.loads(data.decode("utf-8"))
-            with open(MODEL_META_PATH, "wb") as out: out.write(data)
-        except Exception as e: raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
+            data = await up_meta.read()
+            _ = json.loads(data.decode("utf-8"))
+            with open(MODEL_META_PATH, "wb") as out:
+                out.write(data)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
     _load_model_if_available()
     return {"ok": True, "saved": {"model": MODEL_PATH, "meta": (MODEL_META_PATH if up_meta else None)},
             "model_loaded": bool(_model), "thr_qvc": _thr_qvc, "thr_atc": _thr_atc}
 
 @app.post("/admin/reload_model")
 def admin_reload_model(x_admin_token: str = Header(None)):
-    if x_admin_token != ADMIN_TOKEN: raise HTTPException(status_code=401, detail="unauthorized")
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
     _load_model_if_available()
     return {"ok": True, "model_loaded": bool(_model), "thr_qvc": _thr_qvc, "thr_atc": _thr_atc}
 
 @app.get("/admin/flush")
 def admin_flush(token: str):
-    if token != ADMIN_TOKEN: return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-    sent = _flush_buffer_to_gcs(); return {"ok": True, "sent_rows": sent}
+    if token != ADMIN_TOKEN:
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    sent = _flush_buffer_to_gcs()
+    return {"ok": True, "sent_rows": sent}
 
 @app.get("/admin/counter")
 def admin_counter(x_admin_token: str = Header(None)):
-    if x_admin_token != ADMIN_TOKEN: raise HTTPException(status_code=401, detail="unauthorized")
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
     try:
-        v = r.get(COUNTER_KEY); ttl = r.ttl(COUNTER_KEY)
+        v = r.get(COUNTER_KEY)
+        ttl = r.ttl(COUNTER_KEY)
         return {"counter": int(v or 0), "ttl": ttl}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -848,8 +1005,10 @@ def admin_counter(x_admin_token: str = Header(None)):
 # ===================== Flush no exit =====================
 @atexit.register
 def _flush_on_exit():
-    try: _flush_buffer_to_gcs()
-    except Exception: pass
+    try:
+        _flush_buffer_to_gcs()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     import uvicorn
