@@ -2,30 +2,20 @@
 """
 FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost) + Meta Ads (CAPI)
 (versão ajustada: thresholds_cb + TE embutido no meta + cookies fbp/fbc/eid + external_id persistente; event_time/value/currency)
-(Aprimorado: pré-filtro UTM com sufixo 'Axx' → nova coluna utm_original_01; utm_numbered e subId3 priorizam utm_original_01)
+(Aprimorado: pré-filtro UTM; utm_original = base; utm_original_01 = COMPLETA (base + 'Axx' quando existir);
+             utm_numbered e subId3 priorizam utm_original_01 completa)
 
-Principais ajustes vs original:
-- _load_model_if_available():
-    * thresholds: preferir "thresholds_cb" (CatBoost puro) → depois "thresholds" (stack) → fallback 0.5
-    * TE: carregar "te_stats" de dentro do model_meta_comprou.json; fallback para ./models/te_stats.json
-- CAPI:
-    * event_time: segundos UNIX (UTC) com int(time.time())
-    * Sempre enviar value=0 e currency="BRL" em custom_data
-    * external_id persistente (derivado do _fbp); fallback: hash de user_agent|ip
-    * Persistir/enviar _fbc mesmo sem fbclid (gera sintético a partir do _fbp se necessário)
-    * Criar/persistir _eid (hash do _fbp) e usar como external_id
-    * Sempre enviar fbp e fbc em user_data
-- UTM pré-filtro:
-    * Se utm terminar com 'A' + dígitos (ex.: 68novolinkA01):
-        - utm_original = "68novolink"
-        - utm_original_01 = "A01"
-        - utm_numbered gerado a partir de utm_original_01
-        - subId3 (Shopee) usa utm_original_01
-    * Caso contrário:
-        - utm_original = UTM inteira
-        - utm_original_01 = ""
-        - utm_numbered gerado a partir de utm_original
-        - subId3 usa utm_original
+Regras novas:
+- Se a UTM terminar com 'A' + dígitos (ex.: 68novolinkA01):
+    utm_original     = "68novolink"
+    utm_original_01  = "68novolinkA01"   # COMPLETA
+    utm_numbered     = "68novolinkA01N{counter}"
+    subId3 (Shopee)  = "68novolinkA01"
+- Caso não tenha sufixo:
+    utm_original     = UTM inteira
+    utm_original_01  = ""  (vazio)
+    utm_numbered     = "{utm_original}N{counter}"
+    subId3 (Shopee)  = utm_original
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -189,8 +179,6 @@ def _gen_fbp(ts: int) -> str:
     return f"fb.1.{ts}.{random.randint(10**15, 10**16 - 1)}"
 
 def _gen_fbc_from_fbp(fbp: str, ts: int) -> str:
-    # fbc sintético, consistente por usuário, quando não houver fbclid
-    # formato: fb.1.<ts>.<hash16_do_fbp>
     return f"fb.1.{ts}.{_sha256_lower(fbp)[:16]}"
 
 # ===================== CSV buffer =====================
@@ -215,7 +203,7 @@ CSV_HEADERS = [
     "pred_label","p_comprou","p_quase","p_desinteressado",
     # thresholds (do meta do modelo) e flags
     "thr_qvc","thr_atc","is_qvc","is_atc",
-    # métricas derivadas (para ver o quão perto/longe do threshold)
+    # métricas derivadas
     "pcomprou_pct","thr_qvc_pct","thr_atc_pct","gap_qvc","gap_atc","pct_of_atc",
     # eventos meta
     "meta_event_sent","meta_view_sent"
@@ -301,7 +289,7 @@ def sanitize_subid_for_shopee(value: str) -> str:
 
 def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
     if not SHOPEE_APP_ID or not SHOPEE_APP_SECRET:
-        return origin_url  # fallback se não houver credencial
+        return origin_url  # fallback
     payload_obj = {
         "query": ("mutation{generateShortLink(input:{"
                   f"originUrl:\"{origin_url}\","
@@ -361,8 +349,8 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
 
 # ===================== Predição (CatBoost) =====================
 _model = None
-_model_classes: List[str] = []  # nomes das classes
-_thresholds: Dict[str, float] = {}  # qvc_mid / atc_high
+_model_classes: List[str] = []
+_thresholds: Dict[str, float] = {}
 _thr_qvc = None
 _thr_atc = None
 
@@ -372,13 +360,11 @@ _CAT_IDX_FROM_META: List[int] = []
 _TE_STATS = None
 _TE_PRIORS = None
 
-# classe positiva
 _POS_LABEL_NAME = "comprou"
 _POS_LABEL_ID = 1
 _POS_IDX = None
 
 def _load_te_if_available():
-    """Fallback para ./models/te_stats.json"""
     global _TE_STATS, _TE_PRIORS
     if os.path.exists(TE_STATS_PATH):
         try:
@@ -498,25 +484,20 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
     device_city_combo   = (f"{device_bucket}__{geo_city}").lower()
     utm_partofday_combo = (f"{utm_original}__{part_of_day}").lower()
 
-    # Target encodings opcionais (iguais às do treino)
     utm_n,  utm_br  = _apply_te("utm_original", str(utm_original or ""))
     ref_n,  ref_br  = _apply_te("ref_domain",   str(ref_domain))
     devb_n, devb_br = _apply_te("device_bucket",str(device_bucket))
     city_n, city_br = _apply_te("geo_city",     str(geo_city))
 
     return {
-        # categóricas
         "device_bucket": device_bucket, "os_family": os_family or "", "part_of_day": part_of_day,
         "geo_macro": geo_macro, "geo_region": geo_region, "geo_city": geo_city, "geo_zip": geo_zip,
         "geo_isp": geo_isp, "geo_org": geo_org, "ref_domain": ref_domain, "utm_original": utm_original or "",
         "device_city_combo": device_city_combo, "utm_partofday_combo": utm_partofday_combo,
-        # numéricas “puras”
         "hour": float(hour), "dow": float(dow), "month": float(month),
         "is_weekend": float(is_weekend),
         "os_version_num": float(os_ver_num), "is_android": float(is_android), "is_ios": float(is_ios),
-        # flags auxiliares (não entram no treino padrão; mantidos aqui para logs/consistência)
         "is_private_ip_flag": 0.0, "is_bot_flag": 0.0, "geo_fail_flag": float(geo_fail_flag), "has_utm_flag": float(1 if utm_original else 0),
-        # target encodings
         "utm_n": float(utm_n), "utm_br": float(utm_br),
         "ref_n": float(ref_n), "ref_br": float(ref_br),
         "devb_n": float(devb_n), "devb_br": float(devb_br),
@@ -538,7 +519,6 @@ def _row_in_meta_order(feats_dict: Dict[str, Any]) -> Tuple[List[Any], List[int]
     return ordered, _CAT_IDX_FROM_META
 
 def _load_model_if_available():
-    """Carrega CatBoost + meta (features/cats/thresholds) e TE; configura classe positiva."""
     global _model, _model_classes, _thresholds, _thr_qvc, _thr_atc
     global _FEATURE_NAMES_FROM_META, _CAT_IDX_FROM_META
     global _POS_LABEL_NAME, _POS_LABEL_ID, _POS_IDX
@@ -551,10 +531,8 @@ def _load_model_if_available():
             m.load_model(MODEL_PATH)
             _model = m
 
-            # classes do catboost (binário usualmente [0,1])
             _model_classes = [str(x) for x in getattr(m, "classes_", [])] or ["0", "1"]
 
-            # defaults
             _POS_LABEL_NAME = "comprou"
             _POS_LABEL_ID = 1
             _POS_IDX = None
@@ -566,7 +544,6 @@ def _load_model_if_available():
                 _FEATURE_NAMES_FROM_META = list(meta.get("feature_names", []))
                 _CAT_IDX_FROM_META = list(meta.get("cat_idx", []))
 
-                # thresholds: preferir thresholds_cb (CatBoost puro)
                 thr = meta.get("thresholds_cb") or meta.get("thresholds") or {}
                 _thresholds = {"qvc_mid": thr.get("qvc_mid"), "atc_high": thr.get("atc_high")}
                 _thr_qvc = float(_thresholds.get("qvc_mid") or 0.5)
@@ -579,7 +556,6 @@ def _load_model_if_available():
                 except Exception:
                     _POS_LABEL_ID = 1
 
-                # TE embutido no meta (preferencial)
                 te = meta.get("te_stats")
                 if isinstance(te, dict):
                     _TE_STATS  = te.get("stats", {})
@@ -594,7 +570,6 @@ def _load_model_if_available():
                 _thr_atc = 0.5
                 _load_te_if_available()
 
-            # descobrir índice da classe positiva dentro de model.classes_
             try:
                 classes_raw = list(getattr(_model, "classes_", [0, 1]))
                 _POS_IDX = classes_raw.index(_POS_LABEL_ID) if _POS_LABEL_ID in classes_raw else (1 if len(classes_raw) == 2 else None)
@@ -608,7 +583,6 @@ def _load_model_if_available():
         print("[model] erro ao carregar:", e)
 
 def predict_proba_single(row_values: List[Any], cat_idx: List[int]) -> Dict[str, float]:
-    """Retorna dict com probabilidades por classe (binário ou multi)."""
     try:
         from catboost import Pool
         import pandas as pd
@@ -618,14 +592,12 @@ def predict_proba_single(row_values: List[Any], cat_idx: List[int]) -> Dict[str,
         pool  = Pool(X_df, cat_features=cat_idx)
         probs = _model.predict_proba(pool)[0]
 
-        # Binário (2 saídas): p_pos no índice da classe positiva detectada
         if len(probs) == 2:
             pos_idx = _POS_IDX if _POS_IDX is not None else 1
             p_pos = float(probs[pos_idx])
             p_neg = float(probs[1 - pos_idx])
             return {"comprou": p_pos, "quase": 0.0, "desinteressado": p_neg}
 
-        # Multiclasse
         out = {"comprou": 0.0, "quase": 0.0, "desinteressado": 0.0}
         for i, cls in enumerate([str(c).lower() for c in _model_classes]):
             if i >= len(probs):
@@ -643,18 +615,13 @@ def predict_proba_single(row_values: List[Any], cat_idx: List[int]) -> Dict[str,
 
 _load_model_if_available()
 
-# ===================== UTM Pré-filtro (A\d+ no final) =====================
+# ===================== UTM Pré-filtro =====================
 _UTM_A_SUFFIX_PATTERN = re.compile(r"^(?P<base>.*?)(?P<suf>A\d+)$")
 
 def split_utm_A_suffix(utm: str) -> Tuple[str, str]:
     """
-    Se a UTM terminar com 'A' maiúsculo seguido de dígitos, separa e retorna (base, 'Axx').
+    Se a UTM terminar com 'A' maiúsculo seguido de dígitos, retorna (base, 'Axx').
     Caso contrário, retorna (utm, '').
-    Exemplos:
-      '68novolinkA01' -> ('68novolink', 'A01')
-      'abcA1'         -> ('abc', 'A1')
-      'semA'          -> ('semA', '')
-      'abcAxy'        -> ('abcAxy', '')   # não casa porque 'xy' não são dígitos
     """
     s = (utm or "").strip()
     m = _UTM_A_SUFFIX_PATTERN.match(s)
@@ -752,7 +719,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     except HTTPException as he:
         return JSONResponse({"ok": False, "error": he.detail}, status_code=he.status_code)
 
-    ts = int(time.time())  # event_time em segundos UNIX (UTC)
+    ts = int(time.time())
     iso_time = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(ts))
     headers = request.headers
     cookie_header = headers.get("cookie") or headers.get("Cookie")
@@ -772,34 +739,32 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     if not _is_allowed_long(parts_res.netloc) and not _is_short_domain(parts_res.netloc):
         return JSONResponse({"ok": False, "error": f"Domínio não permitido: {parts_res.netloc}"}, status_code=400)
 
-    # ===== UTM / pré-filtro (Axx) e numbering =====
+    # ===== UTM / pré-filtro =====
     outer_uc = request.query_params.get("uc")
     utm_original_in = outer_uc or extract_utm_content_from_url(incoming_url) or extract_utm_content_from_url(resolved_url) or ""
 
-    # Pré-filtro: separa base e sufixo A\d+ (se existir)
-    utm_base, utm_suffix_A = split_utm_A_suffix(utm_original_in)
+    base, suf = split_utm_A_suffix(utm_original_in)
+    utm_original = base
+    utm_original_01 = (base + suf) if suf else ""   # COMPLETA quando existir
 
-    # utm_original (base) e a nova coluna utm_original_01 (apenas 'Axx' quando houver)
-    utm_original = utm_base
-    utm_original_01 = utm_suffix_A  # '' quando não houver padrão
+    # base para numbered e subId3
+    primary_for_ops = utm_original_01 if utm_original_01 else utm_original
 
-    # utm_numbered: usa utm_original_01 se existir; senão, utm_original
-    base_for_numbered = utm_original_01 if utm_original_01 else utm_original
-    clean_base = re.sub(r'[^A-Za-z0-9]', '', base_for_numbered or "") or "n"
+    # ===== utm_numbered =====
+    clean_base = re.sub(r'[^A-Za-z0-9]', '', primary_for_ops or "") or "n"
     utm_numbered = f"{clean_base}N{incr_counter()}"
 
-    # origin_url com utm_numbered (preservando ordem do querystring)
+    # ===== origin_url com numbered =====
     url_with_utm = _set_utm_content_preserving_order(resolved_url, utm_numbered)
     origin_url = add_or_update_query_param(url_with_utm, "utm_numbered", utm_numbered)
     if _is_short_domain(urlsplit(origin_url).netloc):
         origin_url = _resolve_short_follow(origin_url)
 
-    # ===== content_ids/contents =====
+    # ===== content_ids =====
     content_ids, contents_payload = _build_content_identifiers(origin_url)
 
-    # ===== short oficial (prioriza utm_original_01) =====
-    subid_source = utm_original_01 if utm_original_01 else utm_original
-    sub_id_api = sanitize_subid_for_shopee(subid_source) or "na"
+    # ===== short oficial (subId3) =====
+    sub_id_api = sanitize_subid_for_shopee(primary_for_ops) or "na"
     dest = generate_short_link(origin_url, sub_id_api)
 
     # ===== Cookies / IDs persistentes =====
@@ -812,10 +777,9 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     if not fbc_cookie:
         fbc_cookie = _gen_fbc_from_fbp(fbp_cookie, ts)
 
-    # eid: id estável nosso, hash do fbp; persistido em cookie
     eid_cookie = get_cookie_value(cookie_header, "_eid") or _sha256_lower(fbp_cookie)
 
-    # snapshot p/ consulta posterior
+    # ===== snapshot no Redis =====
     r.setex(f"{USERDATA_KEY_PREFIX}{utm_numbered}", USERDATA_TTL_SECONDS, json.dumps({
         "ip": ip_addr, "ua": user_agent, "referrer": referrer,
         "event_source_url": origin_url, "short_link": dest,
@@ -823,10 +787,9 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_cookie, "eid": eid_cookie, "mode": mode
     }))
 
-    # ===== external_id persistente =====
+    # ===== external_id para CAPI =====
     external_id = eid_cookie or _sha256_lower(f"{user_agent}|{ip_addr}")
 
-    # ===== user data meta =====
     user_data_meta = {
         "client_ip_address": ip_addr,
         "client_user_agent": user_agent,
@@ -889,7 +852,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             print("[meta] VC exceção:", e)
             meta_view = "error"
 
-    # ===== Meta: AddToCart somente quando p_comprou >= thr_atc =====
+    # ===== Meta: AddToCart se p>=thr_atc =====
     if META_PIXEL_ID and META_ACCESS_TOKEN and is_atc_flag == 1:
         atc_payload = {
             "data": [{
@@ -1050,8 +1013,14 @@ async def admin_upload_model(
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
     _load_model_if_available()
-    return {"ok": True, "saved": {"model": MODEL_PATH, "meta": (MODEL_META_PATH if up_meta else None)},
-            "model_loaded": bool(_model), "thr_qvc": _thr_qvc, "thr_atc": _thr_qc if ' _thr_qc' in globals() else _thr_atc, "te_loaded": bool(_TE_STATS)}
+    return {
+        "ok": True,
+        "saved": {"model": MODEL_PATH, "meta": (MODEL_META_PATH if up_meta else None)},
+        "model_loaded": bool(_model),
+        "thr_qvc": _thr_qvc,
+        "thr_atc": _thr_atc,
+        "te_loaded": bool(_TE_STATS)
+    }
 
 @app.post("/admin/reload_model")
 def admin_reload_model(x_admin_token: str = Header(None)):
