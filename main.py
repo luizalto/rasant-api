@@ -1,13 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost) + Meta Ads (CAPI)
-(versão ajustada: thresholds_cb + TE embutido no meta)
 
-Principais ajustes vs original:
-- _load_model_if_available():
-    * thresholds: preferir "thresholds_cb" (CatBoost puro) → depois "thresholds" (stack) → fallback 0.5
-    * TE: carregar "te_stats" de dentro do model_meta_comprou.json; fallback para ./models/te_stats.json
-- Predição mantém CatBoost puro (coerente com thresholds_cb).
+Inclui TODAS as recomendações:
+- event_time em segundos UTC (int(time.time()))
+- Sempre enviar value=0.0 e currency="BRL" (se não houver valor real)
+- external_id persistente: preferir SHA-256(_fbp); fallback SHA-256(user_agent|ip)
+- Persistência de cookies: _fbp, _fbc (quando houver fbclid → fbc) e _eid (hash do _fbp)
+- Preferência por thresholds_cb (CatBoost puro) → depois thresholds (stack) → fallback 0.5
+- TE (target encoding) carregado do model_meta_comprou.json; fallback ./models/te_stats.json
+- Predição com CatBoost, features na mesma ordem do treino (feature_names do meta)
+- Logs CSV em GCS com probabilidades, thresholds, gaps e flags
+- Shortlink oficial da Shopee (se credenciais), e resolução de short links da Shopee
+- Intersticial para Pinterest
+- Endpoints admin: upload_model, reload_model, flush, counter; health com debug
+
+Como iniciar local:
+    uvicorn main:app --host 0.0.0.0 --port 10000
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -50,7 +59,7 @@ SHOPEE_ENDPOINT       = os.getenv("SHOPEE_ENDPOINT", "https://open-api.affiliate
 # Meta Ads (CAPI)
 META_PIXEL_ID         = os.getenv("META_PIXEL_ID") or os.getenv("FB_PIXEL_ID")
 META_ACCESS_TOKEN     = os.getenv("META_ACCESS_TOKEN") or os.getenv("FB_ACCESS_TOKEN")
-META_GRAPH_VERSION    = os.getenv("META_GRAPH_VERSION", "v17.0")
+META_GRAPH_VERSION    = os.getenv("META_GRAPH_VERSION", "v18.0")
 META_TEST_EVENT_CODE  = os.getenv("META_TEST_EVENT_CODE")  # opcional
 
 # Modelos
@@ -167,6 +176,9 @@ def _build_content_identifiers(origin_url: str) -> Tuple[List[str], List[Dict[st
     return [cid], [{"id": cid, "quantity": 1}]
 
 # ===================== AM / IDs =====================
+_DEF_FBP_RE   = re.compile(r"^fb\.1\.\d+\.[0-9A-Za-z]+$")
+_DEF_FBC_RE   = re.compile(r"^fb\.1\.\d+\.[0-9A-Za-z]+$")
+
 def _gen_fbp(ts: int) -> str:
     return f"fb.1.{ts}.{random.randint(10**15, 10**16 - 1)}"
 
@@ -253,6 +265,7 @@ def extract_utm_content_from_url(u: str) -> str:
     except:
         return ""
 
+# Resolve short-link (primário)
 def resolve_short_link(short_url: str) -> Tuple[str, Dict[str, Optional[str]]]:
     current = short_url
     final_url = short_url
@@ -267,9 +280,10 @@ def resolve_short_link(short_url: str) -> Tuple[str, Dict[str, Optional[str]]]:
         pass
     return final_url, subids
 
-# Shopee short-link
+# Shopee short-link API
 _SUBID_MAXLEN = int(os.getenv("SHOPEE_SUBID_MAXLEN", "50"))
 _SUBID_REGEX  = re.compile(r"[^A-Za-z0-9]")
+
 def sanitize_subid_for_shopee(value: str) -> str:
     if not value:
         return "na"
@@ -281,7 +295,7 @@ def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
         return origin_url  # fallback se não houver credencial
     payload_obj = {
         "query": ("mutation{generateShortLink(input:{"
-                  f"originUrl:\"{origin_url}\","
+                  f"originUrl:\"{origin_url}\"," 
                   f"subIds:[\"\",\"\",\"{utm_content_for_api}\",\"\",\"\"]"
                   "}){shortLink}}")
     }
@@ -303,6 +317,7 @@ def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
 
 # ===================== Geo por IP =====================
 IPAPI_FIELDS = "status,country,region,regionName,city,zip,lat,lon,isp,org,as,query"
+
 def geo_lookup(ip: str) -> Dict[str, Any]:
     if not ip:
         return {"geo_status":"fail"}
@@ -514,6 +529,15 @@ def _row_in_meta_order(feats_dict: Dict[str, Any]) -> Tuple[List[Any], List[int]
         ordered.append(v)
     return ordered, _CAT_IDX_FROM_META
 
+def _client_ip_from_headers(request: Request) -> str:
+    # Usa X-Forwarded-For quando presente (primeiro IP)
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "0.0.0.0"
+
 def _load_model_if_available():
     """Carrega CatBoost + meta (features/cats/thresholds) e TE; configura classe positiva."""
     global _model, _model_classes, _thresholds, _thr_qvc, _thr_atc
@@ -717,7 +741,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     referrer = headers.get("referer") or "-"
     user_agent = headers.get("user-agent", "-")
     fbclid = request.query_params.get("fbclid")
-    ip_addr = (request.client.host if request.client else "0.0.0.0")
+    ip_addr = _client_ip_from_headers(request)
     device_name, os_family, os_version = parse_device_info(user_agent)
 
     # ===== Resolve url =====
@@ -749,7 +773,9 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     dest = generate_short_link(origin_url, sub_id_api)
 
     # ===== Cookies / IDs =====
-    fbp_cookie = get_cookie_value(cookie_header, "_fbp") or _gen_fbp(ts)
+    fbp_cookie = get_cookie_value(cookie_header, "_fbp")
+    if not fbp_cookie or not _DEF_FBP_RE.match(fbp_cookie):
+        fbp_cookie = _gen_fbp(ts)
     fbc_val    = build_fbc_from_fbclid(fbclid, creation_ts=ts)
 
     # snapshot p/ consulta posterior
@@ -760,8 +786,15 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_val, "mode": mode
     }))
 
-    # ===== external_id =====
-    external_id = _sha256_lower(utm_numbered.lower()) if utm_numbered else _sha256_lower(f"{fbp_cookie}|{user_agent}|{ip_addr}")
+    # ===== external_id persistente =====
+    # preferir _fbp → sha256; fallback sha256(user_agent|ip)
+    eid_cookie = get_cookie_value(cookie_header, "_eid")
+    if eid_cookie:
+        external_id = eid_cookie
+    elif fbp_cookie:
+        external_id = _sha256_lower(fbp_cookie)
+    else:
+        external_id = _sha256_lower(f"{user_agent}|{ip_addr}")
 
     # ===== user data meta =====
     user_data_meta = {
@@ -801,7 +834,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         vc_payload = {
             "data": [{
                 "event_name": "ViewContent",
-                "event_time": ts,
+                "event_time": int(time.time()),  # segundos UTC
                 "event_id": utm_numbered,
                 "action_source": "website",
                 "event_source_url": origin_url,
@@ -831,7 +864,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         atc_payload = {
             "data": [{
                 "event_name": "AddToCart",
-                "event_time": ts,
+                "event_time": int(time.time()),  # segundos UTC
                 "event_id": utm_numbered,
                 "action_source": "website",
                 "event_source_url": origin_url,
@@ -879,7 +912,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     csv_row = [
         ts, iso_time, ip_addr, user_agent, referrer,
         incoming_url, resolved_url, origin_url, (cat or ""),
-        utm_original, utm_numbered, fbclid or "", fbp_cookie or "", build_fbc_from_fbclid(fbclid, ts) or "",
+        utm_original, utm_numbered, fbclid or "", fbp_cookie or "", (fbc_val or ""),
         device_name, os_family, os_version,
         geo.get("geo_status",""), geo.get("geo_country",""), geo.get("geo_region",""), geo.get("geo_state",""),
         geo.get("geo_city",""), geo.get("geo_zip",""), geo.get("geo_lat",""), geo.get("geo_lon",""),
@@ -893,6 +926,26 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     with _buffer_lock:
         _buffer_rows.append(csv_row)
 
+    # ===== Redirect response + múltiplos cookies =====
+    # Para múltiplos Set-Cookie, criamos o objeto e usamos set_cookie várias vezes
+    resp = RedirectResponse(dest, status_code=302)
+    # _fbp sempre persistente
+    resp.set_cookie("_fbp", fbp_cookie, max_age=63072000, path="/", samesite="lax")
+    # _fbc quando houver fbclid
+    if fbc_val:
+        resp.set_cookie("_fbc", fbc_val, max_age=63072000, path="/", samesite="lax")
+    # _eid baseado no _fbp (se possível)
+    try:
+        eid_val = eid_cookie or (_sha256_lower(fbp_cookie) if fbp_cookie else None)
+        if eid_val:
+            resp.set_cookie("_eid", eid_val, max_age=63072000, path="/", samesite="lax")
+    except Exception:
+        pass
+
+    # Cache-Control seguro
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+
     # ===== Intersticial Pinterest =====
     def _is_pinterest(ua: str) -> bool:
         return "pinterest" in (ua or "").lower()
@@ -900,19 +953,16 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     if _is_pinterest(user_agent):
         html = f"""<!doctype html>
 <html><head>
-<meta charset="utf-8">
-<meta http-equiv="refresh" content="0.2;url={dest}">
+<meta charset=\"utf-8\">
+<meta http-equiv=\"refresh\" content=\"0.2;url={dest}\">
 <title>Redirecionando…</title>
-<script>setTimeout(function(){{ window.location.replace("{dest}"); }}, 200);</script>
+<script>setTimeout(function(){{ window.location.replace(\"{dest}\"); }}, 200);</script>
 </head><body>Redirecionando…</body></html>"""
         return HTMLResponse(content=html, status_code=200, headers={
             "Cache-Control": "no-store, max-age=0", "X-Content-Type-Options": "nosniff",
         })
 
-    return RedirectResponse(dest, status_code=302, headers={
-        "Cache-Control": "no-store, max-age=0",
-        "Set-Cookie": f"_fbp={fbp_cookie}; Path=/; Max-Age=63072000; SameSite=Lax"
-    })
+    return resp
 
 # ===================== Admin =====================
 @app.get("/admin", response_class=HTMLResponse)
@@ -1019,3 +1069,102 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
+
+@app.post("/admin/upload_model_simple")
+async def admin_upload_model_simple(token: str = Form(...), model: UploadFile = File(...), meta: UploadFile = File(None)):
+    if token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    try:
+        with open(MODEL_PATH, "wb") as out:
+            out.write(await model.read())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"falha ao salvar model: {e}")
+    if meta:
+        try:
+            data = await meta.read()
+            _ = json.loads(data.decode("utf-8"))
+            with open(MODEL_META_PATH, "wb") as out:
+                out.write(data)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
+    _load_model_if_available()
+    return {"ok": True, "model_loaded": bool(_model), "thr_qvc": _thr_qvc, "thr_atc": _thr_atc, "te_loaded": bool(_TE_STATS)}
+
+
+@app.post("/admin/upload_model")
+async def admin_upload_model(
+    model_file: UploadFile = File(None), meta_file: UploadFile = File(None),
+    model: UploadFile = File(None), meta: UploadFile = File(None),
+    x_admin_token: str = Header(None)
+):
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    up_model = model_file or model
+    if not up_model:
+        raise HTTPException(status_code=400, detail="model file ausente (campo model_file ou model)")
+    try:
+        with open(MODEL_PATH, "wb") as out:
+            out.write(await up_model.read())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"falha ao salvar model: {e}")
+    up_meta = meta_file or meta
+    if up_meta:
+        try:
+            data = await up_meta.read()
+            _ = json.loads(data.decode("utf-8"))
+            with open(MODEL_META_PATH, "wb") as out:
+                out.write(data)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
+    _load_model_if_available()
+    return {
+        "ok": True,
+        "saved": {"model": MODEL_PATH, "meta": (MODEL_META_PATH if up_meta else None)},
+        "model_loaded": bool(_model),
+        "thr_qvc": _thr_qvc,
+        "thr_atc": _thr_atc,
+        "te_loaded": bool(_TE_STATS)
+    }
+
+
+@app.post("/admin/reload_model")
+def admin_reload_model(x_admin_token: str = Header(None)):
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    _load_model_if_available()
+    return {"ok": True, "model_loaded": bool(_model), "thr_qvc": _thr_qvc, "thr_atc": _thr_atc, "te_loaded": bool(_TE_STATS)}
+
+
+@app.get("/admin/flush")
+def admin_flush(token: str):
+    if token != ADMIN_TOKEN:
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    sent = _flush_buffer_to_gcs()
+    return {"ok": True, "sent_rows": sent}
+
+
+@app.get("/admin/counter")
+def admin_counter(x_admin_token: str = Header(None)):
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    try:
+        v = r.get(COUNTER_KEY)
+        ttl = r.ttl(COUNTER_KEY)
+        return {"counter": int(v or 0), "ttl": ttl}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ===================== Flush no exit =====================
+@atexit.register
+def _flush_on_exit():
+    try:
+        _flush_buffer_to_gcs()
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
+
