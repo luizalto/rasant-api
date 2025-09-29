@@ -2,6 +2,7 @@
 """
 FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost) + Meta Ads (CAPI)
 (versão ajustada: thresholds_cb + TE embutido no meta + cookies fbp/fbc/eid + external_id persistente; event_time/value/currency)
+(Aprimorado: pré-filtro UTM com sufixo 'Axx' → nova coluna utm_original_01; utm_numbered e subId3 priorizam utm_original_01)
 
 Principais ajustes vs original:
 - _load_model_if_available():
@@ -14,6 +15,17 @@ Principais ajustes vs original:
     * Persistir/enviar _fbc mesmo sem fbclid (gera sintético a partir do _fbp se necessário)
     * Criar/persistir _eid (hash do _fbp) e usar como external_id
     * Sempre enviar fbp e fbc em user_data
+- UTM pré-filtro:
+    * Se utm terminar com 'A' + dígitos (ex.: 68novolinkA01):
+        - utm_original = "68novolink"
+        - utm_original_01 = "A01"
+        - utm_numbered gerado a partir de utm_original_01
+        - subId3 (Shopee) usa utm_original_01
+    * Caso contrário:
+        - utm_original = UTM inteira
+        - utm_original_01 = ""
+        - utm_numbered gerado a partir de utm_original
+        - subId3 usa utm_original
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -192,7 +204,7 @@ CSV_HEADERS = [
     # urls
     "short_link_in","resolved_url","final_url","category",
     # utm
-    "utm_original","utm_numbered","fbclid","fbp","fbc",
+    "utm_original","utm_original_01","utm_numbered","fbclid","fbp","fbc",
     # device
     "device_name","os_family","os_version",
     # geo
@@ -631,6 +643,25 @@ def predict_proba_single(row_values: List[Any], cat_idx: List[int]) -> Dict[str,
 
 _load_model_if_available()
 
+# ===================== UTM Pré-filtro (A\d+ no final) =====================
+_UTM_A_SUFFIX_PATTERN = re.compile(r"^(?P<base>.*?)(?P<suf>A\d+)$")
+
+def split_utm_A_suffix(utm: str) -> Tuple[str, str]:
+    """
+    Se a UTM terminar com 'A' maiúsculo seguido de dígitos, separa e retorna (base, 'Axx').
+    Caso contrário, retorna (utm, '').
+    Exemplos:
+      '68novolinkA01' -> ('68novolink', 'A01')
+      'abcA1'         -> ('abc', 'A1')
+      'semA'          -> ('semA', '')
+      'abcAxy'        -> ('abcAxy', '')   # não casa porque 'xy' não são dígitos
+    """
+    s = (utm or "").strip()
+    m = _UTM_A_SUFFIX_PATTERN.match(s)
+    if m:
+        return m.group("base"), m.group("suf")
+    return s, ""
+
 # ===================== GCS flush =====================
 def _day_key(ts: int) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts))
@@ -741,12 +772,23 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     if not _is_allowed_long(parts_res.netloc) and not _is_short_domain(parts_res.netloc):
         return JSONResponse({"ok": False, "error": f"Domínio não permitido: {parts_res.netloc}"}, status_code=400)
 
-    # ===== UTM / numbering =====
+    # ===== UTM / pré-filtro (Axx) e numbering =====
     outer_uc = request.query_params.get("uc")
-    utm_original = outer_uc or extract_utm_content_from_url(incoming_url) or extract_utm_content_from_url(resolved_url) or ""
-    clean_base = re.sub(r'[^A-Za-z0-9]', '', utm_original or "") or "n"
+    utm_original_in = outer_uc or extract_utm_content_from_url(incoming_url) or extract_utm_content_from_url(resolved_url) or ""
+
+    # Pré-filtro: separa base e sufixo A\d+ (se existir)
+    utm_base, utm_suffix_A = split_utm_A_suffix(utm_original_in)
+
+    # utm_original (base) e a nova coluna utm_original_01 (apenas 'Axx' quando houver)
+    utm_original = utm_base
+    utm_original_01 = utm_suffix_A  # '' quando não houver padrão
+
+    # utm_numbered: usa utm_original_01 se existir; senão, utm_original
+    base_for_numbered = utm_original_01 if utm_original_01 else utm_original
+    clean_base = re.sub(r'[^A-Za-z0-9]', '', base_for_numbered or "") or "n"
     utm_numbered = f"{clean_base}N{incr_counter()}"
 
+    # origin_url com utm_numbered (preservando ordem do querystring)
     url_with_utm = _set_utm_content_preserving_order(resolved_url, utm_numbered)
     origin_url = add_or_update_query_param(url_with_utm, "utm_numbered", utm_numbered)
     if _is_short_domain(urlsplit(origin_url).netloc):
@@ -755,15 +797,14 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     # ===== content_ids/contents =====
     content_ids, contents_payload = _build_content_identifiers(origin_url)
 
-    # ===== short oficial (se houver credencial) =====
-    sub_id_api = sanitize_subid_for_shopee(utm_numbered)
+    # ===== short oficial (prioriza utm_original_01) =====
+    subid_source = utm_original_01 if utm_original_01 else utm_original
+    sub_id_api = sanitize_subid_for_shopee(subid_source) or "na"
     dest = generate_short_link(origin_url, sub_id_api)
 
     # ===== Cookies / IDs persistentes =====
-    # fbp: cookie existente ou gera novo
     fbp_cookie = get_cookie_value(cookie_header, "_fbp") or _gen_fbp(ts)
 
-    # fbc: preferir cookie; se houver fbclid, gerar fbc do fbclid; senão, gerar sintético a partir do fbp
     fbc_cookie = get_cookie_value(cookie_header, "_fbc")
     fbc_from_fbclid = build_fbc_from_fbclid(fbclid, creation_ts=ts) if fbclid else None
     if fbc_from_fbclid:
@@ -778,12 +819,11 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     r.setex(f"{USERDATA_KEY_PREFIX}{utm_numbered}", USERDATA_TTL_SECONDS, json.dumps({
         "ip": ip_addr, "ua": user_agent, "referrer": referrer,
         "event_source_url": origin_url, "short_link": dest,
-        "vc_time": ts, "utm_original": utm_original, "utm_numbered": utm_numbered,
+        "vc_time": ts, "utm_original": utm_original, "utm_original_01": utm_original_01, "utm_numbered": utm_numbered,
         "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_cookie, "eid": eid_cookie, "mode": mode
     }))
 
     # ===== external_id persistente =====
-    # Preferir _eid (hash do _fbp). Fallback para hash de (user_agent|ip).
     external_id = eid_cookie or _sha256_lower(f"{user_agent}|{ip_addr}")
 
     # ===== user data meta =====
@@ -824,14 +864,14 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         vc_payload = {
             "data": [{
                 "event_name": "ViewContent",
-                "event_time": ts,  # segundos UNIX
-                "event_id": utm_numbered,  # consistência na sessão
+                "event_time": ts,
+                "event_id": utm_numbered,
                 "action_source": "website",
                 "event_source_url": origin_url,
                 "user_data": user_data_meta,
                 "custom_data": {
-                    "currency": "BRL",   # sempre enviar
-                    "value": 0,          # sempre enviar (0 se preço desconhecido)
+                    "currency": "BRL",
+                    "value": 0,
                     "content_type": "product",
                     "content_ids": content_ids,
                     "contents": contents_payload
@@ -854,14 +894,14 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         atc_payload = {
             "data": [{
                 "event_name": "AddToCart",
-                "event_time": ts,  # segundos UNIX
-                "event_id": utm_numbered,  # consistência na sessão
+                "event_time": ts,
+                "event_id": utm_numbered,
                 "action_source": "website",
                 "event_source_url": origin_url,
                 "user_data": user_data_meta,
                 "custom_data": {
-                    "currency": "BRL",  # sempre enviar
-                    "value": 0,         # sempre enviar (0 se preço desconhecido)
+                    "currency": "BRL",
+                    "value": 0,
                     "content_type": "product",
                     "content_ids": content_ids,
                     "contents": contents_payload
@@ -902,7 +942,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     csv_row = [
         ts, iso_time, ip_addr, user_agent, referrer,
         incoming_url, resolved_url, origin_url, (cat or ""),
-        utm_original, utm_numbered, fbclid or "", fbp_cookie or "", fbc_cookie or "",
+        utm_original, utm_original_01, utm_numbered, fbclid or "", fbp_cookie or "", fbc_cookie or "",
         device_name, os_family, os_version,
         geo.get("geo_status",""), geo.get("geo_country",""), geo.get("geo_region",""), geo.get("geo_state",""),
         geo.get("geo_city",""), geo.get("geo_zip",""), geo.get("geo_lat",""), geo.get("geo_lon",""),
@@ -1011,7 +1051,7 @@ async def admin_upload_model(
             raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
     _load_model_if_available()
     return {"ok": True, "saved": {"model": MODEL_PATH, "meta": (MODEL_META_PATH if up_meta else None)},
-            "model_loaded": bool(_model), "thr_qvc": _thr_qvc, "thr_atc": _thr_atc, "te_loaded": bool(_TE_STATS)}
+            "model_loaded": bool(_model), "thr_qvc": _thr_qvc, "thr_atc": _thr_qc if ' _thr_qc' in globals() else _thr_atc, "te_loaded": bool(_TE_STATS)}
 
 @app.post("/admin/reload_model")
 def admin_reload_model(x_admin_token: str = Header(None)):
