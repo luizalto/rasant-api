@@ -1,22 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost) + Meta Ads (CAPI)
+FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição
+CB + RF + (XGB opcional) + STACK(LogReg) + Meta Ads (CAPI)
 
-O que faz:
-- Resolve short-link da Shopee, numera UTM (utm_numbered) e preserva utm_content.
-- Gera content_ids/contents sempre (Meta CAPI).
-- Envia ViewContent SEMPRE; AddToCart APENAS se p_comprou >= thr_atc (do arquivo meta).
-- Loga cada clique em CSV (buffer -> GCS) com colunas de probas e thresholds (p_comprou, thr_qvc, thr_atc, is_qvc, is_atc),
-  e métricas derivadas (pcomprou_pct, thr_qvc_pct, thr_atc_pct, gap_qvc, gap_atc, pct_of_atc).
-- Predição alinhada ao treino: usa "feature_names" e "cat_idx" do model_meta_comprou.json.
-- Suporta Target Encoding opcional (arquivo te_stats.json).
-
-Arquivos esperados em ./models/ :
-  - model_comprou.cbm
-  - model_meta_comprou.json
-  - te_stats.json (opcional)
-
-Iniciar local: uvicorn main:app --host 0.0.0.0 --port 10000
+Principais pontos:
+- Mantém as MESMAS features do treino/teste para CatBoost e para as features numéricas (RF/XGB):
+  cat_cols = ["device_bucket","os_family","part_of_day","geo_macro","geo_region","geo_city","geo_zip","geo_isp","geo_org","ref_domain","utm_original","device_city_combo","utm_partofday_combo"]
+  num_cols = ["hour","dow","is_weekend","os_version_num","is_android","is_ios"]
+  enc_cols = ["utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br"]
+- Saída-base = STACK se (stack_model.joblib + stack_meta.json) existirem e pelo menos 1 base score (cb/rf/xgb) estiver disponível.
+  Caso contrário, usa apenas CatBoost.
+- Thresholds:
+  1) tenta meta do modelo (stack_meta.json.thresholds OU model_meta_comprou.json.thresholds)
+  2) pode sobrescrever por ENV: THR_QVC, THR_ATC
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -24,6 +20,7 @@ from typing import Optional, Dict, Tuple, List, Any
 
 import requests
 import redis
+import joblib
 from fastapi import FastAPI, Request, Query, Path, UploadFile, File, Header, HTTPException, Form
 from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse, HTMLResponse
 from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode, unquote
@@ -62,6 +59,10 @@ META_ACCESS_TOKEN     = os.getenv("META_ACCESS_TOKEN") or os.getenv("FB_ACCESS_T
 META_GRAPH_VERSION    = os.getenv("META_GRAPH_VERSION", "v17.0")
 META_TEST_EVENT_CODE  = os.getenv("META_TEST_EVENT_CODE")  # opcional
 
+# Threshold override (opcional)
+ENV_THR_QVC = os.getenv("THR_QVC")
+ENV_THR_ATC = os.getenv("THR_ATC")
+
 # Modelos
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR      = os.path.join(BASE_DIR, "models")
@@ -69,6 +70,12 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 MODEL_PATH      = os.path.join(MODELS_DIR, "model_comprou.cbm")
 MODEL_META_PATH = os.path.join(MODELS_DIR, "model_meta_comprou.json")
 TE_STATS_PATH   = os.path.join(MODELS_DIR, "te_stats.json")  # opcional
+
+# Ensemble paths
+RF_PATH         = os.path.join(MODELS_DIR, "rf.joblib")
+XGB_JSON_PATH   = os.path.join(MODELS_DIR, "xgb.json")               # opcional
+STACK_MODEL_PATH= os.path.join(MODELS_DIR, "stack_model.joblib")
+STACK_META_PATH = os.path.join(MODELS_DIR, "stack_meta.json")
 
 # ===================== App / Clients =====================
 app = FastAPI(title="Shopee UTM → ShortLink + Geo + Predict + CAPI")
@@ -345,23 +352,34 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
         print("[geo_lookup] erro:", e)
         return {"geo_status":"fail"}
 
-# ===================== Predição (CatBoost) =====================
-_model = None
-_model_classes: List[str] = []  # nomes (string) das classes reportadas pelo modelo
+# ===================== Predição: carregar artefatos =====================
+_model_cb = None
+_model_rf = None
+_model_xgb = None       # Booster/Classifier (opcional)
+_model_stack = None     # LogisticRegression (joblib)
+
+_model_classes: List[str] = []  # nomes reportados por CatBoost
 _thresholds: Dict[str, float] = {}  # qvc_mid / atc_high
 _thr_qvc = None
 _thr_atc = None
 
-_FEATURE_NAMES_FROM_META: List[str] = []
-_CAT_IDX_FROM_META: List[int] = []
+_FEATURE_NAMES_FROM_META: List[str] = []   # cols do CB (cat+num+enc)
+_CAT_IDX_FROM_META: List[int] = []         # índices categóricos p/ CB
+_STACK_FEATURES: List[str] = []            # ["proba_cb","proba_rf","proba_xgb"]
 
 _TE_STATS = None
 _TE_PRIORS = None
 
-# --- NOVO: metadados da classe positiva (para modelo binário) ---
-_POS_LABEL_NAME = "comprou"  # nome lógico
-_POS_LABEL_ID = 1            # ID mapeado no treino (conforme 'mapping' do JSON)
-_POS_IDX = None              # índice da classe positiva dentro de model.classes_
+# --- Classe positiva (binário) ---
+_POS_LABEL_NAME = "comprou"
+_POS_LABEL_ID = 1
+_POS_IDX = None
+
+# Colunas EXACTAS (iguais ao treino) para montagem de RF/XGB
+_CAT_COLS = ["device_bucket","os_family","part_of_day","geo_macro","geo_region","geo_city","geo_zip","geo_isp","geo_org","ref_domain","utm_original","device_city_combo","utm_partofday_combo"]
+_NUM_COLS = ["hour","dow","is_weekend","os_version_num","is_android","is_ios"]
+_ENC_COLS = ["utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br"]
+_NUM_PLUS_ENC = _NUM_COLS + _ENC_COLS  # ordem p/ RF/XGB
 
 def _load_te_if_available():
     global _TE_STATS, _TE_PRIORS
@@ -495,7 +513,7 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
         s = (ua or "").lower()
         return 1 if any(x in s for x in ["bot", "crawl", "spider", "facebookexternalhit", "whatsapp"]) else 0
 
-    # Target encodings opcionais
+    # Target encodings opcionais (iguais treino)
     utm_n,  utm_br  = _apply_te("utm_original", str(utm_original or ""))
     ref_n,  ref_br  = _apply_te("ref_domain",   str(ref_domain))
     devb_n, devb_br = _apply_te("device_bucket",str(device_bucket))
@@ -520,7 +538,6 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
     }
 
 def _row_in_meta_order(feats_dict: Dict[str, Any]) -> Tuple[List[Any], List[int]]:
-    # defaults numéricos p/ colunas novas vindas do meta
     numeric_defaults = {
         "hour","dow","month","is_weekend","os_version_num","is_android","is_ios",
         "utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br",
@@ -534,96 +551,208 @@ def _row_in_meta_order(feats_dict: Dict[str, Any]) -> Tuple[List[Any], List[int]
         ordered.append(v)
     return ordered, _CAT_IDX_FROM_META
 
+def _vector_num_plus_enc(feats_dict: Dict[str, Any]) -> List[float]:
+    out = []
+    for col in _NUM_PLUS_ENC:
+        v = feats_dict.get(col)
+        try:
+            out.append(float(v))
+        except Exception:
+            out.append(0.0)
+    return out
+
 def _load_model_if_available():
-    """Carrega CatBoost + meta (features/cats/thresholds) e configura classe positiva."""
-    global _model, _model_classes, _thresholds, _thr_qvc, _thr_atc
+    """Carrega CatBoost + RF + (XGB opc.) + STACK e meta/thresholds."""
+    global _model_cb, _model_rf, _model_xgb, _model_stack
+    global _model_classes, _thresholds, _thr_qvc, _thr_atc
     global _FEATURE_NAMES_FROM_META, _CAT_IDX_FROM_META
-    global _POS_LABEL_NAME, _POS_LABEL_ID, _POS_IDX
+    global _POS_LABEL_NAME, _POS_LABEL_ID, _POS_IDX, _STACK_FEATURES
+
+    # CatBoost
     try:
         from catboost import CatBoostClassifier
         if os.path.exists(MODEL_PATH):
             m = CatBoostClassifier()
             m.load_model(MODEL_PATH)
-            _model = m
-
-            # classes do catboost (binário usualmente [0,1])
-            _model_classes = [str(x) for x in getattr(m, "classes_", [])] or ["0", "1"]
-
-            # defaults safe
-            _POS_LABEL_NAME = "comprou"
-            _POS_LABEL_ID = 1
-            _POS_IDX = None
-
-            if os.path.exists(MODEL_META_PATH):
-                meta = json.load(open(MODEL_META_PATH, "r", encoding="utf-8"))
-                _FEATURE_NAMES_FROM_META = list(meta.get("feature_names", []))
-                _CAT_IDX_FROM_META = list(meta.get("cat_idx", []))
-
-                thr = meta.get("thresholds") or {}
-                _thresholds = {"qvc_mid": thr.get("qvc_mid"), "atc_high": thr.get("atc_high")}
-                _thr_qvc = float(_thresholds.get("qvc_mid") or 0.5)
-                _thr_atc = float(_thresholds.get("atc_high") or _thr_qvc or 0.5)
-
-                _POS_LABEL_NAME = meta.get("positive_label") or "comprou"
-                mapping = meta.get("mapping") or {}
-                try:
-                    _POS_LABEL_ID = int(mapping.get(_POS_LABEL_NAME, 1))
-                except Exception:
-                    _POS_LABEL_ID = 1
-            else:
-                _FEATURE_NAMES_FROM_META = []
-                _CAT_IDX_FROM_META = []
-                _thr_qvc = 0.5
-                _thr_atc = 0.5
-
-            # descobrir índice da classe positiva dentro de model.classes_
-            try:
-                classes_raw = list(getattr(_model, "classes_", [0, 1]))
-                _POS_IDX = classes_raw.index(_POS_LABEL_ID) if _POS_LABEL_ID in classes_raw else (1 if len(classes_raw) == 2 else None)
-            except Exception:
-                _POS_IDX = 1
-
-            _load_te_if_available()
-            print(f"[model] carregado. thr_qvc={_thr_qvc} thr_atc={_thr_atc} n_feats={len(_FEATURE_NAMES_FROM_META)} pos_id={_POS_LABEL_ID} pos_idx={_POS_IDX}")
+            _model_cb = m
+            _model_classes = [str(x) for x in getattr(m, "classes_", [])] or ["0","1"]
         else:
-            print("[model] arquivo não encontrado:", MODEL_PATH)
+            print("[model] CatBoost não encontrado:", MODEL_PATH)
     except Exception as e:
-        print("[model] erro ao carregar:", e)
+        print("[model] erro ao carregar CatBoost:", e)
 
-def predict_proba_single(row_values: List[Any], cat_idx: List[int]) -> Dict[str, float]:
-    """Retorna dict com probabilidades por classe (binário ou multi)."""
+    # Meta (features/thresholds)
+    _FEATURE_NAMES_FROM_META = []
+    _CAT_IDX_FROM_META = []
+    _thresholds = {}
+    _thr_qvc = None
+    _thr_atc = None
+    _POS_LABEL_NAME = "comprou"
+    _POS_LABEL_ID = 1
+    _POS_IDX = None
+
     try:
+        if os.path.exists(MODEL_META_PATH):
+            meta = json.load(open(MODEL_META_PATH, "r", encoding="utf-8"))
+            _FEATURE_NAMES_FROM_META = list(meta.get("feature_names", []))
+            _CAT_IDX_FROM_META = list(meta.get("cat_idx", []))
+            thr = meta.get("thresholds") or {}
+            if thr:
+                _thresholds.update({"qvc_mid": thr.get("qvc_mid"), "atc_high": thr.get("atc_high")})
+            _POS_LABEL_NAME = meta.get("positive_label") or "comprou"
+            mapping = meta.get("mapping") or {}
+            try:
+                _POS_LABEL_ID = int(mapping.get(_POS_LABEL_NAME, 1))
+            except Exception:
+                _POS_LABEL_ID = 1
+    except Exception as e:
+        print("[model] erro no model_meta:", e)
+
+    # Descobrir índice positivo no CB
+    try:
+        if _model_cb is not None:
+            classes_raw = list(getattr(_model_cb, "classes_", [0, 1]))
+            _POS_IDX = classes_raw.index(_POS_LABEL_ID) if _POS_LABEL_ID in classes_raw else (1 if len(classes_raw)==2 else None)
+    except Exception:
+        _POS_IDX = 1
+
+    # RF
+    _model_rf = None
+    try:
+        if os.path.exists(RF_PATH):
+            _model_rf = joblib.load(RF_PATH)
+            print("[RF] carregado.")
+    except Exception as e:
+        print("[RF] erro ao carregar:", e)
+
+    # XGB (opcional)
+    _model_xgb = None
+    try:
+        if os.path.exists(XGB_JSON_PATH):
+            import xgboost as xgb
+            booster = xgb.Booster()
+            booster.load_model(XGB_JSON_PATH)
+            _model_xgb = booster
+            print("[XGB] booster carregado.")
+    except Exception as e:
+        print("[XGB] erro ao carregar:", e)
+
+    # STACK (LogReg)
+    _model_stack = None
+    _STACK_FEATURES = []
+    try:
+        if os.path.exists(STACK_MODEL_PATH):
+            _model_stack = joblib.load(STACK_MODEL_PATH)
+            print("[STACK] LogReg carregado.")
+        if os.path.exists(STACK_META_PATH):
+            sm = json.load(open(STACK_META_PATH, "r", encoding="utf-8"))
+            _STACK_FEATURES = list((sm.get("stack_features") or []))
+            thr2 = (sm.get("thresholds") or {})
+            if thr2:
+                # thresholds do stack têm prioridade
+                _thresholds.update({"qvc_mid": thr2.get("qvc_mid"), "atc_high": thr2.get("atc_high")})
+    except Exception as e:
+        print("[STACK] erro ao carregar:", e)
+
+    # thresholds finais (com ENV override)
+    _thr_qvc = float(_thresholds.get("qvc_mid") or 0.5)
+    _thr_atc = float(_thresholds.get("atc_high") or _thr_qvc or 0.5)
+    if ENV_THR_QVC:
+        try: _thr_qvc = float(ENV_THR_QVC)
+        except: pass
+    if ENV_THR_ATC:
+        try: _thr_atc = float(ENV_THR_ATC)
+        except: pass
+
+    _load_te_if_available()
+    print(f"[model] pronto: cb={_model_cb is not None} rf={_model_rf is not None} xgb={_model_xgb is not None} stack={_model_stack is not None}")
+    print(f"[meta] feats={len(_FEATURE_NAMES_FROM_META)} cat_idx={_CAT_IDX_FROM_META}")
+    print(f"[thr] qvc={_thr_qvc} atc={_thr_atc} (ENV overrides: qvc={ENV_THR_QVC}, atc={ENV_THR_ATC})")
+
+def _predict_cb(feats_dict: Dict[str, Any]) -> float:
+    """p_pos do CatBoost (classe positiva)."""
+    try:
+        if _model_cb is None or not _FEATURE_NAMES_FROM_META:
+            return 0.0
         from catboost import Pool
         import pandas as pd
-        if not _model:
-            return {}
-        X_df  = pd.DataFrame([row_values], columns=_FEATURE_NAMES_FROM_META)
-        pool  = Pool(X_df, cat_features=cat_idx)
-        probs = _model.predict_proba(pool)[0]
-
-        # Binário (2 saídas): p_pos no índice da classe positiva detectada
+        row_values, cat_idx = _row_in_meta_order(feats_dict)
+        X_df = pd.DataFrame([row_values], columns=_FEATURE_NAMES_FROM_META)
+        pool = Pool(X_df, cat_features=cat_idx)
+        probs = _model_cb.predict_proba(pool)[0]
         if len(probs) == 2:
             pos_idx = _POS_IDX if _POS_IDX is not None else 1
-            p_pos = float(probs[pos_idx])
-            p_neg = float(probs[1 - pos_idx])
-            return {"comprou": p_pos, "quase": 0.0, "desinteressado": p_neg}
-
-        # Multiclasse: tenta casar nomes
-        out = {"comprou": 0.0, "quase": 0.0, "desinteressado": 0.0}
+            return float(probs[pos_idx])
+        # multiclasse: tenta localizar "comprou"
+        # (não é o caso aqui, mas fica seguro)
+        best = 0.0
         for i, cls in enumerate(_model_classes):
-            if i >= len(probs):
-                break
-            name = str(cls).lower()
-            if "comprou" in name or name in ("1",):
-                out["comprou"] = float(probs[i])
-            elif "quase" in name:
-                out["quase"] = float(probs[i])
-            elif "desinteress" in name or name in ("0",):
-                out["desinteressado"] = float(probs[i])
-        return out
+            if "comprou" in str(cls).lower() or str(cls) in ("1",):
+                best = float(probs[i])
+        return best
     except Exception as e:
-        print("[predict] erro:", e)
-        return {}
+        print("[predict_cb] erro:", e)
+        return 0.0
+
+def _predict_rf(feats_dict: Dict[str, Any]) -> Optional[float]:
+    """p_pos do RF; usa NUM+ENC colunas na ordem do treino."""
+    try:
+        if _model_rf is None:
+            return None
+        import numpy as np
+        x_vec = _vector_num_plus_enc(feats_dict)
+        probs = _model_rf.predict_proba([x_vec])[0]
+        # sklearn: probs = [p0, p1]; assumimos classe positiva = 1
+        return float(probs[1])
+    except Exception as e:
+        print("[predict_rf] erro:", e)
+        return None
+
+def _predict_xgb(feats_dict: Dict[str, Any]) -> Optional[float]:
+    """p_pos do XGB Booster; usa NUM+ENC."""
+    try:
+        if _model_xgb is None:
+            return None
+        import numpy as np
+        import xgboost as xgb
+        x_vec = _vector_num_plus_enc(feats_dict)
+        d = xgb.DMatrix([x_vec])
+        prob = _model_xgb.predict(d)[0]
+        return float(prob)
+    except Exception as e:
+        print("[predict_xgb] erro:", e)
+        return None
+
+def _predict_final(feats_dict: Dict[str, Any]) -> Tuple[float, Dict[str,float], str]:
+    """
+    Retorna:
+      p_final (float), component_probs (dict com p_cb, p_rf, p_xgb), base_used ("stack" ou "cb")
+    """
+    p_cb = _predict_cb(feats_dict)
+    p_rf = _predict_rf(feats_dict)
+    p_xgb = _predict_xgb(feats_dict)
+
+    comp = {"p_cb": p_cb}
+    if p_rf is not None: comp["p_rf"] = p_rf
+    if p_xgb is not None: comp["p_xgb"] = p_xgb
+
+    # Se houver STACK e pelo menos 1 prob além (ou mesmo só CB), montamos vetor na ordem _STACK_FEATURES
+    if _model_stack is not None and _STACK_FEATURES:
+        import numpy as np
+        # features aceitas: "proba_cb","proba_rf","proba_xgb"
+        fmap = {"proba_cb": p_cb,
+                "proba_rf": (p_rf if p_rf is not None else 0.0),
+                "proba_xgb": (p_xgb if p_xgb is not None else 0.0)}
+        x_stack = [float(fmap.get(name, 0.0)) for name in _STACK_FEATURES]
+        # predict_proba do LogReg
+        try:
+            p_final = float(_model_stack.predict_proba([x_stack])[0][1])
+            return p_final, comp, "stack"
+        except Exception as e:
+            print("[stack] erro no predict:", e)
+
+    # fallback: CatBoost
+    return p_cb, comp, "cb"
 
 _load_model_if_available()
 
@@ -675,10 +804,26 @@ def health():
     except Exception:
         ttl = None
     return {
-        "ok": True, "ts": int(time.time()), "bucket": GCS_BUCKET, "prefix": GCS_PREFIX,
-        "video_id": VIDEO_ID, "model_loaded": bool(_model), "classes": _model_classes,
-        "thr_qvc": _thr_qvc, "thr_atc": _thr_atc, "n_features_meta": len(_FEATURE_NAMES_FROM_META),
-        "cat_idx_meta": _CAT_IDX_FROM_META, "counter_ttl": ttl
+        "ok": True,
+        "ts": int(time.time()),
+        "bucket": GCS_BUCKET,
+        "prefix": GCS_PREFIX,
+        "video_id": VIDEO_ID,
+        "models": {
+            "cb": bool(_model_cb),
+            "rf": bool(_model_rf),
+            "xgb": bool(_model_xgb),
+            "stack": bool(_model_stack),
+            "stack_features": _STACK_FEATURES,
+            "base_used_pref": ("stack" if (_model_stack and _STACK_FEATURES) else "cb")
+        },
+        "model_loaded": bool(_model_cb),
+        "classes": _model_classes,
+        "thr_qvc": _thr_qvc,
+        "thr_atc": _thr_atc,
+        "n_features_meta": len(_FEATURE_NAMES_FROM_META),
+        "cat_idx_meta": _CAT_IDX_FROM_META,
+        "counter_ttl": ttl
     }
 
 @app.get("/robots.txt")
@@ -787,18 +932,21 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 
     try:
         feats_dict = _features_full_dict(os_family, device_name, os_version, referrer, utm_original, iso_time, geo)
-        if _model and _FEATURE_NAMES_FROM_META:
-            row_values, cat_idx = _row_in_meta_order(feats_dict)
-            probs = predict_proba_single(row_values, cat_idx)
-            # normaliza chaves
-            for k in list(probs.keys()):
-                p_map[k] = float(probs[k])
 
-            # decide QVC/ATC
-            p_c = float(p_map.get("comprou", 0.0))
-            is_qvc_flag = 1 if p_c >= (_thr_qvc or 0.5) else 0
-            is_atc_flag = 1 if p_c >= (_thr_atc or _thr_qvc or 0.5) else 0
-            pred_label = "comprou" if is_atc_flag else ("comprou_qvc" if is_qvc_flag else "desinteressado")
+        # PROB FINAL (stack preferencial)
+        p_final, comp_probs, base_used = _predict_final(feats_dict)
+
+        # Normaliza p_map (mantemos esquema de 3 chaves)
+        p_map["comprou"] = float(p_final)
+        p_map["desinteressado"] = float(1.0 - p_final)
+        p_map["quase"] = 0.0
+
+        # decide QVC/ATC
+        p_c = p_map["comprou"]
+        is_qvc_flag = 1 if p_c >= (_thr_qvc or 0.5) else 0
+        is_atc_flag = 1 if p_c >= (_thr_atc or _thr_qvc or 0.5) else 0
+        pred_label = "comprou" if is_atc_flag else ("comprou_qvc" if is_qvc_flag else "desinteressado")
+
     except Exception as e:
         print("[predict] erro:", e)
 
@@ -873,7 +1021,6 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     is_ios_log     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
     part_of_day_log = _part_of_day_from_hour(hour_log)
 
-    # métricas derivadas vs thresholds
     p_c = float(p_map.get("comprou", 0.0))
     thr_q = float(_thr_qvc or 0.5)
     thr_a = float(_thr_atc or thr_q or 0.5)
@@ -881,8 +1028,8 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     pcomprou_pct = p_c * 100.0
     thr_qvc_pct  = thr_q * 100.0
     thr_atc_pct  = thr_a * 100.0
-    gap_qvc      = p_c - thr_q             # positivo = passou do QVC
-    gap_atc      = p_c - thr_a             # positivo = passou do ATC
+    gap_qvc      = p_c - thr_q
+    gap_atc      = p_c - thr_a
     pct_of_atc   = (p_c / thr_a * 100.0) if thr_a > 0 else 0.0
 
     csv_row = [
@@ -902,7 +1049,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     with _buffer_lock:
         _buffer_rows.append(csv_row)
 
-    # ===== Intersticial Pinterest (evita bloqueio) =====
+    # ===== Intersticial Pinterest =====
     def _is_pinterest(ua: str) -> bool:
         return "pinterest" in (ua or "").lower()
 
@@ -924,81 +1071,89 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         "Set-Cookie": f"_fbp={fbp_cookie}; Path=/; Max-Age=63072000; SameSite=Lax"
     })
 
-# ===================== Admin =====================
+# ===================== Admin / Uploads =====================
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page():
     return """
     <html>
-      <head><meta charset="utf-8"><title>Upload do Modelo</title></head>
-      <body style="font-family: sans-serif; max-width: 640px; margin: 40px auto;">
-        <h2>Enviar modelo CatBoost (alinhado ao treino)</h2>
-        <p><b>Arquivos esperados:</b> model_comprou.cbm e model_meta_comprou.json (opcional: te_stats.json)</p>
-        <form method="post" action="/admin/upload_model_simple" enctype="multipart/form-data">
+      <head><meta charset="utf-8"><title>Upload de Modelos</title></head>
+      <body style="font-family: sans-serif; max-width: 760px; margin: 40px auto;">
+        <h2>Enviar modelos/artefatos (CatBoost + RF + XGB + STACK + TE)</h2>
+        <p>Arquivos aceitos (enviar apenas os que tiver):</p>
+        <ul>
+          <li><b>model_comprou.cbm</b> (obrigatório para CatBoost)</li>
+          <li><b>model_meta_comprou.json</b> (features/cat_idx/thresholds)</li>
+          <li><b>rf.joblib</b> (opcional)</li>
+          <li><b>xgb.json</b> (opcional)</li>
+          <li><b>stack_model.joblib</b> (opcional)</li>
+          <li><b>stack_meta.json</b> (opcional)</li>
+          <li><b>te_stats.json</b> (opcional)</li>
+        </ul>
+        <form method="post" action="/admin/upload_bundle" enctype="multipart/form-data">
           <div>Token (X-Admin-Token): <input name="token" type="password" required /></div><br/>
-          <div>model_comprou.cbm: <input name="model" type="file" required /></div><br/>
-          <div>model_meta_comprou.json (opcional): <input name="meta" type="file" /></div><br/>
+          <div>model_comprou.cbm: <input name="model_cb" type="file" /></div><br/>
+          <div>model_meta_comprou.json: <input name="model_meta" type="file" /></div><br/>
+          <div>rf.joblib: <input name="rf" type="file" /></div><br/>
+          <div>xgb.json: <input name="xgb" type="file" /></div><br/>
+          <div>stack_model.joblib: <input name="stack_model" type="file" /></div><br/>
+          <div>stack_meta.json: <input name="stack_meta" type="file" /></div><br/>
+          <div>te_stats.json: <input name="te_stats" type="file" /></div><br/>
           <button type="submit">Enviar</button>
         </form>
-        <p>Depois de enviar, abra <code>/health</code> para conferir <b>model_loaded: true</b> e os thresholds.</p>
+        <p>Depois de enviar, abra <code>/health</code> para conferir o carregamento e thresholds.</p>
       </body>
     </html>
     """
 
-@app.post("/admin/upload_model_simple")
-async def admin_upload_model_simple(token: str = Form(...), model: UploadFile = File(...), meta: UploadFile = File(None)):
+@app.post("/admin/upload_bundle")
+async def admin_upload_bundle(
+    token: str = Form(...),
+    model_cb: UploadFile = File(None),
+    model_meta: UploadFile = File(None),
+    rf: UploadFile = File(None),
+    xgb: UploadFile = File(None),
+    stack_model: UploadFile = File(None),
+    stack_meta: UploadFile = File(None),
+    te_stats: UploadFile = File(None),
+):
     if token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
-    try:
-        with open(MODEL_PATH, "wb") as out:
-            out.write(await model.read())
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"falha ao salvar model: {e}")
-    if meta:
-        try:
-            data = await meta.read()
-            _ = json.loads(data.decode("utf-8"))
-            with open(MODEL_META_PATH, "wb") as out:
-                out.write(data)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
-    _load_model_if_available()
-    return {"ok": True, "model_loaded": bool(_model), "thr_qvc": _thr_qvc, "thr_atc": _thr_atc}
 
-@app.post("/admin/upload_model")
-async def admin_upload_model(
-    model_file: UploadFile = File(None), meta_file: UploadFile = File(None),
-    model: UploadFile = File(None), meta: UploadFile = File(None),
-    x_admin_token: str = Header(None)
-):
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    up_model = model_file or model
-    if not up_model:
-        raise HTTPException(status_code=400, detail="model file ausente (campo model_file ou model)")
-    try:
-        with open(MODEL_PATH, "wb") as out:
-            out.write(await up_model.read())
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"falha ao salvar model: {e}")
-    up_meta = meta_file or meta
-    if up_meta:
+    def _save(up: UploadFile, path: str, is_json: bool=False):
+        if not up: return
         try:
-            data = await up_meta.read()
-            _ = json.loads(data.decode("utf-8"))
-            with open(MODEL_META_PATH, "wb") as out:
+            data = await up.read()
+            if is_json:
+                _ = json.loads(data.decode("utf-8"))
+            with open(path, "wb") as out:
                 out.write(data)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
+            raise HTTPException(status_code=400, detail=f"erro salvando {os.path.basename(path)}: {e}")
+
+    _save_tasks = [
+        (model_cb, MODEL_PATH, False),
+        (model_meta, MODEL_META_PATH, True),
+        (rf, RF_PATH, False),
+        (xgb, XGB_JSON_PATH, False),
+        (stack_model, STACK_MODEL_PATH, False),
+        (stack_meta, STACK_META_PATH, True),
+        (te_stats, TE_STATS_PATH, True)
+    ]
+    for up, path, is_json in _save_tasks:
+        if up:
+            await _save(up, path, is_json)
+
     _load_model_if_available()
-    return {"ok": True, "saved": {"model": MODEL_PATH, "meta": (MODEL_META_PATH if up_meta else None)},
-            "model_loaded": bool(_model), "thr_qvc": _thr_qvc, "thr_atc": _thr_atc}
+    return {"ok": True,
+            "loaded": {"cb": bool(_model_cb), "rf": bool(_model_rf), "xgb": bool(_model_xgb), "stack": bool(_model_stack)},
+            "thr_qvc": _thr_qvc, "thr_atc": _thr_atc}
 
 @app.post("/admin/reload_model")
 def admin_reload_model(x_admin_token: str = Header(None)):
     if x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
     _load_model_if_available()
-    return {"ok": True, "model_loaded": bool(_model), "thr_qvc": _thr_qvc, "thr_atc": _thr_atc}
+    return {"ok": True, "model_loaded": bool(_model_cb), "thr_qvc": _thr_qvc, "thr_atc": _thr_atc}
 
 @app.get("/admin/flush")
 def admin_flush(token: str):
