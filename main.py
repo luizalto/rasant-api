@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost) + Meta Ads (CAPI)
-(Atualizado)
-- Mantém a UTM original (sem filtrar por 'A') e só acrescenta 'N<contador>'.
-- Escreve utm_content e utm_numbered com o mesmo valor final.
-- Gera sempre short-link via Shopee API (se credenciais válidas).
-- Uploads com leitura única e parse condicional de JSON (evita "Expecting value").
+FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI)
+(versão mesclada e corrigida)
+
+Novidades:
+- Short-link: sempre gerar via API oficial da Shopee. Se não conseguir (credencial/erro), retorna 502 (NÃO entrega URL longa).
+- UTM (A-sufixo): identifica sufixo 'A\\d+' (A maiúsculo), não filtra. Salva:
+    * utm_original_01  (subid completo = base + A.., se existir; senão vazio)
+    * subid_base       (somente base, sem A..)
+    * subid_full       (sinônimo de utm_original_01, para dashboards)
+- subId3 = utm_numbered
+- Upload /admin/upload_model corrigido (leitura única e parse condicional).
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -22,8 +27,8 @@ from datetime import datetime
 DEFAULT_TIMEOUT       = float(os.getenv("HTTP_TIMEOUT", "10"))
 
 # GCS
-GCS_BUCKET            = os.getenv("GCS_BUCKET")              # ex: "meu-bucket"
-GCS_PREFIX            = os.getenv("GCS_PREFIX", "logs/")     # ex: "logs/"
+GCS_BUCKET            = os.getenv("GCS_BUCKET")
+GCS_PREFIX            = os.getenv("GCS_PREFIX", "logs/")
 FLUSH_MAX_ROWS        = int(os.getenv("FLUSH_MAX_ROWS", "500"))
 FLUSH_MAX_SECONDS     = int(os.getenv("FLUSH_MAX_SECONDS", "30"))
 
@@ -40,7 +45,7 @@ GEO_CACHE_PREFIX      = os.getenv("GEO_CACHE_PREFIX", "geo:")
 
 VIDEO_ID              = os.getenv("VIDEO_ID", "v15")
 
-# Shopee Affiliate (obrigatório para encurtar oficialmente)
+# Shopee Affiliate
 SHOPEE_APP_ID         = os.getenv("SHOPEE_APP_ID", "")
 SHOPEE_APP_SECRET     = os.getenv("SHOPEE_APP_SECRET", "")
 SHOPEE_ENDPOINT       = os.getenv("SHOPEE_ENDPOINT", "https://open-api.affiliate.shopee.com.br/graphql")
@@ -51,23 +56,26 @@ META_ACCESS_TOKEN     = os.getenv("META_ACCESS_TOKEN") or os.getenv("FB_ACCESS_T
 META_GRAPH_VERSION    = os.getenv("META_GRAPH_VERSION", "v17.0")
 META_TEST_EVENT_CODE  = os.getenv("META_TEST_EVENT_CODE")  # opcional
 
+# Seleção de modelo (server)
+SERVING_MODE_ENV      = (os.getenv("SERVING_MODE", "auto") or "auto").strip().lower()  # auto|cb|rf|xgb|stack
+
 # Modelos
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR      = os.path.join(BASE_DIR, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
-MODEL_PATH      = os.path.join(MODELS_DIR, "model_comprou.cbm")
-MODEL_META_PATH = os.path.join(MODELS_DIR, "model_meta_comprou.json")
-TE_STATS_PATH   = os.path.join(MODELS_DIR, "te_stats.json")  # opcional (fallback)
 
-# Arquivos aceitos por upload (compat com seu uploader)
+# Caminhos principais
+MODEL_CB_PATH        = os.path.join(MODELS_DIR, "model_comprou.cbm")
+MODEL_META_PATH      = os.path.join(MODELS_DIR, "model_meta_comprou.json")
+TE_STATS_PATH        = os.path.join(MODELS_DIR, "te_stats.json")          # opcional (fallback)
+
 MODEL_RF_PATH        = os.path.join(MODELS_DIR, "rf.joblib")
 MODEL_XGB_PATH       = os.path.join(MODELS_DIR, "xgb.json")
 MODEL_STACK_PATH     = os.path.join(MODELS_DIR, "stack_model.joblib")
 STACK_META_PATH      = os.path.join(MODELS_DIR, "stack_meta.json")
-CB_FULL_PATH         = os.path.join(MODELS_DIR, "cb_full.cbm")  # opcional "cb_full"
 
 # ===================== App / Clients =====================
-app = FastAPI(title="Shopee UTM → ShortLink + Geo + Predict + CAPI")
+app = FastAPI(title="Shopee UTM → ShortLink + Geo + Predict (Multi-Model) + CAPI")
 
 # Redis
 r = redis.from_url(REDIS_URL)
@@ -76,7 +84,7 @@ try:
 except Exception:
     pass
 
-# GCS (lazy: só importa client se GCS_BUCKET existir)
+# GCS (lazy)
 _bucket = None
 if GCS_BUCKET:
     try:
@@ -189,18 +197,18 @@ CSV_HEADERS = [
     # urls
     "short_link_in","resolved_url","final_url","category",
     # utm
-    "utm_original","utm_numbered","fbclid","fbp","fbc",
+    "utm_original","utm_original_01","subid_base","subid_full","utm_numbered","fbclid","fbp","fbc",
     # device
     "device_name","os_family","os_version",
     # geo
     "geo_status","geo_country","geo_region","geo_state","geo_city","geo_zip","geo_lat","geo_lon","geo_isp","geo_org","geo_asn",
     # features básicas calculadas
     "part_of_day","hour","dow","ref_domain","os_version_num","is_android","is_ios",
-    # predição
+    # predição (do modo ativo)
     "pred_label","p_comprou","p_quase","p_desinteressado",
-    # thresholds e flags
+    # thresholds (do modo ativo) e flags
     "thr_qvc","thr_atc","is_qvc","is_atc",
-    # métricas derivadas
+    # métricas derivadas (modo ativo)
     "pcomprou_pct","thr_qvc_pct","thr_atc_pct","gap_qvc","gap_atc","pct_of_atc",
     # eventos meta
     "meta_event_sent","meta_view_sent"
@@ -285,9 +293,9 @@ def sanitize_subid_for_shopee(value: str) -> str:
     return cleaned[:_SUBID_MAXLEN] if cleaned else "na"
 
 def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
-    # Retorna short oficial da Shopee; se falhar, retorna origin_url (fallback)
+    # "Sempre gerar": se não houver credencial, retorna 502 (não entregamos URL longa)
     if not SHOPEE_APP_ID or not SHOPEE_APP_SECRET:
-        return origin_url
+        raise HTTPException(status_code=502, detail="shortlink_unavailable: missing Shopee credentials")
     payload_obj = {
         "query": ("mutation{generateShortLink(input:{"
                   f"originUrl:\"{origin_url}\","
@@ -299,16 +307,15 @@ def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
     signature = hashlib.sha256((SHOPEE_APP_ID + ts + payload + SHOPEE_APP_SECRET).encode("utf-8")).hexdigest()
     headers = {"Authorization": f"SHA256 Credential={SHOPEE_APP_ID}, Timestamp={ts}, Signature={signature}",
                "Content-Type": "application/json"}
+    resp = session.post(SHOPEE_ENDPOINT, headers=headers, data=payload, timeout=(3, 12))
     try:
-        resp = session.post(SHOPEE_ENDPOINT, headers=headers, data=payload, timeout=(2, 10))
         j = resp.json()
-        short = (((j or {}).get("data") or {}).get("generateShortLink") or {}).get("shortLink")
-        if not short:
-            raise ValueError(f"Resposta Shopee sem shortLink: {j}")
-        return short
-    except Exception as e:
-        print(f"[ShopeeShortLink] ERRO: {e}. Fallback para URL numerada.")
-        return origin_url
+    except Exception:
+        raise HTTPException(status_code=502, detail=f"shortlink_error: non-json response status={resp.status_code}")
+    short = (((j or {}).get("data") or {}).get("generateShortLink") or {}).get("shortLink")
+    if not short:
+        raise HTTPException(status_code=502, detail=f"shortlink_error: {j}")
+    return short
 
 # ===================== Geo por IP =====================
 IPAPI_FIELDS = "status,country,region,regionName,city,zip,lat,lon,isp,org,as,query"
@@ -345,26 +352,34 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
         print("[geo_lookup] erro:", e)
         return {"geo_status":"fail"}
 
-# ===================== Predição (CatBoost) =====================
-_model = None
-_model_classes: List[str] = []  # nomes das classes
-_thresholds: Dict[str, float] = {}  # qvc_mid / atc_high
-_thr_qvc = None
-_thr_atc = None
+# ===================== Multi-Model: estado global =====================
+_cb_model = None
+_rf_model = None
+_xgb_model = None
+_stack_model = None  # LogisticRegression
 
+_stack_features: List[str] = []  # ordem esperada p/ stack
+_loaded_libs = {"catboost": False, "xgboost": False}
+
+# meta / features / thresholds
 _FEATURE_NAMES_FROM_META: List[str] = []
 _CAT_IDX_FROM_META: List[int] = []
-
 _TE_STATS = None
 _TE_PRIORS = None
 
-# classe positiva
 _POS_LABEL_NAME = "comprou"
 _POS_LABEL_ID = 1
 _POS_IDX = None
 
+_thresholds_stack = {"qvc_mid": 0.5, "atc_high": 0.5}
+_thresholds_cb    = {"qvc_mid": 0.5, "atc_high": 0.5}
+_thresholds_rf    = None
+_thresholds_xgb   = None
+
+_current_mode = SERVING_MODE_ENV  # "auto" | "cb" | "rf" | "xgb" | "stack"
+
+# ===================== TE helpers =====================
 def _load_te_if_available():
-    """Fallback para ./models/te_stats.json"""
     global _TE_STATS, _TE_PRIORS
     if os.path.exists(TE_STATS_PATH):
         try:
@@ -375,6 +390,17 @@ def _load_te_if_available():
         except Exception as e:
             print("[TE] erro ao carregar te_stats.json:", e)
 
+def _apply_te(colname: str, value: str) -> Tuple[float,float]:
+    if not _TE_STATS or colname not in _TE_STATS:
+        return 0.0, 0.0
+    stats_map = _TE_STATS[colname]
+    prior = float((_TE_PRIORS or {}).get(colname, 0.0))
+    rec = stats_map.get(value)
+    if rec:
+        return float(rec.get("count", 0.0)), float(rec.get("buy_rate", prior))
+    return 0.0, prior
+
+# ===================== feature builders =====================
 def _norm_text(s: str) -> str:
     import unicodedata
     s = (s or "").strip().lower()
@@ -448,16 +474,6 @@ def _extract_dow_from_iso_for_log(t):
     except:
         return time.localtime().tm_wday
 
-def _apply_te(colname: str, value: str) -> Tuple[float,float]:
-    if not _TE_STATS or colname not in _TE_STATS:
-        return 0.0, 0.0
-    stats_map = _TE_STATS[colname]
-    prior = float((_TE_PRIORS or {}).get(colname, 0.0))
-    rec = stats_map.get(value)
-    if rec:
-        return float(rec.get("count", 0.0)), float(rec.get("buy_rate", prior))
-    return 0.0, prior
-
 def _features_full_dict(os_family, device_name, os_version, referrer, utm_original,
                         iso_time=None, geo: Optional[Dict[str,Any]]=None) -> Dict[str, Any]:
     hour = _extract_hour_from_iso_for_log(iso_time)
@@ -484,131 +500,188 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
     device_city_combo   = (f"{device_bucket}__{geo_city}").lower()
     utm_partofday_combo = (f"{utm_original}__{part_of_day}").lower()
 
-    # Target encodings opcionais (iguais às do treino)
+    # TE encoders
     utm_n,  utm_br  = _apply_te("utm_original", str(utm_original or ""))
     ref_n,  ref_br  = _apply_te("ref_domain",   str(ref_domain))
     devb_n, devb_br = _apply_te("device_bucket",str(device_bucket))
     city_n, city_br = _apply_te("geo_city",     str(geo_city))
 
     return {
-        # categóricas
         "device_bucket": device_bucket, "os_family": os_family or "", "part_of_day": part_of_day,
         "geo_macro": geo_macro, "geo_region": geo_region, "geo_city": geo_city, "geo_zip": geo_zip,
         "geo_isp": geo_isp, "geo_org": geo_org, "ref_domain": ref_domain, "utm_original": utm_original or "",
         "device_city_combo": device_city_combo, "utm_partofday_combo": utm_partofday_combo,
-        # numéricas
         "hour": float(hour), "dow": float(dow), "month": float(month),
         "is_weekend": float(is_weekend),
         "os_version_num": float(os_ver_num), "is_android": float(is_android), "is_ios": float(is_ios),
-        # flags auxiliares
         "is_private_ip_flag": 0.0, "is_bot_flag": 0.0, "geo_fail_flag": float(geo_fail_flag), "has_utm_flag": float(1 if utm_original else 0),
-        # target encodings
         "utm_n": float(utm_n), "utm_br": float(utm_br),
         "ref_n": float(ref_n), "ref_br": float(ref_br),
         "devb_n": float(devb_n), "devb_br": float(devb_br),
         "city_n": float(city_n), "city_br": float(city_br),
     }
 
-def _row_in_meta_order(feats_dict: Dict[str, Any]) -> Tuple[List[Any], List[int]]:
-    numeric_defaults = {
-        "hour","dow","month","is_weekend","os_version_num","is_android","is_ios",
-        "utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br",
-        "is_private_ip_flag","is_bot_flag","geo_fail_flag","has_utm_flag"
-    }
-    ordered = []
-    for col in _FEATURE_NAMES_FROM_META:
-        v = feats_dict.get(col)
-        if v is None:
-            v = 0.0 if col in numeric_defaults else ""
-        ordered.append(v)
-    return ordered, _CAT_IDX_FROM_META
-
-def _load_model_if_available():
-    """Carrega CatBoost + meta (features/cats/thresholds) e TE; configura classe positiva."""
-    global _model, _model_classes, _thresholds, _thr_qvc, _thr_atc
+# ===================== loaders =====================
+def _load_models_if_available():
+    """
+    Carrega todos os artefatos disponíveis e prepara:
+      - CatBoost (cb)
+      - RandomForest (rf)
+      - XGBoost (xgb)
+      - Stack (LogReg + stack_meta)
+      - Meta (features, thresholds, TE)
+    """
+    global _cb_model, _rf_model, _xgb_model, _stack_model, _stack_features
     global _FEATURE_NAMES_FROM_META, _CAT_IDX_FROM_META
     global _POS_LABEL_NAME, _POS_LABEL_ID, _POS_IDX
+    global _thresholds_stack, _thresholds_cb, _thresholds_rf, _thresholds_xgb
     global _TE_STATS, _TE_PRIORS
+    global _loaded_libs
 
-    try:
-        from catboost import CatBoostClassifier
-        if os.path.exists(MODEL_PATH):
-            m = CatBoostClassifier()
-            m.load_model(MODEL_PATH)
-            _model = m
-            _model_classes = [str(x) for x in getattr(m, "classes_", [])] or ["0", "1"]
+    _thresholds_stack = {"qvc_mid": 0.5, "atc_high": 0.5}
+    _thresholds_cb    = {"qvc_mid": 0.5, "atc_high": 0.5}
+    _thresholds_rf    = None
+    _thresholds_xgb   = None
+    _stack_features   = []
+    _POS_LABEL_NAME   = "comprou"
+    _POS_LABEL_ID     = 1
+    _POS_IDX          = None
 
-            _POS_LABEL_NAME = "comprou"
+    meta = None
+    if os.path.exists(MODEL_META_PATH):
+        try:
+            meta = json.load(open(MODEL_META_PATH, "r", encoding="utf-8"))
+        except Exception as e:
+            print("[model-meta] erro ao ler:", e)
+
+    if meta:
+        _FEATURE_NAMES_FROM_META = list(meta.get("feature_names", []))
+        _CAT_IDX_FROM_META = list(meta.get("cat_idx", []))
+
+        t_stack = meta.get("thresholds") or {}
+        _thresholds_stack = {
+            "qvc_mid": float(t_stack.get("qvc_mid", 0.5)),
+            "atc_high": float(t_stack.get("atc_high", 0.5)),
+        }
+        t_cb = meta.get("thresholds_cb") or {}
+        _thresholds_cb = {
+            "qvc_mid": float(t_cb.get("qvc_mid", _thresholds_stack["qvc_mid"])),
+            "atc_high": float(t_cb.get("atc_high", _thresholds_stack["atc_high"])),
+        }
+        if "thresholds_rf" in meta:
+            _thresholds_rf = {
+                "qvc_mid": float(meta["thresholds_rf"].get("qvc_mid", 0.5)),
+                "atc_high": float(meta["thresholds_rf"].get("atc_high", 0.5)),
+            }
+        if "thresholds_xgb" in meta:
+            _thresholds_xgb = {
+                "qvc_mid": float(meta["thresholds_xgb"].get("qvc_mid", 0.5)),
+                "atc_high": float(meta["thresholds_xgb"].get("atc_high", 0.5)),
+            }
+
+        global_mapping = meta.get("mapping") or {}
+        try:
+            _POS_LABEL_ID = int(global_mapping.get(meta.get("positive_label") or "comprou", 1))
+        except Exception:
             _POS_LABEL_ID = 1
-            _POS_IDX = None
 
-            meta = None
-            if os.path.exists(MODEL_META_PATH):
-                meta = json.load(open(MODEL_META_PATH, "r", encoding="utf-8"))
+        te = meta.get("te_stats")
+        if isinstance(te, dict):
+            _TE_STATS  = te.get("stats", {})
+            _TE_PRIORS = te.get("priors", {})
+            print("[TE] stats carregadas do model_meta_comprou.json.")
+        else:
+            _load_te_if_available()
+    else:
+        _FEATURE_NAMES_FROM_META = []
+        _CAT_IDX_FROM_META = []
+        _load_te_if_available()
 
-                _FEATURE_NAMES_FROM_META = list(meta.get("feature_names", []))
-                _CAT_IDX_FROM_META = list(meta.get("cat_idx", []))
-
-                # thresholds: preferir thresholds_cb (CatBoost puro), senão thresholds (stack), senão 0.5
-                thr = meta.get("thresholds_cb") or meta.get("thresholds") or {}
-                _thresholds = {"qvc_mid": thr.get("qvc_mid"), "atc_high": thr.get("atc_high")}
-                _thr_qvc = float(_thresholds.get("qvc_mid") or 0.5)
-                _thr_atc = float(_thresholds.get("atc_high") or _thr_qvc or 0.5)
-
-                _POS_LABEL_NAME = meta.get("positive_label") or "comprou"
-                mapping = meta.get("mapping") or {}
-                try:
-                    _POS_LABEL_ID = int(mapping.get(_POS_LABEL_NAME, 1))
-                except Exception:
-                    _POS_LABEL_ID = 1
-
-                te = meta.get("te_stats")
-                if isinstance(te, dict):
-                    _TE_STATS  = te.get("stats", {})
-                    _TE_PRIORS = te.get("priors", {})
-                    print("[TE] stats carregadas do model_meta_comprou.json.")
-                else:
-                    _load_te_if_available()
-            else:
-                _FEATURE_NAMES_FROM_META = []
-                _CAT_IDX_FROM_META = []
-                _thr_qvc = 0.5
-                _thr_atc = 0.5
-                _load_te_if_available()
-
+    # CatBoost
+    _cb_model = None
+    try:
+        if os.path.exists(MODEL_CB_PATH):
+            from catboost import CatBoostClassifier
+            _loaded_libs["catboost"] = True
+            m = CatBoostClassifier()
+            m.load_model(MODEL_CB_PATH)
+            _cb_model = m
             try:
-                classes_raw = list(getattr(_model, "classes_", [0, 1]))
+                classes_raw = list(getattr(_cb_model, "classes_", [0, 1]))
                 _POS_IDX = classes_raw.index(_POS_LABEL_ID) if _POS_LABEL_ID in classes_raw else (1 if len(classes_raw) == 2 else None)
             except Exception:
                 _POS_IDX = 1
-
-            print(f"[model] carregado. thr_qvc={_thr_qvc} thr_atc={_thr_atc} n_feats={len(_FEATURE_NAMES_FROM_META)} pos_id={_POS_LABEL_ID} pos_idx={_POS_IDX} TE_loaded={'yes' if _TE_STATS else 'no'}")
-        else:
-            print("[model] arquivo não encontrado:", MODEL_PATH)
     except Exception as e:
-        print("[model] erro ao carregar:", e)
+        print("[CatBoost] erro ao carregar:", e)
 
-def predict_proba_single(row_values: List[Any], cat_idx: List[int]) -> Dict[str, float]:
-    """Retorna dict com probabilidades por classe (binário ou multi)."""
+    # RF
+    _rf_model = None
+    if os.path.exists(MODEL_RF_PATH):
+        try:
+            import joblib
+            _rf_model = joblib.load(MODEL_RF_PATH)
+        except Exception as e:
+            print("[RF] erro ao carregar:", e)
+
+    # XGB
+    _xgb_model = None
+    try:
+        if os.path.exists(MODEL_XGB_PATH):
+            import xgboost as xgb
+            _loaded_libs["xgboost"] = True
+            model = xgb.XGBClassifier()
+            model.load_model(MODEL_XGB_PATH)
+            _xgb_model = model
+    except Exception as e:
+        print("[XGB] erro ao carregar:", e)
+
+    # Stack
+    _stack_model = None
+    _stack_features = []
+    if os.path.exists(MODEL_STACK_PATH):
+        try:
+            import joblib
+            _stack_model = joblib.load(MODEL_STACK_PATH)
+        except Exception as e:
+            print("[STACK] erro ao carregar stack_model:", e)
+    if os.path.exists(STACK_META_PATH):
+        try:
+            sm = json.load(open(STACK_META_PATH, "r", encoding="utf-8"))
+            _stack_features = list(sm.get("stack_features", []))
+            if "thresholds" in sm:
+                _thresholds_stack = {
+                    "qvc_mid": float(sm["thresholds"].get("qvc_mid", _thresholds_stack["qvc_mid"])),
+                    "atc_high": float(sm["thresholds"].get("atc_high", _thresholds_stack["atc_high"])),
+                }
+        except Exception as e:
+            print("[STACK] erro ao carregar stack_meta:", e)
+
+    print(f"[models] loaded: cb={bool(_cb_model)} rf={bool(_rf_model)} xgb={bool(_xgb_model)} stack={bool(_stack_model)}")
+    print(f"[meta] n_features={len(_FEATURE_NAMES_FROM_META)} cat_idx={_CAT_IDX_FROM_META} pos_id={_POS_LABEL_ID} pos_idx={_POS_IDX}")
+    print(f"[thr] stack={_thresholds_stack} cb={_thresholds_cb} rf={_thresholds_rf} xgb={_thresholds_xgb} TE={'yes' if _TE_STATS else 'no'}")
+
+def _rf_xgb_feature_vector_from(feats_dict: Dict[str, Any]) -> List[float]:
+    cols = ["hour","dow","is_weekend","os_version_num","is_android","is_ios",
+            "utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br"]
+    return [float(feats_dict.get(c, 0.0)) for c in cols]
+
+def _cb_predict_proba(row_values: List[Any], cat_idx: List[int]) -> Dict[str, float]:
     try:
         from catboost import Pool
         import pandas as pd
-        if not _model:
+        if not _cb_model:
             return {}
         X_df  = pd.DataFrame([row_values], columns=_FEATURE_NAMES_FROM_META)
         pool  = Pool(X_df, cat_features=cat_idx)
-        probs = _model.predict_proba(pool)[0]
-
+        probs = _cb_model.predict_proba(pool)[0]
         if len(probs) == 2:
             pos_idx = _POS_IDX if _POS_IDX is not None else 1
             p_pos = float(probs[pos_idx])
             p_neg = float(probs[1 - pos_idx])
             return {"comprou": p_pos, "quase": 0.0, "desinteressado": p_neg}
-
         out = {"comprou": 0.0, "quase": 0.0, "desinteressado": 0.0}
-        for i, cls in enumerate([str(c).lower() for c in _model_classes]):
-            if i >= len(probs):
-                break
+        for i, cls in enumerate([str(c).lower() for c in (getattr(_cb_model, "classes_", []) or [0,1])]):
+            if i >= len(probs): break
             if "comprou" in cls or cls in ("1",):
                 out["comprou"] = float(probs[i])
             elif "quase" in cls:
@@ -617,10 +690,122 @@ def predict_proba_single(row_values: List[Any], cat_idx: List[int]) -> Dict[str,
                 out["desinteressado"] = float(probs[i])
         return out
     except Exception as e:
-        print("[predict] erro:", e)
+        print("[predict-cb] erro:", e)
         return {}
 
-_load_model_if_available()
+def _rf_predict_proba(feats_dict: Dict[str, Any]) -> Optional[float]:
+    if not _rf_model:
+        return None
+    try:
+        import numpy as np
+        X = np.asarray([_rf_xgb_feature_vector_from(feats_dict)], dtype=float)
+        proba = _rf_model.predict_proba(X)[0]
+        return float(proba[1]) if len(proba) >= 2 else None
+    except Exception as e:
+        print("[predict-rf] erro:", e)
+        return None
+
+def _xgb_predict_proba(feats_dict: Dict[str, Any]) -> Optional[float]:
+    if not _xgb_model:
+        return None
+    try:
+        import numpy as np
+        X = np.asarray([_rf_xgb_feature_vector_from(feats_dict)], dtype=float)
+        proba = _xgb_model.predict_proba(X)[0]
+        return float(proba[1]) if len(proba) >= 2 else None
+    except Exception as e:
+        print("[predict-xgb] erro:", e)
+        return None
+
+def _stack_predict_proba(p_cb: Optional[float], p_rf: Optional[float], p_xgb: Optional[float]) -> Optional[float]:
+    if not _stack_model or not _stack_features:
+        return None
+    try:
+        import numpy as np
+        mapping = {"proba_cb": p_cb, "proba_rf": p_rf, "proba_xgb": p_xgb}
+        vec = []
+        for f in _stack_features:
+            v = mapping.get(f)
+            if v is None:
+                return None
+            vec.append(float(v))
+        X = np.asarray([vec], dtype=float)
+        proba = _stack_model.predict_proba(X)[0]
+        return float(proba[1]) if len(proba) >= 2 else None
+    except Exception as e:
+        print("[predict-stack] erro:", e)
+        return None
+
+def _choose_active_mode(forced_mode: Optional[str], p_avail: Dict[str, Optional[float]]) -> str:
+    def available(mode: str) -> bool:
+        if mode == "stack": return p_avail.get("stack") is not None
+        if mode == "cb":    return p_avail.get("cb")    is not None
+        if mode == "xgb":   return p_avail.get("xgb")   is not None
+        if mode == "rf":    return p_avail.get("rf")    is not None
+        return False
+
+    if forced_mode in ("stack","cb","xgb","rf") and available(forced_mode):
+        return forced_mode
+    if _current_mode in ("stack","cb","xgb","rf") and available(_current_mode):
+        return _current_mode
+    for mode in ("stack","cb","xgb","rf"):
+        if available(mode):
+            return mode
+    return "cb"
+
+def _thresholds_for_mode(mode: str) -> Tuple[float,float]:
+    if mode == "stack":
+        return float(_thresholds_stack.get("qvc_mid", 0.5)), float(_thresholds_stack.get("atc_high", 0.5))
+    if mode == "cb":
+        return float(_thresholds_cb.get("qvc_mid", 0.5)), float(_thresholds_cb.get("atc_high", 0.5))
+    if mode == "rf":
+        if _thresholds_rf:
+            return float(_thresholds_rf.get("qvc_mid", 0.5)), float(_thresholds_rf.get("atc_high", 0.5))
+        return float(_thresholds_stack.get("qvc_mid", _thresholds_cb.get("qvc_mid", 0.5))), \
+               float(_thresholds_stack.get("atc_high", _thresholds_cb.get("atc_high", 0.5)))
+    if mode == "xgb":
+        if _thresholds_xgb:
+            return float(_thresholds_xgb.get("qvc_mid", 0.5)), float(_thresholds_xgb.get("atc_high", 0.5))
+        return float(_thresholds_stack.get("qvc_mid", _thresholds_cb.get("qvc_mid", 0.5))), \
+               float(_thresholds_stack.get("atc_high", _thresholds_cb.get("atc_high", 0.5)))
+    return 0.5, 0.5
+
+def _compute_all_probs(feats_dict: Dict[str, Any]) -> Tuple[Dict[str,float], Dict[str, Optional[float]]]:
+    p_cb_map = {"comprou": None, "quase": 0.0, "desinteressado": None}
+    p_cb = None
+    if _cb_model and _FEATURE_NAMES_FROM_META:
+        row_values = []
+        numeric_defaults = {
+            "hour","dow","month","is_weekend","os_version_num","is_android","is_ios",
+            "utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br",
+            "is_private_ip_flag","is_bot_flag","geo_fail_flag","has_utm_flag"
+        }
+        for col in _FEATURE_NAMES_FROM_META:
+            v = feats_dict.get(col)
+            if v is None:
+                v = 0.0 if col in numeric_defaults else ""
+            row_values.append(v)
+        p_cb_map = _cb_predict_proba(row_values, _CAT_IDX_FROM_META) or {"comprou": None, "quase": 0.0, "desinteressado": None}
+        p_cb = p_cb_map.get("comprou")
+
+    p_rf = _rf_predict_proba(feats_dict)
+    p_xgb = _xgb_predict_proba(feats_dict)
+    p_stack = _stack_predict_proba(p_cb, p_rf, p_xgb)
+
+    p_avail = {"cb": p_cb, "rf": p_rf, "xgb": p_xgb, "stack": p_stack}
+    return p_cb_map, p_avail
+
+_load_models_if_available()
+
+# ===================== UTM: identificação do sufixo 'A'
+_UTM_A_SUFFIX_PATTERN = re.compile(r"^(?P<base>.*?)(?P<suf>A\d+)$")  # A maiúsculo
+
+def split_utm_A_suffix(utm: str) -> Tuple[str, str]:
+    s = (utm or "").strip()
+    m = _UTM_A_SUFFIX_PATTERN.match(s)
+    if m:
+        return m.group("base"), m.group("suf")
+    return s, ""
 
 # ===================== GCS flush =====================
 def _day_key(ts: int) -> str:
@@ -671,9 +856,20 @@ def health():
         ttl = None
     return {
         "ok": True, "ts": int(time.time()), "bucket": GCS_BUCKET, "prefix": GCS_PREFIX,
-        "video_id": VIDEO_ID, "model_loaded": bool(_model), "classes": _model_classes,
-        "thr_qvc": _thr_qvc, "thr_atc": _thr_atc, "n_features_meta": len(_FEATURE_NAMES_FROM_META),
-        "cat_idx_meta": _CAT_IDX_FROM_META, "counter_ttl": ttl,
+        "video_id": VIDEO_ID,
+        "models_loaded": {
+            "cb": bool(_cb_model),
+            "rf": bool(_rf_model),
+            "xgb": bool(_xgb_model),
+            "stack": bool(_stack_model),
+        },
+        "serving_mode_current": _current_mode,
+        "meta": {"n_features": len(_FEATURE_NAMES_FROM_META), "cat_idx": _CAT_IDX_FROM_META},
+        "thr_stack": _thresholds_stack,
+        "thr_cb": _thresholds_cb,
+        "thr_rf": _thresholds_rf,
+        "thr_xgb": _thresholds_xgb,
+        "counter_ttl": ttl,
         "te_loaded": bool(_TE_STATS)
     }
 
@@ -685,14 +881,16 @@ def robots():
 def root():
     return PlainTextResponse("OK", status_code=200)
 
-# (Opcional) página de privacidade simples
+# (opcional) /privacy – se quiser, coloque o arquivo privacy.html no mesmo diretório
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy():
     try:
-        with open(os.path.join(BASE_DIR, "privacy.html"), "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return HTMLResponse("<h1>Privacy</h1><p>Documento não encontrado.</p>", status_code=200)
+        privacy_path = os.path.join(BASE_DIR, "privacy.html")
+        with open(privacy_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        return HTMLResponse(content=html, status_code=200, headers={"Cache-Control": "public, max-age=3600"})
+    except FileNotFoundError:
+        return PlainTextResponse("privacy.html não encontrado", status_code=404)
 
 def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str, str]:
     link_q = request.query_params.get("link")
@@ -714,10 +912,9 @@ def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str,
 
 # ===================== Handler principal =====================
 @app.get("/{full_path:path}")
-def track_number_and_redirect(request: Request, full_path: str = Path(...), cat: Optional[str] = Query(None)):
-    # ===== Entrada =====
+def track_number_and_redirect(request: Request, full_path: str = Path(...), cat: Optional[str] = Query(None), mode: Optional[str] = Query(None)):
     try:
-        incoming_url, mode = _build_incoming_from_request(request, full_path)
+        incoming_url, in_mode = _build_incoming_from_request(request, full_path)
     except HTTPException as he:
         return JSONResponse({"ok": False, "error": he.detail}, status_code=he.status_code)
 
@@ -741,54 +938,53 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     if not _is_allowed_long(parts_res.netloc) and not _is_short_domain(parts_res.netloc):
         return JSONResponse({"ok": False, "error": f"Domínio não permitido: {parts_res.netloc}"}, status_code=400)
 
-    # ===== UTM / numbering (preserva termo original; só acrescenta N<contador>) =====
-    outer_uc = request.query_params.get("uc")  # opcional (força UTM base)
-    utm_original_in = outer_uc or extract_utm_content_from_url(incoming_url) or extract_utm_content_from_url(resolved_url) or ""
-    utm_original = (utm_original_in or "").strip()
-    if not utm_original:
-        utm_original = "n"  # base mínima
+    # ===== UTM / identificação do sufixo A =====
+    outer_uc = request.query_params.get("uc")
+    utm_in = outer_uc or extract_utm_content_from_url(incoming_url) or extract_utm_content_from_url(resolved_url) or ""
+    subid_base, subid_suffix = split_utm_A_suffix(utm_in)         # detecta 'A\d+' (A maiúsculo)
+    utm_original = subid_base                                     # base SEM sufixo
+    utm_original_01 = (subid_base + subid_suffix) if subid_suffix else ""  # subid completo (base + A..), senão vazio
 
-    counter_val = incr_counter()
-    utm_final = f"{utm_original}N{counter_val}"
+    # base usada para numerar
+    primary_for_ops = utm_original_01 if utm_original_01 else utm_original
+    clean_base = re.sub(r'[^A-Za-z0-9]', '', primary_for_ops or "") or "n"
+    utm_numbered = f"{clean_base}N{incr_counter()}"
 
-    # Atualiza a URL mantendo a ordem do utm_content e duplica em utm_numbered
-    url_with_utm = _set_utm_content_preserving_order(resolved_url, utm_final)
-    origin_url = add_or_update_query_param(url_with_utm, "utm_numbered", utm_final)
-
-    # Se ainda for short Shopee, resolve para log/consistência (não muda utm_final)
+    # ===== origin_url com numbered na query =====
+    url_with_utm = _set_utm_content_preserving_order(resolved_url, utm_numbered)
+    origin_url = add_or_update_query_param(url_with_utm, "utm_numbered", utm_numbered)
     if _is_short_domain(urlsplit(origin_url).netloc):
         origin_url = _resolve_short_follow(origin_url)
 
-    # ===== content_ids/contents =====
+    # ===== content_ids / contents =====
     content_ids, contents_payload = _build_content_identifiers(origin_url)
 
-    # ===== short oficial (sempre tenta; fallback = origin_url) =====
-    sub_id_api = sanitize_subid_for_shopee(utm_final)
-    dest = generate_short_link(origin_url, sub_id_api)
+    # ===== short oficial (sempre) =====
+    # subId3 = utm_numbered (sanitizado)
+    sub_id_api = sanitize_subid_for_shopee(utm_numbered) or "na"
+    dest = generate_short_link(origin_url, sub_id_api)  # se falhar, gera HTTP 502
 
-    # ===== Cookies / IDs =====
+    # ===== Cookies / IDs persistentes =====
     fbp_cookie = get_cookie_value(cookie_header, "_fbp") or _gen_fbp(ts)
-    fbc_cookie = get_cookie_value(cookie_header, "_fbc")
-    fbc_from_fbclid = build_fbc_from_fbclid(fbclid, creation_ts=ts) if fbclid else None
-    if fbc_from_fbclid:
-        fbc_cookie = fbc_from_fbclid
-    if not fbc_cookie:
-        fbc_cookie = _gen_fbc_from_fbp(fbp_cookie, ts)
-
+    fbc_cookie = get_cookie_value(cookie_header, "_fbc") or _gen_fbc_from_fbp(fbp_cookie, ts)
+    if fbclid:
+        fbc_cookie = build_fbc_from_fbclid(fbclid, creation_ts=ts) or fbc_cookie
     eid_cookie = get_cookie_value(cookie_header, "_eid") or _sha256_lower(fbp_cookie)
 
-    # snapshot p/ consulta posterior
-    r.setex(f"{USERDATA_KEY_PREFIX}{utm_final}", USERDATA_TTL_SECONDS, json.dumps({
+    r.setex(f"{USERDATA_KEY_PREFIX}{utm_numbered}", USERDATA_TTL_SECONDS, json.dumps({
         "ip": ip_addr, "ua": user_agent, "referrer": referrer,
         "event_source_url": origin_url, "short_link": dest,
-        "vc_time": ts, "utm_original": utm_original, "utm_numbered": utm_final,
-        "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_cookie, "eid": eid_cookie, "mode": mode
+        "vc_time": ts,
+        "utm_original": utm_original,
+        "utm_original_01": utm_original_01,
+        "subid_base": subid_base,
+        "subid_full": utm_original_01 or subid_base,
+        "utm_numbered": utm_numbered,
+        "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_cookie, "eid": eid_cookie, "mode": in_mode
     }))
 
-    # ===== external_id =====
+    # ===== external_id / user_data_meta =====
     external_id = eid_cookie or _sha256_lower(f"{user_agent}|{ip_addr}")
-
-    # ===== user data meta =====
     user_data_meta = {
         "client_ip_address": ip_addr,
         "client_user_agent": user_agent,
@@ -797,29 +993,46 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         **({"fbc": fbc_cookie} if fbc_cookie else {})
     }
 
-    # ===== Geo + Features + Pred =====
+    # ===== Geo + Features =====
     geo = geo_lookup(ip_addr)
-    p_map = {"comprou": 0.0, "quase": 0.0, "desinteressado": 0.0}
-    pred_label = "desinteressado"
-    is_qvc_flag = 0
-    is_atc_flag = 0
+    feats_dict = _features_full_dict(os_family, device_name, os_version, referrer, utm_original, iso_time, geo)
 
-    try:
-        feats_dict = _features_full_dict(os_family, device_name, os_version, referrer, utm_original, iso_time, geo)
-        if _model and _FEATURE_NAMES_FROM_META:
-            row_values, cat_idx = _row_in_meta_order(feats_dict)
-            probs = predict_proba_single(row_values, cat_idx)
-            for k in list(probs.keys()):
-                p_map[k] = float(probs[k])
+    # ===== Predições =====
+    p_cb_map, p_avail = _compute_all_probs(feats_dict)
+    p_cb  = p_avail.get("cb")
+    p_rf  = p_avail.get("rf")
+    p_xgb = p_avail.get("xgb")
+    p_stack = p_avail.get("stack")
 
-            p_c = float(p_map.get("comprou", 0.0))
-            is_qvc_flag = 1 if p_c >= (_thr_qvc or 0.5) else 0
-            is_atc_flag = 1 if p_c >= (_thr_atc or _thr_qvc or 0.5) else 0
-            pred_label = "comprou" if is_atc_flag else ("comprou_qvc" if is_qvc_flag else "desinteressado")
-    except Exception as e:
-        print("[predict] erro:", e)
+    forced_mode = (mode or "").strip().lower() if mode else None
+    active_mode = _choose_active_mode(forced_mode, p_avail)
 
-    # ===== Meta: ViewContent sempre =====
+    if active_mode == "stack" and p_stack is not None:
+        p_c = float(p_stack)
+        thr_q, thr_a = _thresholds_for_mode("stack")
+        p_map = {"comprou": p_c, "quase": 0.0, "desinteressado": 1.0 - p_c}
+    elif active_mode == "cb" and p_cb is not None:
+        p_c = float(p_cb)
+        thr_q, thr_a = _thresholds_for_mode("cb")
+        p_map = {"comprou": p_c, "quase": float(p_cb_map.get("quase", 0.0)), "desinteressado": float(p_cb_map.get("desinteressado", 1.0 - p_c))}
+    elif active_mode == "xgb" and p_xgb is not None:
+        p_c = float(p_xgb)
+        thr_q, thr_a = _thresholds_for_mode("xgb")
+        p_map = {"comprou": p_c, "quase": 0.0, "desinteressado": 1.0 - p_c}
+    elif active_mode == "rf" and p_rf is not None:
+        p_c = float(p_rf)
+        thr_q, thr_a = _thresholds_for_mode("rf")
+        p_map = {"comprou": p_c, "quase": 0.0, "desinteressado": 1.0 - p_c}
+    else:
+        p_c, thr_q, thr_a = 0.0, 0.5, 0.5
+        p_map = {"comprou": 0.0, "quase": 0.0, "desinteressado": 1.0}
+        active_mode = "none"
+
+    is_qvc_flag = 1 if p_c >= thr_q else 0
+    is_atc_flag = 1 if p_c >= thr_a else 0
+    pred_label = f"{'comprou' if is_atc_flag else ('comprou_qvc' if is_qvc_flag else 'desinteressado')}"
+
+    # ===== Meta: ViewContent =====
     meta_sent = ""
     meta_view = ""
     if META_PIXEL_ID and META_ACCESS_TOKEN:
@@ -827,13 +1040,13 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             "data": [{
                 "event_name": "ViewContent",
                 "event_time": ts,
-                "event_id": utm_final,
+                "event_id": utm_numbered,
                 "action_source": "website",
                 "event_source_url": origin_url,
                 "user_data": user_data_meta,
                 "custom_data": {
                     "currency": "BRL",
-                    "value": 0.0,
+                    "value": 0,
                     "content_type": "product",
                     "content_ids": content_ids,
                     "contents": contents_payload
@@ -851,19 +1064,19 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             print("[meta] VC exceção:", e)
             meta_view = "error"
 
-    # ===== Meta: AddToCart se p>=thr_atc =====
+    # ===== Meta: AddToCart =====
     if META_PIXEL_ID and META_ACCESS_TOKEN and is_atc_flag == 1:
         atc_payload = {
             "data": [{
                 "event_name": "AddToCart",
                 "event_time": ts,
-                "event_id": utm_final,
+                "event_id": utm_numbered,
                 "action_source": "website",
                 "event_source_url": origin_url,
                 "user_data": user_data_meta,
                 "custom_data": {
                     "currency": "BRL",
-                    "value": 0.0,
+                    "value": 0,
                     "content_type": "product",
                     "content_ids": content_ids,
                     "contents": contents_payload
@@ -890,10 +1103,6 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     is_ios_log     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
     part_of_day_log = _part_of_day_from_hour(hour_log)
 
-    p_c = float(p_map.get("comprou", 0.0))
-    thr_q = float(_thr_qvc or 0.5)
-    thr_a = float(_thr_atc or thr_q or 0.5)
-
     pcomprou_pct = p_c * 100.0
     thr_qvc_pct  = thr_q * 100.0
     thr_atc_pct  = thr_a * 100.0
@@ -904,14 +1113,14 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     csv_row = [
         ts, iso_time, ip_addr, user_agent, referrer,
         incoming_url, resolved_url, origin_url, (cat or ""),
-        utm_original, utm_final, fbclid or "", fbp_cookie or "", fbc_cookie or "",
+        utm_original, utm_original_01, subid_base, (utm_original_01 or subid_base), utm_numbered, fbclid or "", fbp_cookie or "", fbc_cookie or "",
         device_name, os_family, os_version,
         geo.get("geo_status",""), geo.get("geo_country",""), geo.get("geo_region",""), geo.get("geo_state",""),
         geo.get("geo_city",""), geo.get("geo_zip",""), geo.get("geo_lat",""), geo.get("geo_lon",""),
         geo.get("geo_isp",""), geo.get("geo_org",""), geo.get("geo_asn",""),
         part_of_day_log, hour_log, dow_log, ref_domain_log, os_version_num_log, is_android_log, is_ios_log,
-        pred_label, p_c, float(p_map.get("quase",0.0)), float(p_map.get("desinteressado",0.0)),
-        thr_q, thr_a, int(is_qvc_flag), int(is_atc_flag),
+        pred_label, float(p_map.get("comprou",0.0)), float(p_map.get("quase",0.0)), float(p_map.get("desinteressado",0.0)),
+        float(thr_q), float(thr_a), int(is_qvc_flag), int(is_atc_flag),
         pcomprou_pct, thr_qvc_pct, thr_atc_pct, gap_qvc, gap_atc, pct_of_atc,
         meta_sent, meta_view
     ]
@@ -941,6 +1150,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             "Set-Cookie": ", ".join(set_cookie_headers)
         })
 
+    # Importante: entregamos o SHORT sempre (redirect para o short).
     return RedirectResponse(dest, status_code=302, headers={
         "Cache-Control": "no-store, max-age=0",
         "Set-Cookie": ", ".join(set_cookie_headers)
@@ -951,143 +1161,174 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 def admin_page():
     return """
     <html>
-      <head><meta charset="utf-8"><title>Upload do Modelo</title></head>
-      <body style="font-family: sans-serif; max-width: 640px; margin: 40px auto;">
-        <h2>Enviar modelos (CatBoost principal; extras opcionais)</h2>
-        <p><b>Arquivos aceitos:</b></p>
+      <head><meta charset="utf-8"><title>Upload do Modelo (Multi-Model)</title></head>
+      <body style="font-family: sans-serif; max-width: 720px; margin: 40px auto;">
+        <h2>Enviar modelos</h2>
+        <p><b>Arquivos aceitos (opcionais):</b></p>
         <ul>
-          <li><code>model_comprou.cbm</code> (obrigatório p/ CatBoost)</li>
-          <li><code>model_meta_comprou.json</code> (meta/thresholds/TE)</li>
-          <li><code>cb_full.cbm</code> (opcional)</li>
-          <li><code>rf.joblib</code> (opcional)</li>
-          <li><code>xgb.json</code> (opcional; precisa ser JSON válido)</li>
-          <li><code>stack_model.joblib</code> (opcional)</li>
-          <li><code>stack_meta.json</code> (opcional; JSON válido)</li>
-          <li><code>te_stats.json</code> (opcional)</li>
+          <li><code>model_comprou.cbm</code> (CatBoost)</li>
+          <li><code>model_meta_comprou.json</code> (meta, thresholds, TE)</li>
+          <li><code>rf.joblib</code> (RandomForest)</li>
+          <li><code>xgb.json</code> (XGBoost)</li>
+          <li><code>stack_model.joblib</code> (LogReg do stack)</li>
+          <li><code>stack_meta.json</code> (ordem das features do stack)</li>
+          <li><code>te_stats.json</code> (fallback do Target Encoding)</li>
         </ul>
-        <form method="post" action="/admin/upload_model" enctype="multipart/form-data">
-          <div>Token (X-Admin-Token): <input name="x_admin_token" type="password" required /></div><br/>
-          <div>model_comprou.cbm: <input name="model" type="file" /></div><br/>
+        <form method="post" action="/admin/upload_models_bundle" enctype="multipart/form-data">
+          <div>Token (X-Admin-Token): <input name="token" type="password" required /></div><br/>
+          <div>model_comprou.cbm: <input name="cb" type="file" /></div><br/>
           <div>model_meta_comprou.json: <input name="meta" type="file" /></div><br/>
-          <div>cb_full.cbm: <input name="cb_model" type="file" /></div><br/>
-          <div>rf.joblib: <input name="rf_model" type="file" /></div><br/>
-          <div>xgb.json: <input name="xgb_model" type="file" /></div><br/>
-          <div>stack_model.joblib: <input name="stack_model" type="file" /></div><br/>
+          <div>rf.joblib: <input name="rf" type="file" /></div><br/>
+          <div>xgb.json: <input name="xgb" type="file" /></div><br/>
+          <div>stack_model.joblib: <input name="stack" type="file" /></div><br/>
           <div>stack_meta.json: <input name="stack_meta" type="file" /></div><br/>
           <div>te_stats.json: <input name="te" type="file" /></div><br/>
           <button type="submit">Enviar</button>
         </form>
-        <p>Depois de enviar, abra <code>/health</code> para conferir thresholds e TE loaded.</p>
+        <p>Depois de enviar, abra <code>/health</code> para conferir modelos e thresholds carregados.</p>
       </body>
     </html>
     """
 
-def _save_upload_once(fp: str, data: bytes):
-    with open(fp, "wb") as out:
-        out.write(data)
+@app.post("/admin/upload_models_bundle")
+async def admin_upload_models_bundle(
+    token: str = Form(...),
+    cb: UploadFile = File(None),
+    meta: UploadFile = File(None),
+    rf: UploadFile = File(None),
+    xgb: UploadFile = File(None),
+    stack: UploadFile = File(None),
+    stack_meta: UploadFile = File(None),
+    te: UploadFile = File(None),
+):
+    if token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    try:
+        if cb:
+            data = await cb.read()
+            open(MODEL_CB_PATH, "wb").write(data)
+        if meta:
+            data = await meta.read()
+            # parse condicional (só se não vazio)
+            if data and data.strip():
+                json.loads(data.decode("utf-8"))
+            open(MODEL_META_PATH, "wb").write(data)
+        if rf:
+            data = await rf.read()
+            open(MODEL_RF_PATH, "wb").write(data)
+        if xgb:
+            data = await xgb.read()
+            # xgb.json deve ser JSON válido
+            if data and data.strip():
+                json.loads(data.decode("utf-8"))
+            open(MODEL_XGB_PATH, "wb").write(data)
+        if stack:
+            data = await stack.read()
+            open(MODEL_STACK_PATH, "wb").write(data)
+        if stack_meta:
+            data = await stack_meta.read()
+            if data and data.strip():
+                json.loads(data.decode("utf-8"))
+            open(STACK_META_PATH, "wb").write(data)
+        if te:
+            data = await te.read()
+            open(TE_STATS_PATH, "wb").write(data)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="JSON inválido em algum artefato .json")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"falha ao salvar arquivo(s): {e}")
+
+    _load_models_if_available()
+    return {
+        "ok": True,
+        "models_loaded": {"cb": bool(_cb_model), "rf": bool(_rf_model), "xgb": bool(_xgb_model), "stack": bool(_stack_model)},
+        "thr_stack": _thresholds_stack, "thr_cb": _thresholds_cb, "thr_rf": _thresholds_rf, "thr_xgb": _thresholds_xgb,
+        "te_loaded": bool(_TE_STATS)
+    }
+
+@app.post("/admin/upload_model_simple")
+async def admin_upload_model_simple(token: str = Form(...), model: UploadFile = File(...), meta: UploadFile = File(None)):
+    if token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    try:
+        open(MODEL_CB_PATH, "wb").write(await model.read())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"falha ao salvar model: {e}")
+    if meta:
+        try:
+            data = await meta.read()
+            if data and data.strip():
+                json.loads(data.decode("utf-8"))
+            open(MODEL_META_PATH, "wb").write(data)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="meta_file inválido (JSON)")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"falha ao salvar meta: {e}")
+    _load_models_if_available()
+    return {"ok": True, "models_loaded": {"cb": bool(_cb_model)}, "thr_cb": _thresholds_cb, "te_loaded": bool(_TE_STATS)}
 
 @app.post("/admin/upload_model")
 async def admin_upload_model(
-    # compat com seu uploader (usa chaves variadas)
     model_file: UploadFile = File(None), meta_file: UploadFile = File(None),
     model: UploadFile = File(None), meta: UploadFile = File(None),
-    cb_model: UploadFile = File(None),
-    rf_model: UploadFile = File(None),
-    xgb_model: UploadFile = File(None),
-    stack_model: UploadFile = File(None),
-    stack_meta: UploadFile = File(None),
+    rf: UploadFile = File(None), xgb: UploadFile = File(None),
+    stack: UploadFile = File(None), stack_meta: UploadFile = File(None),
     te: UploadFile = File(None),
     x_admin_token: str = Header(None)
 ):
     if x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
-
-    saved = {}
-
-    # --- CatBoost principal ---
-    up_model = model_file or model
-    if up_model:
-        try:
-            data = await up_model.read()
-            if not data:
-                raise ValueError("model vazio")
-            _save_upload_once(MODEL_PATH, data)
-            saved["model"] = MODEL_PATH
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"falha ao salvar model: {e}")
-
-    # --- Meta JSON ---
-    up_meta = meta_file or meta
-    if up_meta:
-        try:
-            data = await up_meta.read()
-            if data:
-                # valida JSON
-                _ = json.loads(data.decode("utf-8"))
-                _save_upload_once(MODEL_META_PATH, data)
-                saved["meta"] = MODEL_META_PATH
-            else:
-                raise ValueError("meta_file vazio")
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
-
-    # --- Extras opcionais (todos leitura única; JSON só valida se não-vazio) ---
     try:
-        if cb_model:
-            data = await cb_model.read()
-            if data:
-                _save_upload_once(CB_FULL_PATH, data)
-                saved["cb_model"] = CB_FULL_PATH
+        up_model = model_file or model
+        if up_model:
+            open(MODEL_CB_PATH, "wb").write(await up_model.read())
 
-        if rf_model:
-            data = await rf_model.read()
-            if data:
-                _save_upload_once(MODEL_RF_PATH, data)
-                saved["rf"] = MODEL_RF_PATH
-
-        if xgb_model:
-            data = await xgb_model.read()
-            if data:
-                # precisa ser JSON válido
+        up_meta = meta_file or meta
+        if up_meta:
+            data = await up_meta.read()
+            if data and data.strip():
                 json.loads(data.decode("utf-8"))
-                _save_upload_once(MODEL_XGB_PATH, data)
-                saved["xgb"] = MODEL_XGB_PATH
+            open(MODEL_META_PATH, "wb").write(data)
 
-        if stack_model:
-            data = await stack_model.read()
-            if data:
-                _save_upload_once(MODEL_STACK_PATH, data)
-                saved["stack_model"] = MODEL_STACK_PATH
+        if rf:
+            open(MODEL_RF_PATH, "wb").write(await rf.read())
+
+        if xgb:
+            data = await xgb.read()
+            if data and data.strip():
+                json.loads(data.decode("utf-8"))
+            open(MODEL_XGB_PATH, "wb").write(data)
+
+        if stack:
+            open(MODEL_STACK_PATH, "wb").write(await stack.read())
 
         if stack_meta:
             data = await stack_meta.read()
-            if data:
+            if data and data.strip():
                 json.loads(data.decode("utf-8"))
-                _save_upload_once(STACK_META_PATH, data)
-                saved["stack_meta"] = STACK_META_PATH
+            open(STACK_META_PATH, "wb").write(data)
 
         if te:
-            data = await te.read()
-            if data:
-                # te_stats é JSON
-                json.loads(data.decode("utf-8"))
-                _save_upload_once(TE_STATS_PATH, data)
-                saved["te"] = TE_STATS_PATH
-
-    except json.JSONDecodeError as je:
-        raise HTTPException(status_code=400, detail=f"JSON inválido em arquivo extra: {je}")
+            open(TE_STATS_PATH, "wb").write(await te.read())
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="JSON inválido em algum artefato .json")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"falha ao salvar arquivo(s) extras: {e}")
 
-    # (re)carrega modelo/thresholds/TE se um dos principais mudou
-    if "model" in saved or "meta" in saved or "te" in saved:
-        _load_model_if_available()
-
+    _load_models_if_available()
     return {
         "ok": True,
-        "saved": saved,
-        "model_loaded": bool(_model),
-        "thr_qvc": _thr_qvc, "thr_atc": _thr_atc,
+        "saved": {
+            "cb": MODEL_CB_PATH if up_model else None,
+            "meta": MODEL_META_PATH if (meta_file or meta) else None,
+            "rf": MODEL_RF_PATH if rf else None,
+            "xgb": MODEL_XGB_PATH if xgb else None,
+            "stack": MODEL_STACK_PATH if stack else None,
+            "stack_meta": STACK_META_PATH if stack_meta else None,
+            "te": TE_STATS_PATH if te else None
+        },
+        "models_loaded": {"cb": bool(_cb_model), "rf": bool(_rf_model), "xgb": bool(_xgb_model), "stack": bool(_stack_model)},
+        "thr_stack": _thresholds_stack, "thr_cb": _thresholds_cb, "thr_rf": _thresholds_rf, "thr_xgb": _thresholds_xgb,
         "te_loaded": bool(_TE_STATS)
     }
 
@@ -1095,8 +1336,24 @@ async def admin_upload_model(
 def admin_reload_model(x_admin_token: str = Header(None)):
     if x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
-    _load_model_if_available()
-    return {"ok": True, "model_loaded": bool(_model), "thr_qvc": _thr_qvc, "thr_atc": _thr_atc, "te_loaded": bool(_TE_STATS)}
+    _load_models_if_available()
+    return {
+        "ok": True,
+        "models_loaded": {"cb": bool(_cb_model), "rf": bool(_rf_model), "xgb": bool(_xgb_model), "stack": bool(_stack_model)},
+        "thr_stack": _thresholds_stack, "thr_cb": _thresholds_cb, "thr_rf": _thresholds_rf, "thr_xgb": _thresholds_xgb,
+        "te_loaded": bool(_TE_STATS)
+    }
+
+@app.post("/admin/set_mode")
+def admin_set_mode(mode: str = Query(...), x_admin_token: str = Header(None)):
+    global _current_mode
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    m = (mode or "").strip().lower()
+    if m not in ("auto","cb","rf","xgb","stack"):
+        raise HTTPException(status_code=400, detail="invalid_mode")
+    _current_mode = m
+    return {"ok": True, "serving_mode_current": _current_mode}
 
 @app.get("/admin/flush")
 def admin_flush(token: str):
