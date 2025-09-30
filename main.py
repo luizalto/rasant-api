@@ -3,14 +3,18 @@
 FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI)
 (versão mesclada e corrigida) — UTMContent / UTMContent01 / UTMNumered
 
-Mudanças:
+Mudanças principais deste build:
 - Short-link: SEMPRE via API oficial da Shopee; se falhar (credencial/erro), 502 (não entrega URL longa).
+- Normalização forte do utm_content:
+  * Corta qualquer traço de URL/host (http, https, www., *.com, *.com.br etc).
+  * Remove “cascas” (--, espaços) e mantém apenas [A-Za-z0-9-].
+  * Aceita sufixo '-A\\d+' (com hífen) para compor UTMContent01.
 - UTM:
-  * UTMContent     = base (até antes do sufixo 'A\d+').
-  * UTMContent01   = completo com 'A\d+' (se houver), senão vazio.
-  * UTMNumered     = (UTMContent01 se existir, senão UTMContent) + 'N' + contador infinito.
+  * UTMContent     = base (após normalização).
+  * UTMContent01   = base + '-A\\d+' (se houver), senão vazio.
+  * UTMNumered     = (UTMContent01 se existir, senão UTMContent) + 'N' + contador infinito (preserva hífen).
   * Apenas substitui o valor de utm_content na URL (NÃO adiciona 'utm_numbered=').
-  * subId3 (API Shopee) = UTMNumered (sanitizado).
+  * subId3 (API Shopee) = sanitize(UTMNumered) → apenas alfanumérico, respeitando limite de tamanho.
 - Redis/CSV: mantém colunas utm_original (UTMContent), utm_original_01 (UTMContent01), utm_numbered (UTMNumered).
 """
 
@@ -108,9 +112,9 @@ LONG_ALLOWED  = (".shopee.com.br", ".shopee.com", ".xiapiapp.com")
 
 def _fix_scheme(url: str) -> str:
     if url.startswith("https:/") and not url.startswith("https://"):
-        return "https://" + url[len("https:/"):]
+        return "https://" + url[len("https:/") :]
     if url.startswith("http:/") and not url.startswith("http://"):
-        return "http://" + url[len("http:/"):]
+        return "http://" + url[len("http:/") :]
     return url
 
 def _is_short_domain(domain: str) -> bool:
@@ -269,6 +273,45 @@ def extract_utm_content_from_url(u: str) -> str:
         return (q.get("utm_content") or [""])[0]
     except:
         return ""
+
+# === Helpers de normalização de UTM (NOVA LÓGICA) ===
+_URL_CUT_RE = re.compile(r'(https?:\/\/|www\.|[a-z0-9-]+\.(?:com|br|net|org)(?:\/|$))', re.I)
+
+def _normalize_utm_content(raw: str) -> Tuple[str, str]:
+    """
+    Retorna (UTMContent, UTMContent01).
+    - Corta qualquer URL/host que apareça no valor.
+    - Mantém apenas [A-Za-z0-9-].
+    - Suporta sufixo '-A\\d+' para compor o UTMContent01.
+    """
+    s = (raw or "").strip()
+
+    # Corta na 1ª marca de URL (https://, http://, www., domínio .com/.com.br etc)
+    m = _URL_CUT_RE.search(s)
+    if m:
+        s = s[:m.start()]
+
+    # Defesa extra contra "http" colado
+    idx_http = s.lower().find("http")
+    if idx_http != -1:
+        s = s[:idx_http]
+
+    # Limpeza de cascas e whitelisting
+    s = re.sub(r'^[\s\-_]+|[\s\-_]+$', '', s)
+    s = re.sub(r'[^A-Za-z0-9\-]+', '', s)
+    s = re.sub(r'-{2,}', '-', s)
+
+    # Base + sufixo opcional "-A\\d+"
+    m2 = re.match(r'^(?P<base>[A-Za-z0-9\-]*?)(?:-?(?P<suf>A\d+))?$', s)
+    if not m2:
+        return s, ""
+
+    base = (m2.group("base") or "").strip("-")
+    suf  = m2.group("suf") or ""
+
+    utm_content    = base
+    utm_content_01 = f"{base}-{suf}" if suf else ""
+    return utm_content, utm_content_01
 
 def resolve_short_link(short_url: str) -> Tuple[str, Dict[str, Optional[str]]]:
     current = short_url
@@ -798,16 +841,6 @@ def _compute_all_probs(feats_dict: Dict[str, Any]) -> Tuple[Dict[str,float], Dic
 
 _load_models_if_available()
 
-# ===================== UTM: identificação do sufixo 'A'
-_UTM_A_SUFFIX_PATTERN = re.compile(r"^(?P<base>.*?)(?P<suf>A\d+)$")  # A maiúsculo
-
-def split_utm_A_suffix(utm: str) -> Tuple[str, str]:
-    s = (utm or "").strip()
-    m = _UTM_A_SUFFIX_PATTERN.match(s)
-    if m:
-        return m.group("base"), m.group("suf")
-    return s, ""
-
 # ===================== GCS flush =====================
 def _day_key(ts: int) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts))
@@ -946,23 +979,18 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     utm_raw = extract_utm_content_from_url(resolved_url) or \
               extract_utm_content_from_url(incoming_url) or \
               (outer_uc or "")
-    utm_raw = (utm_raw or "").strip()
 
-    # 2) Separa base e sufixo 'A\d+' (A maiúsculo) — NÃO filtra para operação
-    subid_base, subid_suffix = split_utm_A_suffix(utm_raw)
+    # 2) Normaliza e separa (corta URLs, mantém só [A-Za-z0-9-], aceita sufixo '-A\\d+')
+    utm_original, utm_original_01 = _normalize_utm_content(utm_raw)
 
-    # 3) Mapas lógicos solicitados
-    utm_original    = subid_base                                  # == UTMContent (base)
-    utm_original_01 = (subid_base + subid_suffix) if subid_suffix else ""  # == UTMContent01 (com A..), ou vazio
-
-    # 4) Semente p/ numeração: prioriza UTMContent01; se vazio, usa UTMContent
+    # 3) Semente p/ numeração: prioriza UTMContent01; se vazio, usa UTMContent
     seed_for_numbering = (utm_original_01 or utm_original)
 
-    # 5) UTMNumered = seed limpa + 'N' + contador infinito
-    seed_clean   = re.sub(r'[^A-Za-z0-9]', '', seed_for_numbering) or "n"
-    utm_numbered = f"{seed_clean}N{incr_counter()}"   # == UTMNumered
+    # 4) UTMNumered = seed (com hífen permitido) + 'N' + contador
+    seed_clean_for_numbered = re.sub(r'[^A-Za-z0-9\-]', '', seed_for_numbering) or "n"
+    utm_numbered = f"{seed_clean_for_numbered}N{incr_counter()}"
 
-    # 6) Substitui APENAS o valor de utm_content; NÃO adiciona 'utm_numbered=' na query
+    # 5) Substitui APENAS o valor de utm_content; NÃO adiciona 'utm_numbered=' na query
     origin_url = _set_utm_content_preserving_order(resolved_url, utm_numbered)
     if _is_short_domain(urlsplit(origin_url).netloc):
         origin_url = _resolve_short_follow(origin_url)
@@ -970,7 +998,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     # ===== content_ids / contents =====
     content_ids, contents_payload = _build_content_identifiers(origin_url)
 
-    # ===== Short oficial (sempre) — subId3 = UTMNumered (sanitizado) =====
+    # ===== Short oficial (sempre) — subId3 = UTMNumered (sanitizado)
     sub_id_api = sanitize_subid_for_shopee(utm_numbered) or "na"
     dest = generate_short_link(origin_url, sub_id_api)  # se falhar, gera HTTP 502
 
@@ -987,9 +1015,9 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         "vc_time": ts,
         # === colunas pedidas ===
         "utm_original": utm_original,           # UTMContent (base)
-        "utm_original_01": utm_original_01,     # UTMContent01 (com A.. ou vazio)
-        "subid_base": subid_base,
-        "subid_full": (utm_original_01 or subid_base),
+        "utm_original_01": utm_original_01,     # UTMContent01 (com -A.. ou vazio)
+        "subid_base": utm_original,
+        "subid_full": (utm_original_01 or utm_original),
         "utm_numbered": utm_numbered,           # UTMNumered (aplicado em utm_content e subId3)
         # =======================
         "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_cookie, "eid": eid_cookie, "mode": in_mode
@@ -1125,7 +1153,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     csv_row = [
         ts, iso_time, ip_addr, user_agent, referrer,
         incoming_url, resolved_url, origin_url, (cat or ""),
-        utm_original, utm_original_01, subid_base, (utm_original_01 or subid_base), utm_numbered, fbclid or "", fbp_cookie or "", fbc_cookie or "",
+        utm_original, utm_original_01, utm_original, (utm_original_01 or utm_original), utm_numbered, fbclid or "", fbp_cookie or "", fbc_cookie or "",
         device_name, os_family, os_version,
         geo.get("geo_status",""), geo.get("geo_country",""), geo.get("geo_region",""), geo.get("geo_state",""),
         geo.get("geo_city",""), geo.get("geo_zip",""), geo.get("geo_lat",""), geo.get("geo_lon",""),
@@ -1201,6 +1229,60 @@ def admin_page():
       </body>
     </html>
     """
+
+@app.post("/admin/upload_models_bundle")
+async def admin_upload_models_bundle(
+    token: str = Form(...),
+    cb: UploadFile = File(None),
+    meta: UploadFile = File(None),
+    rf: UploadFile = File(None),
+    xgb: UploadFile = File(None),
+    stack: UploadFile = File(None),
+    stack_meta: UploadFile = File(None),
+    te: UploadFile = File(None),
+):
+    if token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    try:
+        if cb:
+            data = await cb.read()
+            open(MODEL_CB_PATH, "wb").write(data)
+        if meta:
+            data = await meta.read()
+            if data and data.strip():
+                json.loads(data.decode("utf-8"))
+            open(MODEL_META_PATH, "wb").write(data)
+        if rf:
+            data = await rf.read()
+            open(MODEL_RF_PATH, "wb").write(data)
+        if xgb:
+            data = await xgb.read()
+            if data and data.strip():
+                json.loads(data.decode("utf-8"))
+            open(MODEL_XGB_PATH, "wb").write(data)
+        if stack:
+            data = await stack.read()
+            open(MODEL_STACK_PATH, "wb").write(data)
+        if stack_meta:
+            data = await stack_meta.read()
+            if data and data.strip():
+                json.loads(data.decode("utf-8"))
+            open(STACK_META_PATH, "wb").write(data)
+        if te:
+            data = await te.read()
+            open(TE_STATS_PATH, "wb").write(data)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="JSON inválido em algum artefato .json")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"falha ao salvar arquivo(s): {e}")
+
+    _load_models_if_available()
+    return {
+        "ok": True,
+        "models_loaded": {"cb": bool(_cb_model), "rf": bool(_rf_model), "xgb": bool(_xgb_model), "stack": bool(_stack_model)},
+        "thr_stack": _thresholds_stack, "thr_cb": _thresholds_cb, "thr_rf": _thresholds_rf, "thr_xgb": _thresholds_xgb,
+        "te_loaded": bool(_TE_STATS)
+    }
 
 @app.post("/admin/upload_models_bundle")
 async def admin_upload_models_bundle(
