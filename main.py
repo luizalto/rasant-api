@@ -1,28 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI) + TikTok Events API
-(versão consolidada) — UTMContent / UTMContent01 / UTMNumered
-
-Correções:
-- TikTok: usa `event_time` (antes estava `timestamp`) e eventos válidos ("ViewContent", "AddToCart").
-- AddToCart do TikTok segue a MESMA regra do Meta (gatilho pelo mesmo `is_atc_flag`).
-- Removida duplicação no carregamento XGBoost.
-- Removido `global _thresholds_stack` redundante dentro de bloco (causava SyntaxError).
-- Ajustes finos de indentação.
-
-REQUISITOS:
-- NÃO resolver/abrir short-link da Shopee antes de gerar o short oficial (SKIP_RESOLVE=1 por padrão).
-- A UTM deve vir do parâmetro `uc` da querystring.
-- A partir de `uc`, derivar:
-  * UTMContent     = base (sem URL colada; apenas [A-Za-z0-9-]).
-  * UTMContent01   = base + '-A\\d+' (se houver esse sufixo).
-  * UTMNumered     = (UTMContent01 se existir, senão UTMContent) + 'N' + contador infinito.
-- Apenas substituir o valor de utm_content na URL ALVO (NÃO criar "utm_numbered=").
-- subId3 (API Shopee) = UTMNumered (sanitizado p/ alfanumérico).
-- Predição usa **somente** utm_original (UTMContent base).
-
-OBS:
-- Para reativar a resolução de short antes, defina SKIP_RESOLVE=0.
+(versão consolidada e corrigida)
+- TikTok: ViewContent e AddToCart com content_id e value numérico (mesmo requisito do Meta).
+- Sem duplicações, sem 'global usado antes da declaração', sem erros de indentação.
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -73,7 +54,6 @@ TIKTOK_PIXEL_ID       = os.getenv("TIKTOK_PIXEL_ID", "")
 TIKTOK_ACCESS_TOKEN   = os.getenv("TIKTOK_ACCESS_TOKEN", "")
 TIKTOK_API_BASE       = os.getenv("TIKTOK_API_BASE", "https://business-api.tiktok.com/open_api")
 TIKTOK_API_TRACK_URL  = f"{TIKTOK_API_BASE}/v1.3/pixel/track/"
-TIKTOK_TEST_EVENT_CODE = os.getenv("TIKTOK_TEST_EVENT_CODE")  # opcional
 
 # Seleção de modelo (server)
 SERVING_MODE_ENV      = (os.getenv("SERVING_MODE", "auto") or "auto").strip().lower()  # auto|cb|rf|xgb|stack
@@ -151,7 +131,6 @@ def _is_allowed_long(domain: str) -> bool:
     return apex_ok or suf_ok
 
 def _resolve_short_follow(url: str) -> str:
-    """Mantido para compatibilidade; só será usado se SKIP_RESOLVE=0."""
     try:
         resp = session.head(url, allow_redirects=True, timeout=DEFAULT_TIMEOUT)
         final_url = resp.url
@@ -215,27 +194,16 @@ _buffer_rows: List[List[str]] = []
 _last_flush_ts = time.time()
 
 CSV_HEADERS = [
-    # tempos e request
     "timestamp","iso_time","ip","user_agent","referrer",
-    # urls
     "short_link_in","resolved_url","final_url","category",
-    # utm
     "utm_original","utm_original_01","subid_base","subid_full","utm_numbered","fbclid","fbp","fbc",
-    # device
     "device_name","os_family","os_version",
-    # geo
     "geo_status","geo_country","geo_region","geo_state","geo_city","geo_zip","geo_lat","geo_lon","geo_isp","geo_org","geo_asn",
-    # features básicas calculadas
     "part_of_day","hour","dow","ref_domain","os_version_num","is_android","is_ios",
-    # predição (do modo ativo)
     "pred_label","p_comprou","p_quase","p_desinteressado",
-    # thresholds (do modo ativo) e flags
     "thr_qvc","thr_atc","is_qvc","is_atc",
-    # métricas derivadas (modo ativo)
     "pcomprou_pct","thr_qvc_pct","thr_atc_pct","gap_qvc","gap_atc","pct_of_atc",
-    # eventos meta
     "meta_event_sent","meta_view_sent",
-    # eventos tiktok
     "tiktok_event_sent","tiktok_view_sent"
 ]
 
@@ -284,57 +252,30 @@ def parse_device_info(ua: str):
     device_name = "iPhone" if "iphone" in ua_l else ("Android" if "android" in ua_l else "Desktop")
     return device_name, os_family, os_version
 
-def extract_utm_content_from_url(u: str) -> str:
-    try:
-        qs = urlsplit(u).query
-        if not qs:
-            return ""
-        q = parse_qs(qs, keep_blank_values=True)
-        return (q.get("utm_content") or [""])[0]
-    except:
-        return ""
-
-# ===== Normalizador de UTM (corta URLs grudadas e aceita sufixo -A\\d+) =====
+# ===== Normalizador de UTM (corta URLs grudadas e aceita sufixo -A\d+) =====
 _URL_CUT_RE = re.compile(r'(https?:\/\/|www\.|[a-z0-9-]+\.(?:com|br|net|org)(?:\/|$))', re.I)
 
 def _normalize_utm_content(raw: str) -> Tuple[str, str]:
-    """
-    Retorna (UTMContent, UTMContent01).
-    - Corta qualquer URL/host que apareça no valor.
-    - Mantém apenas [A-Za-z0-9-].
-    - Suporta sufixo '-A\\d+' para compor o UTMContent01.
-    """
     s = (raw or "").strip()
-
-    # Corta na 1ª marca de URL (https://, http://, www., domínio .com/.com.br etc)
     m = _URL_CUT_RE.search(s)
     if m:
         s = s[:m.start()]
-
-    # Defesa extra contra sequências "http" sem separador
     idx_http = s.lower().find("http")
     if idx_http != -1:
         s = s[:idx_http]
-
-    # Limpeza de cascas e whitelisting
     s = re.sub(r'^[\s\-_]+|[\s\-_]+$', '', s)
     s = re.sub(r'[^A-Za-z0-9\-]+', '', s)
     s = re.sub(r'-{2,}', '-', s)
-
-    # Base + sufixo opcional "-A\\d+"
     m2 = re.match(r'^(?P<base>[A-Za-z0-9\-]*?)(?:-?(?P<suf>A\d+))?$', s)
     if not m2:
         return s, ""
-
     base = (m2.group("base") or "").strip("-")
     suf  = m2.group("suf") or ""
-
     utm_content    = base
     utm_content_01 = f"{base}-{suf}" if suf else ""
     return utm_content, utm_content_01
 
 def resolve_short_link(short_url: str) -> Tuple[str, Dict[str, Optional[str]]]:
-    """Mantido para compatibilidade; hoje não usamos se SKIP_RESOLVE=1."""
     current = short_url
     final_url = short_url
     subids = {}
@@ -358,7 +299,6 @@ def sanitize_subid_for_shopee(value: str) -> str:
     return cleaned[:_SUBID_MAXLEN] if cleaned else "na"
 
 def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
-    # Sempre gerar via API; sem credenciais -> 502
     if not SHOPEE_APP_ID or not SHOPEE_APP_SECRET:
         raise HTTPException(status_code=502, detail="shortlink_unavailable: missing Shopee credentials")
     payload_obj = {
@@ -565,7 +505,6 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
     device_city_combo   = (f"{device_bucket}__{geo_city}").lower()
     utm_partofday_combo = (f"{utm_original}__{part_of_day}").lower()
 
-    # TE encoders — sempre usando utm_original (base)
     utm_n,  utm_br  = _apply_te("utm_original", str(utm_original or ""))
     ref_n,  ref_br  = _apply_te("ref_domain",   str(ref_domain))
     devb_n, devb_br = _apply_te("device_bucket",str(device_bucket))
@@ -589,19 +528,18 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
 # ===================== loaders =====================
 def _load_models_if_available():
     """
-    Carrega todos os artefatos disponíveis e prepara:
+    Carrega artefatos disponíveis:
       - CatBoost (cb)
       - RandomForest (rf)
       - XGBoost (xgb)
-      - Stack (LogReg + stack_meta)
+      - Stack (LogReg)
       - Meta (features, thresholds, TE)
     """
     global _cb_model, _rf_model, _xgb_model, _stack_model, _stack_features
     global _FEATURE_NAMES_FROM_META, _CAT_IDX_FROM_META
     global _POS_LABEL_NAME, _POS_LABEL_ID, _POS_IDX
     global _thresholds_stack, _thresholds_cb, _thresholds_rf, _thresholds_xgb
-    global _TE_STATS, _TE_PRIORS
-    global _loaded_libs
+    global _TE_STATS, _TE_PRIORS, _loaded_libs
 
     _thresholds_stack = {"qvc_mid": 0.5, "atc_high": 0.5}
     _thresholds_cb    = {"qvc_mid": 0.5, "atc_high": 0.5}
@@ -695,12 +633,10 @@ def _load_models_if_available():
             import xgboost as xgb
             _loaded_libs["xgboost"] = True
             try:
-                # Modelo salvo via XGBClassifier.save_model(...)
                 clf = xgb.XGBClassifier()
                 clf.load_model(MODEL_XGB_PATH)
                 _xgb_model = clf
             except Exception:
-                # Fallback: modelo salvo como Booster puro
                 bst = xgb.Booster()
                 bst.load_model(MODEL_XGB_PATH)
                 _xgb_model = bst
@@ -786,26 +722,23 @@ def _xgb_predict_proba(feats_dict: Dict[str, Any]) -> Optional[float]:
         import numpy as np
         X_np = np.asarray([_rf_xgb_feature_vector_from(feats_dict)], dtype=float)
 
-        # Caso 1: wrapper sklearn (XGBClassifier)
         if hasattr(_xgb_model, "predict_proba"):
             proba = _xgb_model.predict_proba(X_np)[0]
             return float(proba[1]) if len(proba) >= 2 else None
 
-        # Caso 2: Booster puro
         import xgboost as xgb
         dmat = xgb.DMatrix(X_np)
-        p = _xgb_model.predict(dmat)  # shape (n,) ou (n,2)
+        p = _xgb_model.predict(dmat)
         if getattr(p, "ndim", 1) == 1:
-            return float(p[0])                 # prob positiva direta
+            return float(p[0])
         if p.ndim == 2 and p.shape[1] >= 2:
-            return float(p[0, 1])              # coluna da classe positiva
+            return float(p[0, 1])
         return None
     except Exception as e:
         import traceback
         print("[predict-xgb] erro:", e)
         traceback.print_exc()
         return None
-
 
 def _stack_predict_proba(p_cb: Optional[float], p_rf: Optional[float], p_xgb: Optional[float]) -> Optional[float]:
     if not _stack_model or not _stack_features:
@@ -887,7 +820,7 @@ def _compute_all_probs(feats_dict: Dict[str, Any]) -> Tuple[Dict[str,float], Dic
 
 _load_models_if_available()
 
-# ===================== TikTok helper (corrigido) =====================
+# ===================== TikTok helper =====================
 def send_tiktok_event(
     event_name: str,
     event_id: str,
@@ -902,48 +835,45 @@ def send_tiktok_event(
     contents_payload: List[Dict[str, Any]],
 ) -> str:
     """
-    Envia um evento para o TikTok Events API (v1.3).
+    Envia evento para TikTok Events API (v1.3).
     Requer: TIKTOK_PIXEL_ID e TIKTOK_ACCESS_TOKEN.
     """
     if not (TIKTOK_PIXEL_ID and TIKTOK_ACCESS_TOKEN):
         return "skipped:no_tiktok_creds"
 
+    # TikTok exige value numérico e content_id. Vamos garantir isso:
+    try:
+        value = float(value)
+    except Exception:
+        value = 0.0
+    content_id = content_ids[0] if content_ids else None
+
     payload = {
         "pixel_code": TIKTOK_PIXEL_ID,
-        "event": event_name,               # "ViewContent", "AddToCart", "Purchase", ...
-        "event_id": event_id,              # dedup
-        "event_time": ts,                  # CORRETO p/ TikTok (não usar 'timestamp')
+        "event": event_name,                 # "ViewContent", "AddToCart" etc
+        "event_id": event_id,                # dedup
+        "timestamp": ts,                     # seconds
         "context": {
             "ad": {"callback": ttclid} if ttclid else {},
             "page": {"url": page_url},
             "user": {"ip": ip, "user_agent": user_agent}
         },
         "properties": {
-            "currency": currency,
-            "value": float(value),
+            "currency": currency,            # "BRL"
+            "value": value,                  # number
             "content_type": "product",
-            "content_id": content_ids[0] if content_ids else None,
-            "contents": contents_payload,   # [{"id": "...", "quantity": 1}]
+            "content_id": content_id,
+            "contents": contents_payload     # [{"id": "...", "quantity": 1}]
         }
     }
 
-    if TIKTOK_TEST_EVENT_CODE:
-        payload["test_event_code"] = TIKTOK_TEST_EVENT_CODE
-
-    headers = {
-        "Content-Type": "application/json",
-        "Access-Token": TIKTOK_ACCESS_TOKEN,
-    }
+    headers = {"Content-Type": "application/json", "Access-Token": TIKTOK_ACCESS_TOKEN}
 
     try:
         resp = session.post(TIKTOK_API_TRACK_URL, headers=headers, json=payload, timeout=8)
-        try:
-            body = resp.json()
-        except Exception:
-            body = {"raw": resp.text}
         if resp.status_code < 400:
             return "ok"
-        return f"error:{resp.status_code}:{body}"
+        return f"error:{resp.status_code}"
     except Exception as e:
         print("[tiktok] exceção:", e)
         return "error"
@@ -1074,7 +1004,6 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 
     # ===== Interpretar URL de entrada SEM resolver =====
     parts_in = urlsplit(incoming_url)
-
     if SKIP_RESOLVE:
         resolved_url = _fix_scheme(incoming_url)
     else:
@@ -1083,7 +1012,6 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     parts_res = urlsplit(resolved_url)
     if not parts_res.scheme or not parts_res.netloc:
         return JSONResponse({"ok": False, "error": f"URL inválida: {resolved_url}"}, status_code=400)
-    # Permite tanto s.shopee... (short) quanto domínios longos aprovados
     if not _is_allowed_long(parts_res.netloc) and not _is_short_domain(parts_res.netloc):
         return JSONResponse({"ok": False, "error": f"Domínio não permitido: {parts_res.netloc}"}, status_code=400)
 
@@ -1211,7 +1139,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             print("[meta] VC exceção:", e)
             meta_view = "error"
 
-    # ===== TikTok: ViewContent (corrigido) =====
+    # ===== TikTok: ViewContent =====
     tiktok_view = ""
     try:
         tiktok_view = send_tiktok_event(
@@ -1231,7 +1159,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         print("[tiktok] VC exceção:", e)
         tiktok_view = "error"
 
-    # ===== Meta: AddToCart (sua definição de "comprou") =====
+    # ===== Meta: AddToCart (mesma condição de "is_atc_flag == 1") =====
     if META_PIXEL_ID and META_ACCESS_TOKEN and is_atc_flag == 1:
         atc_payload = {
             "data": [{
@@ -1260,13 +1188,13 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             print("[meta] ATC exceção:", e)
             meta_sent = "error"
 
-    # ===== TikTok: AddToCart (MESMA REGRA do Meta: is_atc_flag == 1) =====
+    # ===== TikTok: AddToCart quando is_atc_flag == 1 (mesmo requisito do Meta) =====
     tiktok_sent = ""
     if is_atc_flag == 1:
         try:
             tiktok_sent = send_tiktok_event(
-                event_name="AddToCart",           # equivalente no TikTok
-                event_id=utm_numbered + "-atc",   # dedup separado do VC
+                event_name="AddToCart",
+                event_id=utm_numbered,
                 ts=ts,
                 page_url=origin_url,
                 ip=ip_addr,
@@ -1280,25 +1208,6 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         except Exception as e:
             print("[tiktok] ATC exceção:", e)
             tiktok_sent = "error"
-
-    # # (Opcional) TikTok: evento final de conversão
-    # if is_atc_flag == 1:
-    #     try:
-    #         _ = send_tiktok_event(
-    #             event_name="Purchase",
-    #             event_id=utm_numbered + "-purchase",
-    #             ts=ts,
-    #             page_url=origin_url,
-    #             ip=ip_addr,
-    #             user_agent=user_agent,
-    #             ttclid=ttclid,
-    #             currency="BRL",
-    #             value=0.0,
-    #             content_ids=content_ids,
-    #             contents_payload=contents_payload,
-    #         )
-    #     except Exception as e:
-    #         print("[tiktok] Purchase exceção:", e)
 
     # ===== Log CSV =====
     hour_log = _extract_hour_from_iso_for_log(iso_time)
