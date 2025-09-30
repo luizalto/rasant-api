@@ -1,12 +1,6 @@
 [tool.poetry]
 name = "rasant-api"
 version = "0.1.0"
-# ...
-
-
-[tool.poetry]
-name = "rasant-api"
-version = "0.1.0"
 description = "Shopee UTM → ShortLink + Predict + CAPI + TikTok"
 authors = ["luizalto <you@example.com>"]
 readme = "README.md"
@@ -33,11 +27,13 @@ scikit-learn = "1.4.2"
 numpy = "1.26.4"
 scipy = "1.11.4"
 joblib = "1.5.2"
-xgboost = "3.0.5"   # ← mesma versão usada no treino
+xgboost = "3.0.5"   # mesma versão do treino
 
 [build-system]
 requires = ["poetry-core>=1.8.0"]
 build-backend = "poetry.core.masonry.api"
+
+
 
 
 
