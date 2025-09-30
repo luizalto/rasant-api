@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (Stack via Proxy Render + fallback CatBoost)
+FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI) + TikTok Events API
 (versão consolidada) — UTMContent / UTMContent01 / UTMNumered
 
-Resumo:
-- Gera shortlink oficial da Shopee (subId3 = UTMNumered)
-- Predição padrão: STACK executada fora (PC local) via Proxy Render (HTTP POST /predict)
-- Se o Proxy não responder, faz fallback para CatBoost local (leve)
-- Mantém logging em CSV no GCS, Meta CAPI, TikTok Events, etc.
+REQUISITOS:
+- NÃO resolver/abrir short-link da Shopee antes de gerar o short oficial (SKIP_RESOLVE=1 por padrão).
+- A UTM deve vir do parâmetro `uc` da querystring.
+- A partir de `uc`, derivar:
+  * UTMContent     = base (sem URL colada; apenas [A-Za-z0-9-]).
+  * UTMContent01   = base + '-A\\d+' (se houver esse sufixo).
+  * UTMNumered     = (UTMContent01 se existir, senão UTMContent) + 'N' + contador infinito.
+- Apenas substituir o valor de utm_content na URL ALVO (NÃO criar "utm_numbered=").
+- subId3 (API Shopee) = UTMNumered (sanitizado p/ alfanumérico).
+- Predição usa **somente** utm_original (UTMContent base).
 
-ENVs principais:
-- PROXY_PREDICT_URL=https://seu-proxy.onrender.com/predict
-- SERVING_MODE=stack   (stack|cb|auto)  -> default "stack" (= tenta proxy stack e cai p/ cb)
-- SKIP_RESOLVE=1       (não resolve short antes)
+OBS:
+- Para reativar a resolução de short antes, defina SKIP_RESOLVE=0.
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -64,34 +67,29 @@ TIKTOK_ACCESS_TOKEN   = os.getenv("TIKTOK_ACCESS_TOKEN", "")
 TIKTOK_API_BASE       = os.getenv("TIKTOK_API_BASE", "https://business-api.tiktok.com/open_api")
 TIKTOK_API_TRACK_URL  = f"{TIKTOK_API_BASE}/v1.3/pixel/track/"
 
-# Proxy Render (predição remota: PC local por trás do proxy)
-PROXY_PREDICT_URL     = (os.getenv("PROXY_PREDICT_URL") or "").strip()  # ex.: https://seu-proxy.onrender.com/predict
-
 # Seleção de modelo (server)
-# "stack" = tenta proxy stack primeiro, se falhar cai para cb
-# "cb"    = sempre catboost local
-# "auto"  = tenta stack (proxy) -> cb; se existir xgb/rf/stack local, também pode usar (mantido)
-SERVING_MODE_ENV      = (os.getenv("SERVING_MODE", "stack") or "stack").strip().lower()  # stack|cb|auto
+SERVING_MODE_ENV      = (os.getenv("SERVING_MODE", "auto") or "auto").strip().lower()  # auto|cb|rf|xgb|stack
 
 # Comportamento de resolução de URL (1 = NÃO resolver short, default; 0 = resolver)
 SKIP_RESOLVE          = os.getenv("SKIP_RESOLVE", "1").lower() in ("1","true","yes","on")
 
-# Modelos (somente CatBoost é necessário localmente; RF/XGB/STACK locais são opcionais)
+# Modelos
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR      = os.path.join(BASE_DIR, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
+# Caminhos principais
 MODEL_CB_PATH        = os.path.join(MODELS_DIR, "model_comprou.cbm")
 MODEL_META_PATH      = os.path.join(MODELS_DIR, "model_meta_comprou.json")
 TE_STATS_PATH        = os.path.join(MODELS_DIR, "te_stats.json")          # opcional (fallback)
 
-MODEL_RF_PATH        = os.path.join(MODELS_DIR, "rf.joblib")              # opcional
-MODEL_XGB_PATH       = os.path.join(MODELS_DIR, "xgb.json")               # opcional
-MODEL_STACK_PATH     = os.path.join(MODELS_DIR, "stack_model.joblib")     # opcional
-STACK_META_PATH      = os.path.join(MODELS_DIR, "stack_meta.json")        # opcional
+MODEL_RF_PATH        = os.path.join(MODELS_DIR, "rf.joblib")
+MODEL_XGB_PATH       = os.path.join(MODELS_DIR, "xgb.json")
+MODEL_STACK_PATH     = os.path.join(MODELS_DIR, "stack_model.joblib")
+STACK_META_PATH      = os.path.join(MODELS_DIR, "stack_meta.json")
 
 # ===================== App / Clients =====================
-app = FastAPI(title="Shopee UTM → ShortLink + Geo + Predict (Proxy Stack + CB fallback) + CAPI + TikTok")
+app = FastAPI(title="Shopee UTM → ShortLink + Geo + Predict (Multi-Model) + CAPI + TikTok")
 
 # Redis
 r = redis.from_url(REDIS_URL)
@@ -415,9 +413,9 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
 _cb_model = None
 _rf_model = None
 _xgb_model = None
-_stack_model = None  # LogisticRegression (opcional local)
+_stack_model = None  # LogisticRegression
 
-_stack_features: List[str] = []  # ordem esperada p/ stack (opcional local)
+_stack_features: List[str] = []  # ordem esperada p/ stack
 _loaded_libs = {"catboost": False, "xgboost": False}
 
 # meta / features / thresholds
@@ -435,9 +433,7 @@ _thresholds_cb    = {"qvc_mid": 0.5, "atc_high": 0.5}
 _thresholds_rf    = None
 _thresholds_xgb   = None
 
-_current_mode = SERVING_MODE_ENV  # "stack" | "cb" | "auto"
-
-_last_proxy_ok: Optional[bool] = None
+_current_mode = SERVING_MODE_ENV  # "auto" | "cb" | "rf" | "xgb" | "stack"
 
 # ===================== TE helpers =====================
 def _load_te_if_available():
@@ -585,9 +581,11 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
 # ===================== loaders =====================
 def _load_models_if_available():
     """
-    Carrega artefatos disponíveis:
-      - CatBoost (cb) → NECESSÁRIO local (fallback)
-      - RF/XGB/Stack → OPCIONAIS locais (não recomendados no Render)
+    Carrega todos os artefatos disponíveis e prepara:
+      - CatBoost (cb)
+      - RandomForest (rf)
+      - XGBoost (xgb)
+      - Stack (LogReg + stack_meta)
       - Meta (features, thresholds, TE)
     """
     global _cb_model, _rf_model, _xgb_model, _stack_model, _stack_features
@@ -673,7 +671,7 @@ def _load_models_if_available():
     except Exception as e:
         print("[CatBoost] erro ao carregar:", e)
 
-    # RF/XGB/Stack locais (opcionais; não recomendados no Render)
+    # RF
     _rf_model = None
     if os.path.exists(MODEL_RF_PATH):
         try:
@@ -682,6 +680,7 @@ def _load_models_if_available():
         except Exception as e:
             print("[RF] erro ao carregar:", e)
 
+    # XGB
     _xgb_model = None
     try:
         if os.path.exists(MODEL_XGB_PATH):
@@ -693,6 +692,7 @@ def _load_models_if_available():
     except Exception as e:
         print("[XGB] erro ao carregar:", e)
 
+    # Stack
     _stack_model = None
     _stack_features = []
     if os.path.exists(MODEL_STACK_PATH):
@@ -790,32 +790,44 @@ def _stack_predict_proba(p_cb: Optional[float], p_rf: Optional[float], p_xgb: Op
         proba = _stack_model.predict_proba(X)[0]
         return float(proba[1]) if len(proba) >= 2 else None
     except Exception as e:
-        print("[predict-stack-local] erro:", e)
+        print("[predict-stack] erro:", e)
         return None
 
-# ========= PREDIÇÃO VIA PROXY (STACK remoto) =========
-def _predict_via_proxy(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Envia payload para PROXY_PREDICT_URL e retorna dict com {ok, probas:{p_stack}, thresholds:{...}}."""
-    global _last_proxy_ok
-    if not PROXY_PREDICT_URL:
-        _last_proxy_ok = False
-        return None
-    try:
-        resp = session.post(PROXY_PREDICT_URL, json=payload, timeout=(3, 7))
-        if resp.status_code >= 400:
-            _last_proxy_ok = False
-            return None
-        j = resp.json()
-        _last_proxy_ok = bool(j.get("ok"))
-        return j if _last_proxy_ok else None
-    except Exception as e:
-        print("[proxy] erro:", e)
-        _last_proxy_ok = False
-        return None
+def _choose_active_mode(forced_mode: Optional[str], p_avail: Dict[str, Optional[float]]) -> str:
+    def available(mode: str) -> bool:
+        if mode == "stack": return p_avail.get("stack") is not None
+        if mode == "cb":    return p_avail.get("cb")    is not None
+        if mode == "xgb":   return p_avail.get("xgb")   is not None
+        if mode == "rf":    return p_avail.get("rf")    is not None
+        return False
+
+    if forced_mode in ("stack","cb","xgb","rf") and available(forced_mode):
+        return forced_mode
+    if _current_mode in ("stack","cb","xgb","rf") and available(_current_mode):
+        return _current_mode
+    for mode in ("stack","cb","xgb","rf"):
+        if available(mode):
+            return mode
+    return "cb"
+
+def _thresholds_for_mode(mode: str) -> Tuple[float,float]:
+    if mode == "stack":
+        return float(_thresholds_stack.get("qvc_mid", 0.5)), float(_thresholds_stack.get("atc_high", 0.5))
+    if mode == "cb":
+        return float(_thresholds_cb.get("qvc_mid", 0.5)), float(_thresholds_cb.get("atc_high", 0.5))
+    if mode == "rf":
+        if _thresholds_rf:
+            return float(_thresholds_rf.get("qvc_mid", 0.5)), float(_thresholds_rf.get("atc_high", 0.5))
+        return float(_thresholds_stack.get("qvc_mid", _thresholds_cb.get("qvc_mid", 0.5))), \
+               float(_thresholds_stack.get("atc_high", _thresholds_cb.get("atc_high", 0.5)))
+    if mode == "xgb":
+        if _thresholds_xgb:
+            return float(_thresholds_xgb.get("qvc_mid", 0.5)), float(_thresholds_xgb.get("atc_high", 0.5))
+        return float(_thresholds_stack.get("qvc_mid", _thresholds_cb.get("qvc_mid", 0.5))), \
+               float(_thresholds_stack.get("atc_high", _thresholds_cb.get("atc_high", 0.5)))
+    return 0.5, 0.5
 
 def _compute_all_probs(feats_dict: Dict[str, Any]) -> Tuple[Dict[str,float], Dict[str, Optional[float]]]:
-    """Calcula CB local + tenta STACK remoto via proxy; mantém RF/XGB/STACK local se existirem (opcional)."""
-    # CatBoost local
     p_cb_map = {"comprou": None, "quase": 0.0, "desinteressado": None}
     p_cb = None
     if _cb_model and _FEATURE_NAMES_FROM_META:
@@ -833,80 +845,12 @@ def _compute_all_probs(feats_dict: Dict[str, Any]) -> Tuple[Dict[str,float], Dic
         p_cb_map = _cb_predict_proba(row_values, _CAT_IDX_FROM_META) or {"comprou": None, "quase": 0.0, "desinteressado": None}
         p_cb = p_cb_map.get("comprou")
 
-    # RF/XGB locais (opcionais no Render)
     p_rf = _rf_predict_proba(feats_dict)
     p_xgb = _xgb_predict_proba(feats_dict)
+    p_stack = _stack_predict_proba(p_cb, p_rf, p_xgb)
 
-    # STACK local (opcional)
-    p_stack_local = _stack_predict_proba(p_cb, p_rf, p_xgb)
-
-    # STACK via Proxy (preferido)
-    proxy_resp = _predict_via_proxy({"feats": feats_dict})
-    p_stack_proxy = None
-    if proxy_resp and proxy_resp.get("ok"):
-        # aceita campos: probas.p_stack e thresholds.{qvc_mid,atc_high}
-        p_stack_proxy = float(((proxy_resp.get("probas") or {}).get("p_stack") or 0.0))
-
-        # Se veio threshold remoto, atualiza thresholds do stack para esta requisição
-        th = proxy_resp.get("thresholds") or {}
-        if "qvc_mid" in th and "atc_high" in th:
-            try:
-                _thresholds_stack.update({
-                    "qvc_mid": float(th.get("qvc_mid", _thresholds_stack["qvc_mid"])),
-                    "atc_high": float(th.get("atc_high", _thresholds_stack["atc_high"])),
-                })
-            except Exception:
-                pass
-
-    # Preferência final: STACK via proxy -> STACK local -> (XGB/RF) -> CB
-    p_stack = p_stack_proxy if p_stack_proxy is not None else p_stack_local
     p_avail = {"cb": p_cb, "rf": p_rf, "xgb": p_xgb, "stack": p_stack}
     return p_cb_map, p_avail
-
-def _choose_active_mode(forced_mode: Optional[str], p_avail: Dict[str, Optional[float]]) -> str:
-    def available(mode: str) -> bool:
-        if mode == "stack": return p_avail.get("stack") is not None
-        if mode == "cb":    return p_avail.get("cb")    is not None
-        if mode == "xgb":   return p_avail.get("xgb")   is not None
-        if mode == "rf":    return p_avail.get("rf")    is not None
-        return False
-
-    # Prioridade: forced -> current -> fallback
-    if forced_mode in ("stack","cb","xgb","rf","auto"):
-        if forced_mode == "auto":
-            # auto: tenta stack -> cb -> xgb -> rf
-            for m in ("stack","cb","xgb","rf"):
-                if available(m): return m
-            return "cb"
-        if available(forced_mode): return forced_mode
-        # se forçado mas indisponível, cai para catboost
-        return "cb"
-
-    if _current_mode in ("stack","cb","xgb","rf","auto"):
-        if _current_mode == "auto":
-            for m in ("stack","cb","xgb","rf"):
-                if available(m): return m
-            return "cb"
-        if available(_current_mode): return _current_mode
-
-    for mode in ("stack","cb","xgb","rf"):
-        if available(mode): return mode
-    return "cb"
-
-def _thresholds_for_mode(mode: str) -> Tuple[float,float]:
-    if mode == "stack":
-        return float(_thresholds_stack.get("qvc_mid", 0.5)), float(_thresholds_stack.get("atc_high", 0.5))
-    if mode == "cb":
-        return float(_thresholds_cb.get("qvc_mid", 0.5)), float(_thresholds_cb.get("atc_high", 0.5))
-    if mode == "rf":
-        if _thresholds_rf:
-            return float(_thresholds_rf.get("qvc_mid", 0.5)), float(_thresholds_rf.get("atc_high", 0.5))
-        return float(_thresholds_cb.get("qvc_mid", 0.5)), float(_thresholds_cb.get("atc_high", 0.5))
-    if mode == "xgb":
-        if _thresholds_xgb:
-            return float(_thresholds_xgb.get("qvc_mid", 0.5)), float(_thresholds_xgb.get("atc_high", 0.5))
-        return float(_thresholds_cb.get("qvc_mid", 0.5)), float(_thresholds_cb.get("atc_high", 0.5))
-    return 0.5, 0.5
 
 _load_models_if_available()
 
@@ -924,14 +868,18 @@ def send_tiktok_event(
     content_ids: List[str],
     contents_payload: List[Dict[str, Any]],
 ) -> str:
+    """
+    Envia um evento para o TikTok Events API (v1.3).
+    Requer: TIKTOK_PIXEL_ID e TIKTOK_ACCESS_TOKEN.
+    """
     if not (TIKTOK_PIXEL_ID and TIKTOK_ACCESS_TOKEN):
         return "skipped:no_tiktok_creds"
 
     payload = {
         "pixel_code": TIKTOK_PIXEL_ID,
-        "event": event_name,
-        "event_id": event_id,
-        "timestamp": ts,
+        "event": event_name,                # "ViewContent", "CompletePayment"
+        "event_id": event_id,               # dedup
+        "timestamp": ts,                    # segundos
         "context": {
             "ad": {"callback": ttclid} if ttclid else {},
             "page": {"url": page_url},
@@ -941,15 +889,18 @@ def send_tiktok_event(
             }
         },
         "properties": {
-            "currency": currency,
+            "currency": currency,           # "BRL"
             "value": float(value),
             "content_type": "product",
             "content_id": content_ids[0] if content_ids else None,
-            "contents": contents_payload,
+            "contents": contents_payload,   # [{"id": "...", "quantity": 1}]
         }
     }
 
-    headers = {"Content-Type": "application/json", "Access-Token": TIKTOK_ACCESS_TOKEN}
+    headers = {
+        "Content-Type": "application/json",
+        "Access-Token": TIKTOK_ACCESS_TOKEN,
+    }
 
     try:
         resp = session.post(TIKTOK_API_TRACK_URL, headers=headers, json=payload, timeout=8)
@@ -1018,8 +969,6 @@ def health():
             "stack": bool(_stack_model),
         },
         "serving_mode_current": _current_mode,
-        "proxy_predict_url": PROXY_PREDICT_URL or "",
-        "proxy_last_ok": _last_proxy_ok,
         "meta": {"n_features": len(_FEATURE_NAMES_FROM_META), "cat_idx": _CAT_IDX_FROM_META},
         "thr_stack": _thresholds_stack,
         "thr_cb": _thresholds_cb,
@@ -1082,7 +1031,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     referrer = headers.get("referer") or "-"
     user_agent = headers.get("user-agent", "-")
     fbclid = request.query_params.get("fbclid")
-    ttclid = request.query_params.get("ttclid")
+    ttclid = request.query_params.get("ttclid")  # TikTok click id (se houver)
     ip_addr = (request.client.host if request.client else "0.0.0.0")
     device_name, os_family, os_version = parse_device_info(user_agent)
 
@@ -1097,6 +1046,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     parts_res = urlsplit(resolved_url)
     if not parts_res.scheme or not parts_res.netloc:
         return JSONResponse({"ok": False, "error": f"URL inválida: {resolved_url}"}, status_code=400)
+    # Permite tanto s.shopee... (short) quanto domínios longos aprovados
     if not _is_allowed_long(parts_res.netloc) and not _is_short_domain(parts_res.netloc):
         return JSONResponse({"ok": False, "error": f"Domínio não permitido: {parts_res.netloc}"}, status_code=400)
 
@@ -1108,12 +1058,14 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     # Normaliza e separa (corta URLs coladas, aceita '-A\\d+')
     utm_original, utm_original_01 = _normalize_utm_content(outer_uc)
 
-    # Semente p/ numeração
+    # Semente p/ numeração: prioriza UTMContent01; se vazio, usa UTMContent
     seed_for_numbering = (utm_original_01 or utm_original)
+
+    # UTMNumered = seed (permitindo hífen) + 'N' + contador
     seed_clean_for_numbered = re.sub(r'[^A-Za-z0-9\-]', '', seed_for_numbering) or "n"
     utm_numbered = f"{seed_clean_for_numbered}N{incr_counter()}"
 
-    # Substitui APENAS o utm_content na URL
+    # Substitui APENAS o utm_content na URL (não adiciona nenhum outro parâmetro)
     origin_url = _set_utm_content_preserving_order(resolved_url, utm_numbered)
 
     # ===== content_ids / contents =====
@@ -1134,11 +1086,11 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         "ip": ip_addr, "ua": user_agent, "referrer": referrer,
         "event_source_url": origin_url, "short_link": dest,
         "vc_time": ts,
-        "utm_original": utm_original,
-        "utm_original_01": utm_original_01,
+        "utm_original": utm_original,           # UTMContent (base)
+        "utm_original_01": utm_original_01,     # UTMContent01 (com -A.. ou vazio)
         "subid_base": utm_original,
         "subid_full": (utm_original_01 or utm_original),
-        "utm_numbered": utm_numbered,
+        "utm_numbered": utm_numbered,           # UTMNumered (aplicado em utm_content e subId3)
         "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_cookie, "eid": eid_cookie, "mode": in_mode
     }, ensure_ascii=False))
 
@@ -1156,43 +1108,36 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     geo = geo_lookup(ip_addr)
     feats_dict = _features_full_dict(os_family, device_name, os_version, referrer, utm_original, iso_time, geo)
 
-    # ===== Predições (STACK via Proxy → fallback CB) =====
+    # ===== Predições =====
     p_cb_map, p_avail = _compute_all_probs(feats_dict)
+    p_cb  = p_avail.get("cb")
+    p_rf  = p_avail.get("rf")
+    p_xgb = p_avail.get("xgb")
+    p_stack = p_avail.get("stack")
 
     forced_mode = (mode or "").strip().lower() if mode else None
-    # Força preferência "stack" (proxy) quando SERVING_MODE=stack
     active_mode = _choose_active_mode(forced_mode, p_avail)
 
-    if active_mode == "stack" and p_avail.get("stack") is not None:
-        p_c = float(p_avail["stack"])
+    if active_mode == "stack" and p_stack is not None:
+        p_c = float(p_stack)
         thr_q, thr_a = _thresholds_for_mode("stack")
         p_map = {"comprou": p_c, "quase": 0.0, "desinteressado": 1.0 - p_c}
-    elif active_mode == "cb" and p_avail.get("cb") is not None:
-        p_c = float(p_avail["cb"])
+    elif active_mode == "cb" and p_cb is not None:
+        p_c = float(p_cb)
         thr_q, thr_a = _thresholds_for_mode("cb")
-        p_map = {
-            "comprou": p_c,
-            "quase": float(p_cb_map.get("quase", 0.0)),
-            "desinteressado": float(p_cb_map.get("desinteressado", 1.0 - p_c))
-        }
-    elif active_mode == "xgb" and p_avail.get("xgb") is not None:
-        p_c = float(p_avail["xgb"])
+        p_map = {"comprou": p_c, "quase": float(p_cb_map.get("quase", 0.0)), "desinteressado": float(p_cb_map.get("desinteressado", 1.0 - p_c))}
+    elif active_mode == "xgb" and p_xgb is not None:
+        p_c = float(p_xgb)
         thr_q, thr_a = _thresholds_for_mode("xgb")
         p_map = {"comprou": p_c, "quase": 0.0, "desinteressado": 1.0 - p_c}
-    elif active_mode == "rf" and p_avail.get("rf") is not None:
-        p_c = float(p_avail["rf"])
+    elif active_mode == "rf" and p_rf is not None:
+        p_c = float(p_rf)
         thr_q, thr_a = _thresholds_for_mode("rf")
         p_map = {"comprou": p_c, "quase": 0.0, "desinteressado": 1.0 - p_c}
     else:
-        # fallback duro para CB se nada disponível
-        p_c = float(p_avail.get("cb") or 0.0)
-        thr_q, thr_a = _thresholds_for_mode("cb")
-        p_map = {
-            "comprou": p_c,
-            "quase": float(p_cb_map.get("quase", 0.0)),
-            "desinteressado": float(p_cb_map.get("desinteressado", 1.0 - p_c))
-        }
-        active_mode = "cb"
+        p_c, thr_q, thr_a = 0.0, 0.5, 0.5
+        p_map = {"comprou": 0.0, "quase": 0.0, "desinteressado": 1.0}
+        active_mode = "none"
 
     is_qvc_flag = 1 if p_c >= thr_q else 0
     is_atc_flag = 1 if p_c >= thr_a else 0
@@ -1249,7 +1194,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         print("[tiktok] VC exceção:", e)
         tiktok_view = "error"
 
-    # ===== Meta: AddToCart (equivalente a "comprou" pela sua definição) =====
+    # ===== Meta: AddToCart (sua definição de "comprou") =====
     if META_PIXEL_ID and META_ACCESS_TOKEN and is_atc_flag == 1:
         atc_payload = {
             "data": [{
@@ -1278,7 +1223,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             print("[meta] ATC exceção:", e)
             meta_sent = "error"
 
-    # ===== TikTok: CompletePayment (Purchase) quando is_atc_flag == 1 =====
+    # ===== TikTok: CompletePayment (equivalente a Purchase) quando is_atc_flag == 1 =====
     tiktok_sent = ""
     if is_atc_flag == 1:
         try:
@@ -1291,7 +1236,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                 user_agent=user_agent,
                 ttclid=ttclid,
                 currency="BRL",
-                value=0.0,
+                value=0.0,  # se desejar enviar valor do item/ordem, ajustar aqui
                 content_ids=content_ids,
                 contents_payload=contents_payload,
             )
@@ -1356,6 +1301,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             "Set-Cookie": ", ".join(set_cookie_headers)
         })
 
+    # Importante: entregamos o SHORT sempre (redirect para o short).
     return RedirectResponse(dest, status_code=302, headers={
         "Cache-Control": "no-store, max-age=0",
         "Set-Cookie": ", ".join(set_cookie_headers)
@@ -1373,10 +1319,10 @@ def admin_page():
         <ul>
           <li><code>model_comprou.cbm</code> (CatBoost)</li>
           <li><code>model_meta_comprou.json</code> (meta, thresholds, TE)</li>
-          <li><code>rf.joblib</code> (RandomForest - opcional)</li>
-          <li><code>xgb.json</code> (XGBoost - opcional)</li>
-          <li><code>stack_model.joblib</code> (LogReg do stack - opcional)</li>
-          <li><code>stack_meta.json</code> (ordem das features do stack - opcional)</li>
+          <li><code>rf.joblib</code> (RandomForest)</li>
+          <li><code>xgb.json</code> (XGBoost)</li>
+          <li><code>stack_model.joblib</code> (LogReg do stack)</li>
+          <li><code>stack_meta.json</code> (ordem das features do stack)</li>
           <li><code>te_stats.json</code> (fallback do Target Encoding)</li>
         </ul>
         <form method="post" action="/admin/upload_models_bundle" enctype="multipart/form-data">
@@ -1390,7 +1336,7 @@ def admin_page():
           <div>te_stats.json: <input name="te" type="file" /></div><br/>
           <button type="submit">Enviar</button>
         </form>
-        <p>Depois de enviar, abra <code>/health</code> para conferir modelos, thresholds e status do proxy.</p>
+        <p>Depois de enviar, abra <code>/health</code> para conferir modelos e thresholds carregados.</p>
       </body>
     </html>
     """
@@ -1446,7 +1392,6 @@ async def admin_upload_models_bundle(
         "ok": True,
         "models_loaded": {"cb": bool(_cb_model), "rf": bool(_rf_model), "xgb": bool(_xgb_model), "stack": bool(_stack_model)},
         "thr_stack": _thresholds_stack, "thr_cb": _thresholds_cb, "thr_rf": _thresholds_rf, "thr_xgb": _thresholds_xgb,
-        "proxy_predict_url": PROXY_PREDICT_URL or "",
         "te_loaded": bool(_TE_STATS)
     }
 
@@ -1533,7 +1478,6 @@ async def admin_upload_model(
         },
         "models_loaded": {"cb": bool(_cb_model), "rf": bool(_rf_model), "xgb": bool(_xgb_model), "stack": bool(_stack_model)},
         "thr_stack": _thresholds_stack, "thr_cb": _thresholds_cb, "thr_rf": _thresholds_rf, "thr_xgb": _thresholds_xgb,
-        "proxy_predict_url": PROXY_PREDICT_URL or "",
         "te_loaded": bool(_TE_STATS)
     }
 
@@ -1546,7 +1490,6 @@ def admin_reload_model(x_admin_token: str = Header(None)):
         "ok": True,
         "models_loaded": {"cb": bool(_cb_model), "rf": bool(_rf_model), "xgb": bool(_xgb_model), "stack": bool(_stack_model)},
         "thr_stack": _thresholds_stack, "thr_cb": _thresholds_cb, "thr_rf": _thresholds_rf, "thr_xgb": _thresholds_xgb,
-        "proxy_predict_url": PROXY_PREDICT_URL or "",
         "te_loaded": bool(_TE_STATS)
     }
 
