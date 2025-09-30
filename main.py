@@ -3,28 +3,22 @@
 FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI)
 (versão multi-model: suporta CatBoost, RandomForest, XGBoost e Stacking com LogisticRegression)
 
-Compatibilidade:
-- Mantém endpoints e CSV schema originais.
-- Usa p_comprou do MODO ATIVO (stack/cb/rf/xgb). Thresholds respeitam o modo.
-- Carrega TE do meta ou te_stats.json (fallback).
+Correções:
+- Leitura única de UploadFile.
+- Parse condicional só para JSONs de config (meta, stack_meta, te_stats).
+- Suporte a aliases de campos nos uploads (/admin/upload_model e /admin/upload_models_bundle).
 
 Seleção do modo:
 - ENV SERVING_MODE: auto | cb | rf | xgb | stack  (padrão: auto)
 - Override por query param `mode` (para teste), ex: /minha-rota?mode=stack
 
-Artefatos aceitos em ./models:
+Arquivos aceitos em ./models:
 - CatBoost: model_comprou.cbm
 - Meta     : model_meta_comprou.json  (feature_names, cat_idx, thresholds, thresholds_cb, te_stats)
 - RF       : rf.joblib
-- XGB      : xgb.json
+- XGB      : xgb.json   (modelo do XGBoost salvo em JSON — salvo SEM parse)
 - Stack    : stack_model.joblib + stack_meta.json  (stack_features, thresholds)
 - TE       : te_stats.json (opcional; fallback)
-
-Upload:
-- /admin/upload_model_simple: mantém compat CatBoost (com meta opcional)
-- /admin/upload_model: agora com leitura única e parse condicional (corrigido)
-- /admin/upload_models_bundle: idem, com leitura única
-- /admin/set_mode: define o MODO em runtime (memória de processo)
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -41,8 +35,8 @@ from datetime import datetime
 DEFAULT_TIMEOUT       = float(os.getenv("HTTP_TIMEOUT", "10"))
 
 # GCS
-GCS_BUCKET            = os.getenv("GCS_BUCKET")              # ex: "meu-bucket"
-GCS_PREFIX            = os.getenv("GCS_PREFIX", "logs/")     # ex: "logs/"
+GCS_BUCKET            = os.getenv("GCS_BUCKET")
+GCS_PREFIX            = os.getenv("GCS_PREFIX", "logs/")
 FLUSH_MAX_ROWS        = int(os.getenv("FLUSH_MAX_ROWS", "500"))
 FLUSH_MAX_SECONDS     = int(os.getenv("FLUSH_MAX_SECONDS", "30"))
 
@@ -93,7 +87,7 @@ try:
 except Exception:
     pass
 
-# GCS (lazy: só importa client se GCS_BUCKET existir)
+# GCS (lazy)
 _bucket = None
 if GCS_BUCKET:
     try:
@@ -110,13 +104,13 @@ _adapter = requests.adapters.HTTPAdapter(pool_connections=30, pool_maxsize=100)
 session.mount("http://", _adapter)
 session.mount("https://", _adapter)
 
-# ===================== Helpers Upload =====================
+# ===================== Upload helpers =====================
 async def _save_upload_once(file: UploadFile, dest_path: str, *, expect_json: bool = False) -> bool:
     """
     Lê UMA ÚNICA vez um UploadFile e salva no disco.
     - expect_json=True: valida JSON (não-vazio e parseável).
-    - expect_json=False: salva binário/texte como vier (sem parse).
-    Retorna True se salvou, False se 'file' era None.
+    - expect_json=False: salva bytes como vieram (inclui xgb.json do XGBoost, sem parse).
+    Retorna True se salvou, False se 'file' é None.
     """
     if file is None:
         return False
@@ -131,11 +125,11 @@ async def _save_upload_once(file: UploadFile, dest_path: str, *, expect_json: bo
     if expect_json:
         text = data.decode("utf-8", errors="ignore")
         if not text.strip():
-            raise HTTPException(status_code=400, detail=f"{getattr(file, 'filename', dest_path)} vazio (JSON esperado).")
+            raise HTTPException(status_code=400, detail=f"{os.path.basename(dest_path)} vazio (JSON esperado).")
         try:
             json.loads(text)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"{getattr(file, 'filename', dest_path)} JSON inválido: {e}")
+            raise HTTPException(status_code=400, detail=f"{os.path.basename(dest_path)} JSON inválido: {e}")
 
     try:
         with open(dest_path, "wb") as out:
@@ -143,6 +137,13 @@ async def _save_upload_once(file: UploadFile, dest_path: str, *, expect_json: bo
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"falha ao salvar {dest_path}: {e}")
     return True
+
+def _first_non_none(*candidates: Optional[UploadFile]) -> Optional[UploadFile]:
+    """Retorna o primeiro UploadFile não-nulo dentre aliases."""
+    for c in candidates:
+        if c is not None:
+            return c
+    return None
 
 # ===================== Helpers URL / Shopee =====================
 SHORT_DOMAINS = ("s.shopee.com.br", "s.shopee.com")
@@ -193,7 +194,7 @@ def _set_utm_content_preserving_order(url: str, new_value: str) -> str:
             break
     if not replaced:
         items.append("utm_content=" + new_value)
-    new_qs = "&".join([s for s in items if s])
+    new_qs = "&join&".replace("join", "").join([s for s in items if s])  # não quebra ordem dos outros params
     return urlunsplit((parts.scheme, parts.netloc, parts.path, new_qs, parts.fragment))
 
 def add_or_update_query_param(raw_url: str, key: str, value: str) -> str:
@@ -235,25 +236,15 @@ _buffer_rows: List[List[str]] = []
 _last_flush_ts = time.time()
 
 CSV_HEADERS = [
-    # tempos e request
     "timestamp","iso_time","ip","user_agent","referrer",
-    # urls
     "short_link_in","resolved_url","final_url","category",
-    # utm
     "utm_original","utm_original_01","utm_numbered","fbclid","fbp","fbc",
-    # device
     "device_name","os_family","os_version",
-    # geo
     "geo_status","geo_country","geo_region","geo_state","geo_city","geo_zip","geo_lat","geo_lon","geo_isp","geo_org","geo_asn",
-    # features básicas calculadas
     "part_of_day","hour","dow","ref_domain","os_version_num","is_android","is_ios",
-    # predição (do modo ativo)
     "pred_label","p_comprou","p_quase","p_desinteressado",
-    # thresholds (do modo ativo) e flags
     "thr_qvc","thr_atc","is_qvc","is_atc",
-    # métricas derivadas (modo ativo)
     "pcomprou_pct","thr_qvc_pct","thr_atc_pct","gap_qvc","gap_atc","pct_of_atc",
-    # eventos meta
     "meta_event_sent","meta_view_sent"
 ]
 
@@ -404,10 +395,9 @@ _rf_model = None
 _xgb_model = None
 _stack_model = None  # LogisticRegression
 
-_stack_features: List[str] = []  # ordem esperada p/ stack
+_stack_features: List[str] = []
 _loaded_libs = {"catboost": False, "xgboost": False}
 
-# meta / features / thresholds
 _FEATURE_NAMES_FROM_META: List[str] = []
 _CAT_IDX_FROM_META: List[int] = []
 _TE_STATS = None
@@ -419,11 +409,10 @@ _POS_IDX = None
 
 _thresholds_stack = {"qvc_mid": 0.5, "atc_high": 0.5}
 _thresholds_cb    = {"qvc_mid": 0.5, "atc_high": 0.5}
-_thresholds_rf    = None  # se vier no meta
-_thresholds_xgb   = None  # se vier no meta
+_thresholds_rf    = None
+_thresholds_xgb   = None
 
-# modo de serviço atual (pode ser alterado via admin/set_mode)
-_current_mode = SERVING_MODE_ENV  # "auto" | "cb" | "rf" | "xgb" | "stack"
+_current_mode = SERVING_MODE_ENV
 
 # ===================== TE helpers =====================
 def _load_te_if_available():
@@ -447,7 +436,7 @@ def _apply_te(colname: str, value: str) -> Tuple[float,float]:
         return float(rec.get("count", 0.0)), float(rec.get("buy_rate", prior))
     return 0.0, prior
 
-# ===================== feature builders (compatíveis com treino) =====================
+# ===================== feature builders =====================
 def _norm_text(s: str) -> str:
     import unicodedata
     s = (s or "").strip().lower()
@@ -547,7 +536,6 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
     device_city_combo   = (f"{device_bucket}__{geo_city}").lower()
     utm_partofday_combo = (f"{utm_original}__{part_of_day}").lower()
 
-    # TE encoders (iguais ao treino)
     utm_n,  utm_br  = _apply_te("utm_original", str(utm_original or ""))
     ref_n,  ref_br  = _apply_te("ref_domain",   str(ref_domain))
     devb_n, devb_br = _apply_te("device_bucket",str(device_bucket))
@@ -570,14 +558,6 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
 
 # ===================== loaders =====================
 def _load_models_if_available():
-    """
-    Carrega todos os artefatos disponíveis e prepara:
-      - CatBoost (cb)
-      - RandomForest (rf)
-      - XGBoost (xgb)
-      - Stack (LogReg + stack_meta)
-      - Meta (features, thresholds, TE)
-    """
     global _cb_model, _rf_model, _xgb_model, _stack_model, _stack_features
     global _FEATURE_NAMES_FROM_META, _CAT_IDX_FROM_META
     global _POS_LABEL_NAME, _POS_LABEL_ID, _POS_IDX
@@ -585,8 +565,6 @@ def _load_models_if_available():
     global _TE_STATS, _TE_PRIORS
     global _loaded_libs
 
-    # Reset básicos
-    # (mantemos TE se meta não trouxer; TE fallback abaixo)
     _thresholds_stack = {"qvc_mid": 0.5, "atc_high": 0.5}
     _thresholds_cb    = {"qvc_mid": 0.5, "atc_high": 0.5}
     _thresholds_rf    = None
@@ -596,7 +574,6 @@ def _load_models_if_available():
     _POS_LABEL_ID     = 1
     _POS_IDX          = None
 
-    # --- Meta (features/thresholds/TE)
     meta = None
     if os.path.exists(MODEL_META_PATH):
         try:
@@ -618,7 +595,6 @@ def _load_models_if_available():
             "qvc_mid": float(t_cb.get("qvc_mid", _thresholds_stack["qvc_mid"])),
             "atc_high": float(t_cb.get("atc_high", _thresholds_stack["atc_high"])),
         }
-        # se tiver thresholds específicos:
         if "thresholds_rf" in meta:
             _thresholds_rf = {
                 "qvc_mid": float(meta["thresholds_rf"].get("qvc_mid", 0.5)),
@@ -649,7 +625,6 @@ def _load_models_if_available():
         _CAT_IDX_FROM_META = []
         _load_te_if_available()
 
-    # --- CatBoost
     _cb_model = None
     try:
         if os.path.exists(MODEL_CB_PATH):
@@ -666,7 +641,6 @@ def _load_models_if_available():
     except Exception as e:
         print("[CatBoost] erro ao carregar:", e)
 
-    # --- RandomForest
     _rf_model = None
     if os.path.exists(MODEL_RF_PATH):
         try:
@@ -675,7 +649,6 @@ def _load_models_if_available():
         except Exception as e:
             print("[RF] erro ao carregar:", e)
 
-    # --- XGBoost
     _xgb_model = None
     try:
         if os.path.exists(MODEL_XGB_PATH):
@@ -687,7 +660,6 @@ def _load_models_if_available():
     except Exception as e:
         print("[XGB] erro ao carregar:", e)
 
-    # --- Stack (LogisticRegression) + stack_meta.json
     _stack_model = None
     _stack_features = []
     if os.path.exists(MODEL_STACK_PATH):
@@ -851,7 +823,6 @@ _load_models_if_available()
 
 # ===================== UTM Pré-filtro =====================
 _UTM_A_SUFFIX_PATTERN = re.compile(r"^(?P<base>.*?)(?P<suf>A\d+)$")
-
 def split_utm_A_suffix(utm: str) -> Tuple[str, str]:
     s = (utm or "").strip()
     m = _UTM_A_SUFFIX_PATTERN.match(s)
@@ -933,6 +904,18 @@ def robots():
 def root():
     return PlainTextResponse("OK", status_code=200)
 
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy():
+    try:
+        privacy_path = os.path.join(BASE_DIR, "privacy.html")
+        with open(privacy_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        return HTMLResponse(content=html, status_code=200, headers={
+            "Cache-Control": "public, max-age=3600"
+        })
+    except FileNotFoundError:
+        return PlainTextResponse("privacy.html não encontrado", status_code=404)
+
 def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str, str]:
     link_q = request.query_params.get("link")
     if link_q:
@@ -954,7 +937,6 @@ def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str,
 # ===================== Handler principal =====================
 @app.get("/{full_path:path}")
 def track_number_and_redirect(request: Request, full_path: str = Path(...), cat: Optional[str] = Query(None), mode: Optional[str] = Query(None)):
-    # ===== Entrada =====
     try:
         incoming_url, in_mode = _build_incoming_from_request(request, full_path)
     except HTTPException as he:
@@ -970,7 +952,6 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     ip_addr = (request.client.host if request.client else "0.0.0.0")
     device_name, os_family, os_version = parse_device_info(user_agent)
 
-    # ===== Resolve url =====
     parts_in = urlsplit(incoming_url)
     resolved_url = _resolve_short_follow(incoming_url) if _is_short_domain(parts_in.netloc) else _fix_scheme(incoming_url)
 
@@ -980,35 +961,28 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     if not _is_allowed_long(parts_res.netloc) and not _is_short_domain(parts_res.netloc):
         return JSONResponse({"ok": False, "error": f"Domínio não permitido: {parts_res.netloc}"}, status_code=400)
 
-    # ===== UTM / pré-filtro =====
     outer_uc = request.query_params.get("uc")
     utm_original_in = outer_uc or extract_utm_content_from_url(incoming_url) or extract_utm_content_from_url(resolved_url) or ""
 
     base, suf = split_utm_A_suffix(utm_original_in)
     utm_original = base
-    utm_original_01 = (base + suf) if suf else ""   # COMPLETA quando existir
+    utm_original_01 = (base + suf) if suf else ""
 
-    # base para numbered e subId3
     primary_for_ops = utm_original_01 if utm_original_01 else utm_original
 
-    # ===== utm_numbered =====
     clean_base = re.sub(r'[^A-Za-z0-9]', '', primary_for_ops or "") or "n"
     utm_numbered = f"{clean_base}N{incr_counter()}"
 
-    # ===== origin_url com numbered =====
     url_with_utm = _set_utm_content_preserving_order(resolved_url, utm_numbered)
     origin_url = add_or_update_query_param(url_with_utm, "utm_numbered", utm_numbered)
     if _is_short_domain(urlsplit(origin_url).netloc):
         origin_url = _resolve_short_follow(origin_url)
 
-    # ===== content_ids =====
     content_ids, contents_payload = _build_content_identifiers(origin_url)
 
-    # ===== short oficial (subId3) =====
     sub_id_api = sanitize_subid_for_shopee(primary_for_ops) or "na"
     dest = generate_short_link(origin_url, sub_id_api)
 
-    # ===== Cookies / IDs persistentes =====
     fbp_cookie = get_cookie_value(cookie_header, "_fbp") or _gen_fbp(ts)
 
     fbc_cookie = get_cookie_value(cookie_header, "_fbc")
@@ -1020,7 +994,6 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 
     eid_cookie = get_cookie_value(cookie_header, "_eid") or _sha256_lower(fbp_cookie)
 
-    # ===== snapshot no Redis =====
     r.setex(f"{USERDATA_KEY_PREFIX}{utm_numbered}", USERDATA_TTL_SECONDS, json.dumps({
         "ip": ip_addr, "ua": user_agent, "referrer": referrer,
         "event_source_url": origin_url, "short_link": dest,
@@ -1028,7 +1001,6 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_cookie, "eid": eid_cookie, "mode": in_mode
     }))
 
-    # ===== external_id para CAPI =====
     external_id = eid_cookie or _sha256_lower(f"{user_agent}|{ip_addr}")
 
     user_data_meta = {
@@ -1039,22 +1011,18 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         **({"fbc": fbc_cookie} if fbc_cookie else {})
     }
 
-    # ===== Geo + Features =====
     geo = geo_lookup(ip_addr)
     feats_dict = _features_full_dict(os_family, device_name, os_version, referrer, utm_original, iso_time, geo)
 
-    # ===== Predições de todos os modelos carregados =====
     p_cb_map, p_avail = _compute_all_probs(feats_dict)
     p_cb  = p_avail.get("cb")
     p_rf  = p_avail.get("rf")
     p_xgb = p_avail.get("xgb")
     p_stack = p_avail.get("stack")
 
-    # Escolha do modo (query param > _current_mode > auto)
     forced_mode = (mode or "").strip().lower() if mode else None
     active_mode = _choose_active_mode(forced_mode, p_avail)
 
-    # Probabilidade e thresholds do modo ativo
     if active_mode == "stack" and p_stack is not None:
         p_c = float(p_stack)
         thr_q, thr_a = _thresholds_for_mode("stack")
@@ -1080,7 +1048,6 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     is_atc_flag = 1 if p_c >= thr_a else 0
     pred_label = f"{'comprou' if is_atc_flag else ('comprou_qvc' if is_qvc_flag else 'desinteressado')}"
 
-    # ===== Meta: ViewContent sempre =====
     meta_sent = ""
     meta_view = ""
     if META_PIXEL_ID and META_ACCESS_TOKEN:
@@ -1112,7 +1079,6 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             print("[meta] VC exceção:", e)
             meta_view = "error"
 
-    # ===== Meta: AddToCart se p>=thr_atc =====
     if META_PIXEL_ID and META_ACCESS_TOKEN and is_atc_flag == 1:
         atc_payload = {
             "data": [{
@@ -1142,7 +1108,6 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             print("[meta] ATC exceção:", e)
             meta_sent = "error"
 
-    # ===== Log CSV =====
     hour_log = _extract_hour_from_iso_for_log(iso_time)
     dow_log = _extract_dow_from_iso_for_log(iso_time)
     ref_domain_log = _get_first_domain_for_log(referrer)
@@ -1175,7 +1140,6 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     with _buffer_lock:
         _buffer_rows.append(csv_row)
 
-    # ===== Intersticial Pinterest =====
     def _is_pinterest(ua: str) -> bool:
         return "pinterest" in (ua or "").lower()
 
@@ -1213,17 +1177,17 @@ def admin_page():
         <h2>Enviar modelos</h2>
         <p><b>Arquivos aceitos (opcionais):</b></p>
         <ul>
-          <li><code>model_comprou.cbm</code> (CatBoost)</li>
-          <li><code>model_meta_comprou.json</code> (meta, thresholds, TE)</li>
-          <li><code>rf.joblib</code> (RandomForest)</li>
-          <li><code>xgb.json</code> (XGBoost)</li>
-          <li><code>stack_model.joblib</code> (LogReg do stack)</li>
-          <li><code>stack_meta.json</code> (ordem das features do stack)</li>
-          <li><code>te_stats.json</code> (fallback do Target Encoding)</li>
+          <li><code>model_comprou.cbm</code> (CatBoost) — campos aceitos: <code>model</code>, <code>cb</code>, <code>cb_model</code></li>
+          <li><code>model_meta_comprou.json</code> (meta) — campos: <code>meta</code>, <code>meta_file</code></li>
+          <li><code>rf.joblib</code> (RandomForest) — campos: <code>rf</code>, <code>rf_model</code></li>
+          <li><code>xgb.json</code> (XGBoost) — campos: <code>xgb</code>, <code>xgb_model</code> (salvo sem parse)</li>
+          <li><code>stack_model.joblib</code> (Stack) — campos: <code>stack</code>, <code>stack_model</code></li>
+          <li><code>stack_meta.json</code> (Stack Meta, JSON) — campo: <code>stack_meta</code></li>
+          <li><code>te_stats.json</code> (Target Encoding, JSON) — campo: <code>te</code></li>
         </ul>
         <form method="post" action="/admin/upload_models_bundle" enctype="multipart/form-data">
           <div>Token (X-Admin-Token): <input name="token" type="password" required /></div><br/>
-          <div>model_comprou.cbm: <input name="cb" type="file" /></div><br/>
+          <div>model_comprou.cbm: <input name="model" type="file" /></div><br/>
           <div>model_meta_comprou.json: <input name="meta" type="file" /></div><br/>
           <div>rf.joblib: <input name="rf" type="file" /></div><br/>
           <div>xgb.json: <input name="xgb" type="file" /></div><br/>
@@ -1240,6 +1204,7 @@ def admin_page():
 @app.post("/admin/upload_models_bundle")
 async def admin_upload_models_bundle(
     token: str = Form(...),
+    # nomes principais
     cb: UploadFile = File(None),
     meta: UploadFile = File(None),
     rf: UploadFile = File(None),
@@ -1247,17 +1212,32 @@ async def admin_upload_models_bundle(
     stack: UploadFile = File(None),
     stack_meta: UploadFile = File(None),
     te: UploadFile = File(None),
+    # aliases comuns
+    model: UploadFile = File(None),
+    cb_model: UploadFile = File(None),
+    rf_model: UploadFile = File(None),
+    xgb_model: UploadFile = File(None),
+    stack_model: UploadFile = File(None),
 ):
     if token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
-    # Leitura única + parse condicional
-    if cb:        await _save_upload_once(cb,   MODEL_CB_PATH,      expect_json=False)
-    if meta:      await _save_upload_once(meta, MODEL_META_PATH,    expect_json=True)
-    if rf:        await _save_upload_once(rf,   MODEL_RF_PATH,      expect_json=False)
-    if xgb:       await _save_upload_once(xgb,  MODEL_XGB_PATH,     expect_json=False)  # modelo XGB em JSON → sem parse
-    if stack:     await _save_upload_once(stack,MODEL_STACK_PATH,   expect_json=False)
-    if stack_meta:await _save_upload_once(stack_meta, STACK_META_PATH, expect_json=True)
-    if te:        await _save_upload_once(te,   TE_STATS_PATH,      expect_json=True)
+
+    # aliases -> efetivos
+    up_cb    = _first_non_none(cb, model, cb_model)
+    up_meta  = meta
+    up_rf    = _first_non_none(rf, rf_model)
+    up_xgb   = _first_non_none(xgb, xgb_model)
+    up_stack = _first_non_none(stack, stack_model)
+    up_stack_meta = stack_meta
+    up_te    = te
+
+    if up_cb:        await _save_upload_once(up_cb,        MODEL_CB_PATH,    expect_json=False)
+    if up_meta:      await _save_upload_once(up_meta,      MODEL_META_PATH,  expect_json=True)
+    if up_rf:        await _save_upload_once(up_rf,        MODEL_RF_PATH,    expect_json=False)
+    if up_xgb:       await _save_upload_once(up_xgb,       MODEL_XGB_PATH,   expect_json=False)  # sem parse
+    if up_stack:     await _save_upload_once(up_stack,     MODEL_STACK_PATH, expect_json=False)
+    if up_stack_meta:await _save_upload_once(up_stack_meta,STACK_META_PATH,  expect_json=True)
+    if up_te:        await _save_upload_once(up_te,        TE_STATS_PATH,    expect_json=True)
 
     _load_models_if_available()
     return {
@@ -1279,41 +1259,50 @@ async def admin_upload_model_simple(token: str = Form(...), model: UploadFile = 
 
 @app.post("/admin/upload_model")
 async def admin_upload_model(
+    # compat: nomes antigos e atuais
     model_file: UploadFile = File(None), meta_file: UploadFile = File(None),
     model: UploadFile = File(None), meta: UploadFile = File(None),
     rf: UploadFile = File(None), xgb: UploadFile = File(None),
     stack: UploadFile = File(None), stack_meta: UploadFile = File(None),
     te: UploadFile = File(None),
+    # aliases adicionais aceitos
+    cb: UploadFile = File(None), cb_model: UploadFile = File(None),
+    rf_model: UploadFile = File(None), xgb_model: UploadFile = File(None),
+    stack_model: UploadFile = File(None),
     x_admin_token: str = Header(None)
 ):
     """
-    Endpoint corrigido:
-    - Leitura única de cada UploadFile
-    - Só valida JSON quando necessário (meta, stack_meta, te)
-    - Salva binários diretamente (.cbm, .joblib, xgb.json)
+    Endpoint robusto:
+    - Leitura única dos arquivos.
+    - JSON obrigatório apenas para: meta, stack_meta, te.
+    - xgb.json é salvo SEM parse (modelo em JSON).
+    - Aceita aliases: rf/rf_model, xgb/xgb_model, stack/stack_model, cb/model/cb_model, meta/meta_file.
     """
     if x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
 
-    # Compat: aceitar tanto (model_file/meta_file) quanto (model/meta)
-    up_model = model_file or model
-    up_meta  = meta_file  or meta
+    # mapeia aliases -> efetivos
+    up_model = _first_non_none(model_file, model, cb, cb_model)   # CatBoost
+    up_meta  = _first_non_none(meta_file, meta)                   # JSON do meta
+    up_rf    = _first_non_none(rf, rf_model)                      # RF
+    up_xgb   = _first_non_none(xgb, xgb_model)                    # XGB (json, sem parse)
+    up_stack = _first_non_none(stack, stack_model)                # Stack model.joblib
+    up_stack_meta = stack_meta                                    # Stack meta (JSON)
+    up_te    = te                                                 # TE (JSON)
 
-    # Salva principais
+    # salva efetivos
     if up_model:
         await _save_upload_once(up_model, MODEL_CB_PATH, expect_json=False)
     if up_meta:
-        await _save_upload_once(up_meta,  MODEL_META_PATH, expect_json=True)
+        await _save_upload_once(up_meta, MODEL_META_PATH, expect_json=True)
 
-    # Salva extras (sem parse, exceto quando explicitamente JSON de config)
     try:
-        if rf:        await _save_upload_once(rf,        MODEL_RF_PATH,     expect_json=False)
-        if xgb:       await _save_upload_once(xgb,       MODEL_XGB_PATH,    expect_json=False)  # modelo em JSON → sem parse
-        if stack:     await _save_upload_once(stack,     MODEL_STACK_PATH,  expect_json=False)
-        if stack_meta:await _save_upload_once(stack_meta,STACK_META_PATH,   expect_json=True)   # JSON de ordem/thresholds
-        if te:        await _save_upload_once(te,        TE_STATS_PATH,     expect_json=True)   # JSON de TE (opcional)
+        if up_rf:        await _save_upload_once(up_rf,        MODEL_RF_PATH,    expect_json=False)
+        if up_xgb:       await _save_upload_once(up_xgb,       MODEL_XGB_PATH,   expect_json=False)  # sem parse
+        if up_stack:     await _save_upload_once(up_stack,     MODEL_STACK_PATH, expect_json=False)
+        if up_stack_meta:await _save_upload_once(up_stack_meta,STACK_META_PATH,  expect_json=True)
+        if up_te:        await _save_upload_once(up_te,        TE_STATS_PATH,    expect_json=True)
     except HTTPException:
-        # repassa erro com mensagem clara (e status adequado)
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"falha ao salvar arquivo(s) extras: {e}")
@@ -1324,11 +1313,11 @@ async def admin_upload_model(
         "saved": {
             "cb": MODEL_CB_PATH if up_model else None,
             "meta": MODEL_META_PATH if up_meta else None,
-            "rf": MODEL_RF_PATH if rf else None,
-            "xgb": MODEL_XGB_PATH if xgb else None,
-            "stack": MODEL_STACK_PATH if stack else None,
-            "stack_meta": STACK_META_PATH if stack_meta else None,
-            "te": TE_STATS_PATH if te else None
+            "rf": MODEL_RF_PATH if up_rf else None,
+            "xgb": MODEL_XGB_PATH if up_xgb else None,
+            "stack": MODEL_STACK_PATH if up_stack else None,
+            "stack_meta": STACK_META_PATH if up_stack_meta else None,
+            "te": TE_STATS_PATH if up_te else None
         },
         "models_loaded": {"cb": bool(_cb_model), "rf": bool(_rf_model), "xgb": bool(_xgb_model), "stack": bool(_stack_model)},
         "thr_stack": _thresholds_stack, "thr_cb": _thresholds_cb, "thr_rf": _thresholds_rf, "thr_xgb": _thresholds_xgb,
@@ -1349,10 +1338,6 @@ def admin_reload_model(x_admin_token: str = Header(None)):
 
 @app.post("/admin/set_mode")
 def admin_set_mode(mode: str = Query(...), x_admin_token: str = Header(None)):
-    """
-    Define o modo de serviço em runtime (até o processo reiniciar).
-    Valores aceitos: auto | cb | rf | xgb | stack
-    """
     global _current_mode
     if x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
