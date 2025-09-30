@@ -20,3 +20,9 @@ scipy==1.11.4
 # === Adições para multi-model ===
 xgboost==2.0.3        # necessário se usar XGBoost (e recomendado no STACK)
 onnxruntime==1.18.0   # necessário somente se usar Endorphin em ONNX (CPU)
+
+pydantic==2.*
+joblib
+requests
+
+
