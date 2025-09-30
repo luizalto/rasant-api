@@ -680,17 +680,27 @@ def _load_models_if_available():
         except Exception as e:
             print("[RF] erro ao carregar:", e)
 
-    # XGB
-    _xgb_model = None
-    try:
-        if os.path.exists(MODEL_XGB_PATH):
-            import xgboost as xgb
-            _loaded_libs["xgboost"] = True
-            model = xgb.XGBClassifier()
-            model.load_model(MODEL_XGB_PATH)
-            _xgb_model = model
-    except Exception as e:
-        print("[XGB] erro ao carregar:", e)
+ # XGB
+_xgb_model = None
+try:
+    if os.path.exists(MODEL_XGB_PATH):
+        import xgboost as xgb
+        _loaded_libs["xgboost"] = True
+        try:
+            # Caminho padrão: modelo salvo por XGBClassifier.save_model(...)
+            clf = xgb.XGBClassifier()
+            clf.load_model(MODEL_XGB_PATH)
+            _xgb_model = clf
+        except Exception as e1:
+            # Fallback: modelo salvo como Booster puro
+            bst = xgb.Booster()
+            bst.load_model(MODEL_XGB_PATH)
+            _xgb_model = bst
+except Exception as e:
+    import traceback
+    print("[XGB] erro ao carregar:", e)
+    traceback.print_exc()
+
 
     # Stack
     _stack_model = None
@@ -767,12 +777,28 @@ def _xgb_predict_proba(feats_dict: Dict[str, Any]) -> Optional[float]:
         return None
     try:
         import numpy as np
-        X = np.asarray([_rf_xgb_feature_vector_from(feats_dict)], dtype=float)
-        proba = _xgb_model.predict_proba(X)[0]
-        return float(proba[1]) if len(proba) >= 2 else None
-    except Exception as e:
-        print("[predict-xgb] erro:", e)
+        X_np = np.asarray([_rf_xgb_feature_vector_from(feats_dict)], dtype=float)
+
+        # Caso 1: wrapper sklearn (XGBClassifier)
+        if hasattr(_xgb_model, "predict_proba"):
+            proba = _xgb_model.predict_proba(X_np)[0]
+            return float(proba[1]) if len(proba) >= 2 else None
+
+        # Caso 2: Booster puro
+        import xgboost as xgb
+        dmat = xgb.DMatrix(X_np)
+        p = _xgb_model.predict(dmat)  # shape (n,) ou (n,2)
+        if getattr(p, "ndim", 1) == 1:
+            return float(p[0])                 # prob positiva direta
+        if p.ndim == 2 and p.shape[1] >= 2:
+            return float(p[0, 1])              # coluna da classe positiva
         return None
+    except Exception as e:
+        import traceback
+        print("[predict-xgb] erro:", e)
+        traceback.print_exc()
+        return None
+
 
 def _stack_predict_proba(p_cb: Optional[float], p_rf: Optional[float], p_xgb: Optional[float]) -> Optional[float]:
     if not _stack_model or not _stack_features:
@@ -1533,3 +1559,4 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
+
