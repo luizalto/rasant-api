@@ -680,26 +680,48 @@ def _load_models_if_available():
         except Exception as e:
             print("[RF] erro ao carregar:", e)
 
- # XGB
-_xgb_model = None
-try:
-    if os.path.exists(MODEL_XGB_PATH):
-        import xgboost as xgb
-        _loaded_libs["xgboost"] = True
-        try:
-            # Caminho padrão: modelo salvo por XGBClassifier.save_model(...)
-            clf = xgb.XGBClassifier()
-            clf.load_model(MODEL_XGB_PATH)
-            _xgb_model = clf
-        except Exception as e1:
-            # Fallback: modelo salvo como Booster puro
-            bst = xgb.Booster()
-            bst.load_model(MODEL_XGB_PATH)
-            _xgb_model = bst
-except Exception as e:
-    import traceback
-    print("[XGB] erro ao carregar:", e)
-    traceback.print_exc()
+    # XGB
+    _xgb_model = None
+    try:
+        if os.path.exists(MODEL_XGB_PATH):
+            import xgboost as xgb
+            _loaded_libs["xgboost"] = True
+            try:
+                # Modelo salvo via XGBClassifier.save_model(...)
+                clf = xgb.XGBClassifier()
+                clf.load_model(MODEL_XGB_PATH)
+                _xgb_model = clf
+            except Exception:
+                # Fallback: modelo salvo como Booster puro
+                bst = xgb.Booster()
+                bst.load_model(MODEL_XGB_PATH)
+                _xgb_model = bst
+    except Exception as e:
+        import traceback
+        print("[XGB] erro ao carregar:", e)
+        traceback.print_exc()
+     
+    # XGB
+    _xgb_model = None
+    try:
+        if os.path.exists(MODEL_XGB_PATH):
+            import xgboost as xgb
+            _loaded_libs["xgboost"] = True
+            try:
+                # Modelo salvo via XGBClassifier.save_model(...)
+                clf = xgb.XGBClassifier()
+                clf.load_model(MODEL_XGB_PATH)
+                _xgb_model = clf
+            except Exception:
+                # Fallback: modelo salvo como Booster puro
+                bst = xgb.Booster()
+                bst.load_model(MODEL_XGB_PATH)
+                _xgb_model = bst
+    except Exception as e:
+        import traceback
+        print("[XGB] erro ao carregar:", e)
+        traceback.print_exc()
+
 
 
     # Stack
@@ -1559,4 +1581,5 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
+
 
