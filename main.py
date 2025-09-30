@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI)
-(versão mesclada e corrigida)
+(versão mesclada e corrigida) — UTMContent / UTMContent01 / UTMNumered
 
-Novidades:
-- Short-link: sempre gerar via API oficial da Shopee. Se não conseguir (credencial/erro), retorna 502 (NÃO entrega URL longa).
-- UTM (A-sufixo): identifica sufixo 'A\\d+' (A maiúsculo), não filtra. Salva:
-    * utm_original_01  (subid completo = base + A.., se existir; senão vazio)
-    * subid_base       (somente base, sem A..)
-    * subid_full       (sinônimo de utm_original_01, para dashboards)
-- subId3 = utm_numbered
-- Upload /admin/upload_model corrigido (leitura única e parse condicional).
+Mudanças:
+- Short-link: SEMPRE via API oficial da Shopee; se falhar (credencial/erro), 502 (não entrega URL longa).
+- UTM:
+  * UTMContent     = base (até antes do sufixo 'A\d+').
+  * UTMContent01   = completo com 'A\d+' (se houver), senão vazio.
+  * UTMNumered     = (UTMContent01 se existir, senão UTMContent) + 'N' + contador infinito.
+  * Apenas substitui o valor de utm_content na URL (NÃO adiciona 'utm_numbered=').
+  * subId3 (API Shopee) = UTMNumered (sanitizado).
+- Redis/CSV: mantém colunas utm_original (UTMContent), utm_original_01 (UTMContent01), utm_numbered (UTMNumered).
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -293,7 +294,7 @@ def sanitize_subid_for_shopee(value: str) -> str:
     return cleaned[:_SUBID_MAXLEN] if cleaned else "na"
 
 def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
-    # "Sempre gerar": se não houver credencial, retorna 502 (não entregamos URL longa)
+    # Sempre gerar via API; sem credenciais -> 502
     if not SHOPEE_APP_ID or not SHOPEE_APP_SECRET:
         raise HTTPException(status_code=502, detail="shortlink_unavailable: missing Shopee credentials")
     payload_obj = {
@@ -938,29 +939,38 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     if not _is_allowed_long(parts_res.netloc) and not _is_short_domain(parts_res.netloc):
         return JSONResponse({"ok": False, "error": f"Domínio não permitido: {parts_res.netloc}"}, status_code=400)
 
-    # ===== UTM / identificação do sufixo A =====
+    # ===== UTM / separação: UTMContent (base) e UTMContent01 (com A.. completo) =====
     outer_uc = request.query_params.get("uc")
-    utm_in = outer_uc or extract_utm_content_from_url(incoming_url) or extract_utm_content_from_url(resolved_url) or ""
-    subid_base, subid_suffix = split_utm_A_suffix(utm_in)         # detecta 'A\d+' (A maiúsculo)
-    utm_original = subid_base                                     # base SEM sufixo
-    utm_original_01 = (subid_base + subid_suffix) if subid_suffix else ""  # subid completo (base + A..), senão vazio
 
-    # base usada para numerar
-    primary_for_ops = utm_original_01 if utm_original_01 else utm_original
-    clean_base = re.sub(r'[^A-Za-z0-9]', '', primary_for_ops or "") or "n"
-    utm_numbered = f"{clean_base}N{incr_counter()}"
+    # 1) Captura o utm_content conforme veio (prioridade: URL resolvida > URL de entrada > ?uc=)
+    utm_raw = extract_utm_content_from_url(resolved_url) or \
+              extract_utm_content_from_url(incoming_url) or \
+              (outer_uc or "")
+    utm_raw = (utm_raw or "").strip()
 
-    # ===== origin_url com numbered na query =====
-    url_with_utm = _set_utm_content_preserving_order(resolved_url, utm_numbered)
-    origin_url = add_or_update_query_param(url_with_utm, "utm_numbered", utm_numbered)
+    # 2) Separa base e sufixo 'A\d+' (A maiúsculo) — NÃO filtra para operação
+    subid_base, subid_suffix = split_utm_A_suffix(utm_raw)
+
+    # 3) Mapas lógicos solicitados
+    utm_original    = subid_base                                  # == UTMContent (base)
+    utm_original_01 = (subid_base + subid_suffix) if subid_suffix else ""  # == UTMContent01 (com A..), ou vazio
+
+    # 4) Semente p/ numeração: prioriza UTMContent01; se vazio, usa UTMContent
+    seed_for_numbering = (utm_original_01 or utm_original)
+
+    # 5) UTMNumered = seed limpa + 'N' + contador infinito
+    seed_clean   = re.sub(r'[^A-Za-z0-9]', '', seed_for_numbering) or "n"
+    utm_numbered = f"{seed_clean}N{incr_counter()}"   # == UTMNumered
+
+    # 6) Substitui APENAS o valor de utm_content; NÃO adiciona 'utm_numbered=' na query
+    origin_url = _set_utm_content_preserving_order(resolved_url, utm_numbered)
     if _is_short_domain(urlsplit(origin_url).netloc):
         origin_url = _resolve_short_follow(origin_url)
 
     # ===== content_ids / contents =====
     content_ids, contents_payload = _build_content_identifiers(origin_url)
 
-    # ===== short oficial (sempre) =====
-    # subId3 = utm_numbered (sanitizado)
+    # ===== Short oficial (sempre) — subId3 = UTMNumered (sanitizado) =====
     sub_id_api = sanitize_subid_for_shopee(utm_numbered) or "na"
     dest = generate_short_link(origin_url, sub_id_api)  # se falhar, gera HTTP 502
 
@@ -975,11 +985,13 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         "ip": ip_addr, "ua": user_agent, "referrer": referrer,
         "event_source_url": origin_url, "short_link": dest,
         "vc_time": ts,
-        "utm_original": utm_original,
-        "utm_original_01": utm_original_01,
+        # === colunas pedidas ===
+        "utm_original": utm_original,           # UTMContent (base)
+        "utm_original_01": utm_original_01,     # UTMContent01 (com A.. ou vazio)
         "subid_base": subid_base,
-        "subid_full": utm_original_01 or subid_base,
-        "utm_numbered": utm_numbered,
+        "subid_full": (utm_original_01 or subid_base),
+        "utm_numbered": utm_numbered,           # UTMNumered (aplicado em utm_content e subId3)
+        # =======================
         "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_cookie, "eid": eid_cookie, "mode": in_mode
     }))
 
@@ -1209,7 +1221,6 @@ async def admin_upload_models_bundle(
             open(MODEL_CB_PATH, "wb").write(data)
         if meta:
             data = await meta.read()
-            # parse condicional (só se não vazio)
             if data and data.strip():
                 json.loads(data.decode("utf-8"))
             open(MODEL_META_PATH, "wb").write(data)
@@ -1218,7 +1229,6 @@ async def admin_upload_models_bundle(
             open(MODEL_RF_PATH, "wb").write(data)
         if xgb:
             data = await xgb.read()
-            # xgb.json deve ser JSON válido
             if data and data.strip():
                 json.loads(data.decode("utf-8"))
             open(MODEL_XGB_PATH, "wb").write(data)
