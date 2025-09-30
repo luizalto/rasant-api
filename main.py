@@ -186,7 +186,13 @@ def _extract_shopee_ids(u: str) -> Tuple[Optional[str], Optional[str]]:
         return m.group(1), m.group(2)
     return None, None
 
-def _build_content_identifiers(origin_url: str) -> Tuple[List[str], List[Dict[str, Any]]]:
+def _build_content_identifiers(origin_url: str) -> Tuple[List[str], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Retorna:
+      - content_ids: lista com 1 id
+      - contents_meta: para Meta CAPI -> usa chave 'id'
+      - contents_tiktok: para TikTok Events API -> usa chave 'content_id'
+    """
     shop_id, item_id = _extract_shopee_ids(origin_url)
     if shop_id and item_id:
         cid = f"{shop_id}.{item_id}"
@@ -194,7 +200,10 @@ def _build_content_identifiers(origin_url: str) -> Tuple[List[str], List[Dict[st
         parts = urlsplit(origin_url)
         base = (parts.path or "/") + ("?" + parts.query if parts.query else "")
         cid  = _sha256_lower(base)[:16]
-    return [cid], [{"id": cid, "quantity": 1}]
+
+    contents_meta   = [{"id": cid, "quantity": 1}]
+    contents_tiktok = [{"content_id": cid, "quantity": 1}]
+    return [cid], contents_meta, contents_tiktok
 
 # ===================== AM / IDs =====================
 def _gen_fbp(ts: int) -> str:
@@ -910,7 +919,7 @@ def _thresholds_for_mode(mode: str) -> Tuple[float,float]:
 
 _load_models_if_available()
 
-# ===================== TikTok helper =====================
+# ===================== TikTok helper (corrigido) =====================
 def send_tiktok_event(
     event_name: str,
     event_id: str,
@@ -922,30 +931,32 @@ def send_tiktok_event(
     currency: str,
     value: float,
     content_ids: List[str],
-    contents_payload: List[Dict[str, Any]],
+    contents_payload_tiktok: List[Dict[str, Any]],
 ) -> str:
+    """
+    Correções:
+      - contents usa 'content_id' (não 'id')
+      - valida JSON de resposta (TikTok retorna HTTP 200 com code != 0 em erro)
+    """
     if not (TIKTOK_PIXEL_ID and TIKTOK_ACCESS_TOKEN):
         return "skipped:no_tiktok_creds"
 
     payload = {
         "pixel_code": TIKTOK_PIXEL_ID,
-        "event": event_name,
-        "event_id": event_id,
-        "timestamp": ts,
+        "event": event_name,                # "ViewContent", "CompletePayment" (Purchase)
+        "event_id": event_id,               # dedup
+        "timestamp": int(ts),               # segundos
         "context": {
             "ad": {"callback": ttclid} if ttclid else {},
             "page": {"url": page_url},
-            "user": {
-                "ip": ip,
-                "user_agent": user_agent
-            }
+            "user": {"ip": ip, "user_agent": user_agent}
         },
         "properties": {
             "currency": currency,
             "value": float(value),
             "content_type": "product",
-            "content_id": content_ids[0] if content_ids else None,
-            "contents": contents_payload,
+            "content_id": (content_ids[0] if content_ids else None),
+            "contents": contents_payload_tiktok,  # [{"content_id": "...", "quantity": 1}]
         }
     }
 
@@ -953,9 +964,15 @@ def send_tiktok_event(
 
     try:
         resp = session.post(TIKTOK_API_TRACK_URL, headers=headers, json=payload, timeout=8)
-        if resp.status_code < 400:
+        try:
+            j = resp.json()
+        except Exception:
+            j = {}
+        # sucesso real: HTTP < 400 E code == 0
+        if resp.status_code < 400 and isinstance(j, dict) and str(j.get("code", 0)) in ("0", "0.0", 0):
             return "ok"
-        return f"error:{resp.status_code}"
+        # Retorna detalhes pra facilitar debug
+        return f"error:http={resp.status_code},code={j.get('code')},msg={j.get('message')}"
     except Exception as e:
         print("[tiktok] exceção:", e)
         return "error"
@@ -1116,8 +1133,8 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     # Substitui APENAS o utm_content na URL
     origin_url = _set_utm_content_preserving_order(resolved_url, utm_numbered)
 
-    # ===== content_ids / contents =====
-    content_ids, contents_payload = _build_content_identifiers(origin_url)
+    # ===== content_ids / contents (separados por canal) =====
+    content_ids, contents_meta, contents_tiktok = _build_content_identifiers(origin_url)
 
     # ===== Short oficial (sempre) — subId3 = UTMNumered (sanitizado) =====
     sub_id_api = sanitize_subid_for_shopee(utm_numbered) or "na"
@@ -1215,7 +1232,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                     "value": 0,
                     "content_type": "product",
                     "content_ids": content_ids,
-                    "contents": contents_payload
+                    "contents": contents_meta  # Meta exige 'id' nos itens
                 }
             }]}
         try:
@@ -1229,7 +1246,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             print("[meta] VC exceção:", e)
             meta_view = "error"
 
-    # ===== TikTok: ViewContent =====
+    # ===== TikTok: ViewContent (corrigido) =====
     tiktok_view = ""
     try:
         tiktok_view = send_tiktok_event(
@@ -1243,7 +1260,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             currency="BRL",
             value=0.0,
             content_ids=content_ids,
-            contents_payload=contents_payload,
+            contents_payload_tiktok=contents_tiktok,
         )
     except Exception as e:
         print("[tiktok] VC exceção:", e)
@@ -1264,7 +1281,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                     "value": 0,
                     "content_type": "product",
                     "content_ids": content_ids,
-                    "contents": contents_payload
+                    "contents": contents_meta
                 }
             }]}
         try:
@@ -1293,7 +1310,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                 currency="BRL",
                 value=0.0,
                 content_ids=content_ids,
-                contents_payload=contents_payload,
+                contents_payload_tiktok=contents_tiktok,
             )
         except Exception as e:
             print("[tiktok] Purchase exceção:", e)
