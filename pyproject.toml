@@ -8,7 +8,7 @@ version = "0.1.0"
 name = "rasant-api"
 version = "0.1.0"
 description = "Shopee UTM → ShortLink + Predict + CAPI + TikTok"
-authors = ["Seu Nome <you@example.com>"]
+authors = ["luizalto <you@example.com>"]
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.12"
@@ -18,18 +18,17 @@ requests = "2.31.0"
 python-multipart = "0.0.9"
 google-cloud-storage = "2.16.0"
 redis = "5.0.3"
-
-# ML
 catboost = "1.2.5"
 pandas = "2.2.2"
 scikit-learn = "1.4.2"
 numpy = "1.26.4"
 scipy = "1.11.4"
 joblib = "1.5.2"
-xgboost = "3.0.5"   # <<< IMPORTANTE: entre aspas, sem vírgula no final
+xgboost = "3.0.5"   # 👈 aqui a linha importante
 
 [build-system]
 requires = ["poetry-core>=1.8.0"]
 build-backend = "poetry.core.masonry.api"
+
 
 
