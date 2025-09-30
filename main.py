@@ -1,7 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI) + TikTok Events API
+FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK)
++ Meta Ads (CAPI) + TikTok Events API
 (versão consolidada) — UTMContent / UTMContent01 / UTMNumered
+
+Correções TikTok:
+- Usa 'event_time' (e não 'timestamp').
+- Eventos válidos: ViewContent, AddToCart, Purchase, etc. (NADA de 'CompletePayment').
+- Função send_tiktok_event com log amigável do corpo de resposta.
+- Pensado para disparar AddToCart com a MESMA regra usada no Meta.
 
 REQUISITOS:
 - NÃO resolver/abrir short-link da Shopee antes de gerar o short oficial (SKIP_RESOLVE=1 por padrão).
@@ -66,6 +73,7 @@ TIKTOK_PIXEL_ID       = os.getenv("TIKTOK_PIXEL_ID", "")
 TIKTOK_ACCESS_TOKEN   = os.getenv("TIKTOK_ACCESS_TOKEN", "")
 TIKTOK_API_BASE       = os.getenv("TIKTOK_API_BASE", "https://business-api.tiktok.com/open_api")
 TIKTOK_API_TRACK_URL  = f"{TIKTOK_API_BASE}/v1.3/pixel/track/"
+TIKTOK_TEST_EVENT_CODE = os.getenv("TIKTOK_TEST_EVENT_CODE")  # opcional
 
 # Seleção de modelo (server)
 SERVING_MODE_ENV      = (os.getenv("SERVING_MODE", "auto") or "auto").strip().lower()  # auto|cb|rf|xgb|stack
@@ -82,7 +90,6 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 MODEL_CB_PATH        = os.path.join(MODELS_DIR, "model_comprou.cbm")
 MODEL_META_PATH      = os.path.join(MODELS_DIR, "model_meta_comprou.json")
 TE_STATS_PATH        = os.path.join(MODELS_DIR, "te_stats.json")          # opcional (fallback)
-
 MODEL_RF_PATH        = os.path.join(MODELS_DIR, "rf.joblib")
 MODEL_XGB_PATH       = os.path.join(MODELS_DIR, "xgb.json")
 MODEL_STACK_PATH     = os.path.join(MODELS_DIR, "stack_model.joblib")
@@ -687,12 +694,10 @@ def _load_models_if_available():
             import xgboost as xgb
             _loaded_libs["xgboost"] = True
             try:
-                # Modelo salvo via XGBClassifier.save_model(...)
                 clf = xgb.XGBClassifier()
                 clf.load_model(MODEL_XGB_PATH)
                 _xgb_model = clf
             except Exception:
-                # Fallback: modelo salvo como Booster puro
                 bst = xgb.Booster()
                 bst.load_model(MODEL_XGB_PATH)
                 _xgb_model = bst
@@ -700,29 +705,6 @@ def _load_models_if_available():
         import traceback
         print("[XGB] erro ao carregar:", e)
         traceback.print_exc()
-     
-    # XGB
-    _xgb_model = None
-    try:
-        if os.path.exists(MODEL_XGB_PATH):
-            import xgboost as xgb
-            _loaded_libs["xgboost"] = True
-            try:
-                # Modelo salvo via XGBClassifier.save_model(...)
-                clf = xgb.XGBClassifier()
-                clf.load_model(MODEL_XGB_PATH)
-                _xgb_model = clf
-            except Exception:
-                # Fallback: modelo salvo como Booster puro
-                bst = xgb.Booster()
-                bst.load_model(MODEL_XGB_PATH)
-                _xgb_model = bst
-    except Exception as e:
-        import traceback
-        print("[XGB] erro ao carregar:", e)
-        traceback.print_exc()
-
-
 
     # Stack
     _stack_model = None
@@ -738,6 +720,7 @@ def _load_models_if_available():
             sm = json.load(open(STACK_META_PATH, "r", encoding="utf-8"))
             _stack_features = list(sm.get("stack_features", []))
             if "thresholds" in sm:
+                global _thresholds_stack
                 _thresholds_stack = {
                     "qvc_mid": float(sm["thresholds"].get("qvc_mid", _thresholds_stack["qvc_mid"])),
                     "atc_high": float(sm["thresholds"].get("atc_high", _thresholds_stack["atc_high"])),
@@ -821,19 +804,13 @@ def _xgb_predict_proba(feats_dict: Dict[str, Any]) -> Optional[float]:
         traceback.print_exc()
         return None
 
-
 def _stack_predict_proba(p_cb: Optional[float], p_rf: Optional[float], p_xgb: Optional[float]) -> Optional[float]:
     if not _stack_model or not _stack_features:
         return None
     try:
         import numpy as np
         mapping = {"proba_cb": p_cb, "proba_rf": p_rf, "proba_xgb": p_xgb}
-        vec = []
-        for f in _stack_features:
-            v = mapping.get(f)
-            if v is None:
-                return None
-            vec.append(float(v))
+        vec = [float(mapping.get(f)) for f in _stack_features]
         X = np.asarray([vec], dtype=float)
         proba = _stack_model.predict_proba(X)[0]
         return float(proba[1]) if len(proba) >= 2 else None
@@ -902,7 +879,7 @@ def _compute_all_probs(feats_dict: Dict[str, Any]) -> Tuple[Dict[str,float], Dic
 
 _load_models_if_available()
 
-# ===================== TikTok helper =====================
+# ===================== TikTok helper (corrigido) =====================
 def send_tiktok_event(
     event_name: str,
     event_id: str,
@@ -925,25 +902,25 @@ def send_tiktok_event(
 
     payload = {
         "pixel_code": TIKTOK_PIXEL_ID,
-        "event": event_name,                # "ViewContent", "CompletePayment"
-        "event_id": event_id,               # dedup
-        "timestamp": ts,                    # segundos
+        "event": event_name,               # "ViewContent", "AddToCart", "Purchase", ...
+        "event_id": event_id,              # dedup
+        "event_time": ts,                  # CORRETO p/ TikTok (não usar 'timestamp')
         "context": {
             "ad": {"callback": ttclid} if ttclid else {},
             "page": {"url": page_url},
-            "user": {
-                "ip": ip,
-                "user_agent": user_agent
-            }
+            "user": {"ip": ip, "user_agent": user_agent}
         },
         "properties": {
-            "currency": currency,           # "BRL"
+            "currency": currency,
             "value": float(value),
             "content_type": "product",
             "content_id": content_ids[0] if content_ids else None,
-            "contents": contents_payload,   # [{"id": "...", "quantity": 1}]
+            "contents": contents_payload,
         }
     }
+
+    if TIKTOK_TEST_EVENT_CODE:
+        payload["test_event_code"] = TIKTOK_TEST_EVENT_CODE
 
     headers = {
         "Content-Type": "application/json",
@@ -952,9 +929,13 @@ def send_tiktok_event(
 
     try:
         resp = session.post(TIKTOK_API_TRACK_URL, headers=headers, json=payload, timeout=8)
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"raw": resp.text}
         if resp.status_code < 400:
             return "ok"
-        return f"error:{resp.status_code}"
+        return f"error:{resp.status_code}:{body}"
     except Exception as e:
         print("[tiktok] exceção:", e)
         return "error"
@@ -997,6 +978,13 @@ def _background_flusher():
         time.sleep(FLUSH_MAX_SECONDS)
 
 threading.Thread(target=_background_flusher, daemon=True).start()
+
+# ======== (FIM DA 1ª METADE) ========
+# A próxima parte traz:
+# - rotas /health, /robots.txt, /, /privacy
+# - handler principal (/{full_path:path}) com Meta + TikTok (VC, ATC, Purchase)
+# - páginas/admin e uploads de modelos
+# - flush on exit e uvicorn.run
 
 # ===================== Rotas =====================
 @app.get("/health")
@@ -1065,7 +1053,12 @@ def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str,
 
 # ===================== Handler principal =====================
 @app.get("/{full_path:path}")
-def track_number_and_redirect(request: Request, full_path: str = Path(...), cat: Optional[str] = Query(None), mode: Optional[str] = Query(None)):
+def track_number_and_redirect(
+    request: Request,
+    full_path: str = Path(...),
+    cat: Optional[str] = Query(None),
+    mode: Optional[str] = Query(None)
+):
     # Interpretação da URL de entrada (sem resolver short, por padrão)
     try:
         incoming_url, in_mode = _build_incoming_from_request(request, full_path)
@@ -1085,7 +1078,6 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 
     # ===== Interpretar URL de entrada SEM resolver =====
     parts_in = urlsplit(incoming_url)
-
     if SKIP_RESOLVE:
         resolved_url = _fix_scheme(incoming_url)
     else:
@@ -1222,7 +1214,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             print("[meta] VC exceção:", e)
             meta_view = "error"
 
-    # ===== TikTok: ViewContent =====
+    # ===== TikTok: ViewContent (corrigido) =====
     tiktok_view = ""
     try:
         tiktok_view = send_tiktok_event(
@@ -1271,26 +1263,46 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             print("[meta] ATC exceção:", e)
             meta_sent = "error"
 
-    # ===== TikTok: CompletePayment (equivalente a Purchase) quando is_atc_flag == 1 =====
+    # ===== TikTok: AddToCart (MESMA REGRA do Meta: is_atc_flag == 1) =====
     tiktok_sent = ""
     if is_atc_flag == 1:
         try:
             tiktok_sent = send_tiktok_event(
-                event_name="CompletePayment",
-                event_id=utm_numbered,
+                event_name="AddToCart",           # equivalente no TikTok
+                event_id=utm_numbered + "-atc",   # dedup separado do VC
                 ts=ts,
                 page_url=origin_url,
                 ip=ip_addr,
                 user_agent=user_agent,
                 ttclid=ttclid,
                 currency="BRL",
-                value=0.0,  # se desejar enviar valor do item/ordem, ajustar aqui
+                value=0.0,
                 content_ids=content_ids,
                 contents_payload=contents_payload,
             )
         except Exception as e:
-            print("[tiktok] Purchase exceção:", e)
+            print("[tiktok] ATC exceção:", e)
             tiktok_sent = "error"
+
+    # # (Opcional) TikTok: evento final de conversão
+    # # Se desejar manter um evento de conversão adicional, use "Purchase"
+    # if is_atc_flag == 1:
+    #     try:
+    #         _ = send_tiktok_event(
+    #             event_name="Purchase",
+    #             event_id=utm_numbered + "-purchase",
+    #             ts=ts,
+    #             page_url=origin_url,
+    #             ip=ip_addr,
+    #             user_agent=user_agent,
+    #             ttclid=ttclid,
+    #             currency="BRL",
+    #             value=0.0,
+    #             content_ids=content_ids,
+    #             contents_payload=contents_payload,
+    #         )
+    #     except Exception as e:
+    #         print("[tiktok] Purchase exceção:", e)
 
     # ===== Log CSV =====
     hour_log = _extract_hour_from_iso_for_log(iso_time)
@@ -1581,5 +1593,4 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
-
 
