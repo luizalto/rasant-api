@@ -3,21 +3,33 @@ name = "rasant-api"
 version = "0.1.0"
 # ...
 
+
+[tool.poetry]
+name = "rasant-api"
+version = "0.1.0"
+description = "Shopee UTM → ShortLink + Predict + CAPI + TikTok"
+authors = ["Seu Nome <you@example.com>"]
+
 [tool.poetry.dependencies]
-python = "^3.11"
+python = ">=3.11,<3.12"
 fastapi = "0.110.3"
-uvicorn = {version = "0.29.0", extras = ["standard"]}
+uvicorn = "0.29.0"
 requests = "2.31.0"
+python-multipart = "0.0.9"
 google-cloud-storage = "2.16.0"
 redis = "5.0.3"
-python-multipart = "0.0.9"
 
-# Predição local (.cbm)
+# ML
 catboost = "1.2.5"
 pandas = "2.2.2"
 scikit-learn = "1.4.2"
 numpy = "1.26.4"
 scipy = "1.11.4"
-xgboost=="3.0.5"
+joblib = "1.5.2"
+xgboost = "3.0.5"   # <<< IMPORTANTE: entre aspas, sem vírgula no final
+
+[build-system]
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"
 
 
