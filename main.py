@@ -3,19 +3,19 @@
 FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI)
 (versão mesclada e corrigida) — UTMContent / UTMContent01 / UTMNumered
 
-Mudanças principais deste build:
-- Short-link: SEMPRE via API oficial da Shopee; se falhar (credencial/erro), 502 (não entrega URL longa).
-- Normalização forte do utm_content:
-  * Corta qualquer traço de URL/host (http, https, www., *.com, *.com.br etc).
-  * Remove “cascas” (--, espaços) e mantém apenas [A-Za-z0-9-].
-  * Aceita sufixo '-A\\d+' (com hífen) para compor UTMContent01.
-- UTM:
-  * UTMContent     = base (após normalização).
-  * UTMContent01   = base + '-A\\d+' (se houver), senão vazio.
-  * UTMNumered     = (UTMContent01 se existir, senão UTMContent) + 'N' + contador infinito (preserva hífen).
-  * Apenas substitui o valor de utm_content na URL (NÃO adiciona 'utm_numbered=').
-  * subId3 (API Shopee) = sanitize(UTMNumered) → apenas alfanumérico, respeitando limite de tamanho.
-- Redis/CSV: mantém colunas utm_original (UTMContent), utm_original_01 (UTMContent01), utm_numbered (UTMNumered).
+REQUISITO DE NEGÓCIO (atual):
+- NÃO resolver/abrir short-link da Shopee antes de gerar o short oficial.
+- A UTM deve vir do parâmetro `uc` da querystring.
+- A partir de `uc`, derivar:
+  * UTMContent     = base (sem URL colada; apenas [A-Za-z0-9-]).
+  * UTMContent01   = base + '-A\\d+' (se houver esse sufixo).
+  * UTMNumered     = (UTMContent01 se existir, senão UTMContent) + 'N' + contador infinito.
+- Apenas substituir o valor de utm_content na URL ALVO (NÃO criar "utm_numbered=").
+- subId3 (API Shopee) = UTMNumered (sanitizado p/ alfanumérico).
+- Não “colar” URL dentro da UTM, nem concatenar duas UTMs.
+
+OBS:
+- Se quiser reativar o comportamento antigo (resolver short antes), defina SKIP_RESOLVE=0.
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -63,6 +63,9 @@ META_TEST_EVENT_CODE  = os.getenv("META_TEST_EVENT_CODE")  # opcional
 
 # Seleção de modelo (server)
 SERVING_MODE_ENV      = (os.getenv("SERVING_MODE", "auto") or "auto").strip().lower()  # auto|cb|rf|xgb|stack
+
+# Comportamento de resolução de URL (1 = NÃO resolver short, default; 0 = resolver)
+SKIP_RESOLVE          = os.getenv("SKIP_RESOLVE", "1").lower() in ("1","true","yes","on")
 
 # Modelos
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
@@ -112,9 +115,9 @@ LONG_ALLOWED  = (".shopee.com.br", ".shopee.com", ".xiapiapp.com")
 
 def _fix_scheme(url: str) -> str:
     if url.startswith("https:/") and not url.startswith("https://"):
-        return "https://" + url[len("https:/") :]
+        return "https://" + url[len("https:/"):]
     if url.startswith("http:/") and not url.startswith("http://"):
-        return "http://" + url[len("http:/") :]
+        return "http://" + url[len("http:/"):]
     return url
 
 def _is_short_domain(domain: str) -> bool:
@@ -134,6 +137,7 @@ def _is_allowed_long(domain: str) -> bool:
     return apex_ok or suf_ok
 
 def _resolve_short_follow(url: str) -> str:
+    """Mantido para compatibilidade; só será usado se SKIP_RESOLVE=0."""
     try:
         resp = session.head(url, allow_redirects=True, timeout=DEFAULT_TIMEOUT)
         final_url = resp.url
@@ -274,7 +278,7 @@ def extract_utm_content_from_url(u: str) -> str:
     except:
         return ""
 
-# === Helpers de normalização de UTM (NOVA LÓGICA) ===
+# ===== Normalizador de UTM (corta URLs grudadas e aceita sufixo -A\\d+) =====
 _URL_CUT_RE = re.compile(r'(https?:\/\/|www\.|[a-z0-9-]+\.(?:com|br|net|org)(?:\/|$))', re.I)
 
 def _normalize_utm_content(raw: str) -> Tuple[str, str]:
@@ -291,7 +295,7 @@ def _normalize_utm_content(raw: str) -> Tuple[str, str]:
     if m:
         s = s[:m.start()]
 
-    # Defesa extra contra "http" colado
+    # Defesa extra contra sequências "http" sem separador
     idx_http = s.lower().find("http")
     if idx_http != -1:
         s = s[:idx_http]
@@ -314,6 +318,7 @@ def _normalize_utm_content(raw: str) -> Tuple[str, str]:
     return utm_content, utm_content_01
 
 def resolve_short_link(short_url: str) -> Tuple[str, Dict[str, Optional[str]]]:
+    """Mantido para compatibilidade; hoje não usamos se SKIP_RESOLVE=1."""
     current = short_url
     final_url = short_url
     subids = {}
@@ -891,6 +896,7 @@ def health():
     return {
         "ok": True, "ts": int(time.time()), "bucket": GCS_BUCKET, "prefix": GCS_PREFIX,
         "video_id": VIDEO_ID,
+        "skip_resolve": SKIP_RESOLVE,
         "models_loaded": {
             "cb": bool(_cb_model),
             "rf": bool(_rf_model),
@@ -947,6 +953,7 @@ def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str,
 # ===================== Handler principal =====================
 @app.get("/{full_path:path}")
 def track_number_and_redirect(request: Request, full_path: str = Path(...), cat: Optional[str] = Query(None), mode: Optional[str] = Query(None)):
+    # Interpretação da URL de entrada (sem resolver short, por padrão)
     try:
         incoming_url, in_mode = _build_incoming_from_request(request, full_path)
     except HTTPException as he:
@@ -962,45 +969,45 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     ip_addr = (request.client.host if request.client else "0.0.0.0")
     device_name, os_family, os_version = parse_device_info(user_agent)
 
-    # ===== Resolve url =====
+    # ===== Interpretar URL de entrada SEM resolver =====
     parts_in = urlsplit(incoming_url)
-    resolved_url = _resolve_short_follow(incoming_url) if _is_short_domain(parts_in.netloc) else _fix_scheme(incoming_url)
+
+    if SKIP_RESOLVE:
+        resolved_url = _fix_scheme(incoming_url)
+    else:
+        resolved_url = _resolve_short_follow(incoming_url) if _is_short_domain(parts_in.netloc) else _fix_scheme(incoming_url)
 
     parts_res = urlsplit(resolved_url)
     if not parts_res.scheme or not parts_res.netloc:
         return JSONResponse({"ok": False, "error": f"URL inválida: {resolved_url}"}, status_code=400)
+    # Permite tanto s.shopee... (short) quanto domínios longos aprovados
     if not _is_allowed_long(parts_res.netloc) and not _is_short_domain(parts_res.netloc):
         return JSONResponse({"ok": False, "error": f"Domínio não permitido: {parts_res.netloc}"}, status_code=400)
 
-    # ===== UTM / separação: UTMContent (base) e UTMContent01 (com A.. completo) =====
+    # ===== UTM: usa SOMENTE o parâmetro 'uc' =====
     outer_uc = request.query_params.get("uc")
+    if not outer_uc:
+        return JSONResponse({"ok": False, "error": "utm_missing_uc"}, status_code=400)
 
-    # 1) Captura o utm_content conforme veio (prioridade: URL resolvida > URL de entrada > ?uc=)
-    utm_raw = extract_utm_content_from_url(resolved_url) or \
-              extract_utm_content_from_url(incoming_url) or \
-              (outer_uc or "")
+    # Normaliza e separa (corta URLs coladas, aceita '-A\\d+')
+    utm_original, utm_original_01 = _normalize_utm_content(outer_uc)
 
-    # 2) Normaliza e separa (corta URLs, mantém só [A-Za-z0-9-], aceita sufixo '-A\\d+')
-    utm_original, utm_original_01 = _normalize_utm_content(utm_raw)
-
-    # 3) Semente p/ numeração: prioriza UTMContent01; se vazio, usa UTMContent
+    # Semente p/ numeração: prioriza UTMContent01; se vazio, usa UTMContent
     seed_for_numbering = (utm_original_01 or utm_original)
 
-    # 4) UTMNumered = seed (com hífen permitido) + 'N' + contador
+    # UTMNumered = seed (permitindo hífen) + 'N' + contador
     seed_clean_for_numbered = re.sub(r'[^A-Za-z0-9\-]', '', seed_for_numbering) or "n"
     utm_numbered = f"{seed_clean_for_numbered}N{incr_counter()}"
 
-    # 5) Substitui APENAS o valor de utm_content; NÃO adiciona 'utm_numbered=' na query
+    # Substitui APENAS o utm_content na URL (não adiciona nenhum outro parâmetro)
     origin_url = _set_utm_content_preserving_order(resolved_url, utm_numbered)
-    if _is_short_domain(urlsplit(origin_url).netloc):
-        origin_url = _resolve_short_follow(origin_url)
 
     # ===== content_ids / contents =====
     content_ids, contents_payload = _build_content_identifiers(origin_url)
 
-    # ===== Short oficial (sempre) — subId3 = UTMNumered (sanitizado)
+    # ===== Short oficial (sempre) — subId3 = UTMNumered (sanitizado) =====
     sub_id_api = sanitize_subid_for_shopee(utm_numbered) or "na"
-    dest = generate_short_link(origin_url, sub_id_api)  # se falhar, gera HTTP 502
+    dest = generate_short_link(origin_url, sub_id_api)  # se falhar, 502
 
     # ===== Cookies / IDs persistentes =====
     fbp_cookie = get_cookie_value(cookie_header, "_fbp") or _gen_fbp(ts)
@@ -1013,15 +1020,13 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         "ip": ip_addr, "ua": user_agent, "referrer": referrer,
         "event_source_url": origin_url, "short_link": dest,
         "vc_time": ts,
-        # === colunas pedidas ===
         "utm_original": utm_original,           # UTMContent (base)
         "utm_original_01": utm_original_01,     # UTMContent01 (com -A.. ou vazio)
         "subid_base": utm_original,
         "subid_full": (utm_original_01 or utm_original),
         "utm_numbered": utm_numbered,           # UTMNumered (aplicado em utm_content e subId3)
-        # =======================
         "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_cookie, "eid": eid_cookie, "mode": in_mode
-    }))
+    }, ensure_ascii=False))
 
     # ===== external_id / user_data_meta =====
     external_id = eid_cookie or _sha256_lower(f"{user_agent}|{ip_addr}")
@@ -1091,8 +1096,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                     "content_ids": content_ids,
                     "contents": contents_payload
                 }
-            }]
-        }
+            }]}
         try:
             url = f"https://graph.facebook.com/{META_GRAPH_VERSION}/{META_PIXEL_ID}/events"
             params = {"access_token": META_ACCESS_TOKEN}
@@ -1121,8 +1125,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                     "content_ids": content_ids,
                     "contents": contents_payload
                 }
-            }]
-        }
+            }]}
         try:
             url = f"https://graph.facebook.com/{META_GRAPH_VERSION}/{META_PIXEL_ID}/events"
             params = {"access_token": META_ACCESS_TOKEN}
@@ -1229,60 +1232,6 @@ def admin_page():
       </body>
     </html>
     """
-
-@app.post("/admin/upload_models_bundle")
-async def admin_upload_models_bundle(
-    token: str = Form(...),
-    cb: UploadFile = File(None),
-    meta: UploadFile = File(None),
-    rf: UploadFile = File(None),
-    xgb: UploadFile = File(None),
-    stack: UploadFile = File(None),
-    stack_meta: UploadFile = File(None),
-    te: UploadFile = File(None),
-):
-    if token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    try:
-        if cb:
-            data = await cb.read()
-            open(MODEL_CB_PATH, "wb").write(data)
-        if meta:
-            data = await meta.read()
-            if data and data.strip():
-                json.loads(data.decode("utf-8"))
-            open(MODEL_META_PATH, "wb").write(data)
-        if rf:
-            data = await rf.read()
-            open(MODEL_RF_PATH, "wb").write(data)
-        if xgb:
-            data = await xgb.read()
-            if data and data.strip():
-                json.loads(data.decode("utf-8"))
-            open(MODEL_XGB_PATH, "wb").write(data)
-        if stack:
-            data = await stack.read()
-            open(MODEL_STACK_PATH, "wb").write(data)
-        if stack_meta:
-            data = await stack_meta.read()
-            if data and data.strip():
-                json.loads(data.decode("utf-8"))
-            open(STACK_META_PATH, "wb").write(data)
-        if te:
-            data = await te.read()
-            open(TE_STATS_PATH, "wb").write(data)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="JSON inválido em algum artefato .json")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"falha ao salvar arquivo(s): {e}")
-
-    _load_models_if_available()
-    return {
-        "ok": True,
-        "models_loaded": {"cb": bool(_cb_model), "rf": bool(_rf_model), "xgb": bool(_xgb_model), "stack": bool(_stack_model)},
-        "thr_stack": _thresholds_stack, "thr_cb": _thresholds_cb, "thr_rf": _thresholds_rf, "thr_xgb": _thresholds_xgb,
-        "te_loaded": bool(_TE_STATS)
-    }
 
 @app.post("/admin/upload_models_bundle")
 async def admin_upload_models_bundle(
