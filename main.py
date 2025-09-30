@@ -22,8 +22,8 @@ Artefatos aceitos em ./models:
 
 Upload:
 - /admin/upload_model_simple: mantém compat CatBoost (com meta opcional)
-- /admin/upload_model: agora aceita campos adicionais (rf, xgb, stack, stack_meta, te)
-- /admin/upload_models_bundle: forma explícita de subir todos de uma vez
+- /admin/upload_model: agora com leitura única e parse condicional (corrigido)
+- /admin/upload_models_bundle: idem, com leitura única
 - /admin/set_mode: define o MODO em runtime (memória de processo)
 """
 
@@ -109,6 +109,40 @@ session = requests.Session()
 _adapter = requests.adapters.HTTPAdapter(pool_connections=30, pool_maxsize=100)
 session.mount("http://", _adapter)
 session.mount("https://", _adapter)
+
+# ===================== Helpers Upload =====================
+async def _save_upload_once(file: UploadFile, dest_path: str, *, expect_json: bool = False) -> bool:
+    """
+    Lê UMA ÚNICA vez um UploadFile e salva no disco.
+    - expect_json=True: valida JSON (não-vazio e parseável).
+    - expect_json=False: salva binário/texte como vier (sem parse).
+    Retorna True se salvou, False se 'file' era None.
+    """
+    if file is None:
+        return False
+    try:
+        data = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"falha ao ler {getattr(file, 'filename', dest_path)}: {e}")
+
+    if data is None:
+        data = b""
+
+    if expect_json:
+        text = data.decode("utf-8", errors="ignore")
+        if not text.strip():
+            raise HTTPException(status_code=400, detail=f"{getattr(file, 'filename', dest_path)} vazio (JSON esperado).")
+        try:
+            json.loads(text)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"{getattr(file, 'filename', dest_path)} JSON inválido: {e}")
+
+    try:
+        with open(dest_path, "wb") as out:
+            out.write(data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"falha ao salvar {dest_path}: {e}")
+    return True
 
 # ===================== Helpers URL / Shopee =====================
 SHORT_DOMAINS = ("s.shopee.com.br", "s.shopee.com")
@@ -647,7 +681,6 @@ def _load_models_if_available():
         if os.path.exists(MODEL_XGB_PATH):
             import xgboost as xgb
             _loaded_libs["xgboost"] = True
-            # cria um XGBClassifier "vazio" e carrega o json
             model = xgb.XGBClassifier()
             model.load_model(MODEL_XGB_PATH)
             _xgb_model = model
@@ -667,7 +700,6 @@ def _load_models_if_available():
         try:
             sm = json.load(open(STACK_META_PATH, "r", encoding="utf-8"))
             _stack_features = list(sm.get("stack_features", []))
-            # thresholds do stack_meta (se vierem) podem sobrepor
             if "thresholds" in sm:
                 _thresholds_stack = {
                     "qvc_mid": float(sm["thresholds"].get("qvc_mid", _thresholds_stack["qvc_mid"])),
@@ -709,11 +741,6 @@ def _cb_predict_proba(row_values: List[Any], cat_idx: List[int]) -> Dict[str, fl
         return {}
 
 def _rf_xgb_feature_vector_from(feats_dict: Dict[str, Any]) -> List[float]:
-    """
-    RF/XGB foram treinados com X_num + enc_cols:
-      num_cols = ["hour","dow","is_weekend","os_version_num","is_android","is_ios"]
-      enc_cols = ["utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br"]
-    """
     cols = ["hour","dow","is_weekend","os_version_num","is_android","is_ios",
             "utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br"]
     return [float(feats_dict.get(c, 0.0)) for c in cols]
@@ -725,7 +752,6 @@ def _rf_predict_proba(feats_dict: Dict[str, Any]) -> Optional[float]:
         import numpy as np
         X = np.asarray([_rf_xgb_feature_vector_from(feats_dict)], dtype=float)
         proba = _rf_model.predict_proba(X)[0]
-        # assume binário [neg,pos]
         return float(proba[1]) if len(proba) >= 2 else None
     except Exception as e:
         print("[predict-rf] erro:", e)
@@ -744,9 +770,6 @@ def _xgb_predict_proba(feats_dict: Dict[str, Any]) -> Optional[float]:
         return None
 
 def _stack_predict_proba(p_cb: Optional[float], p_rf: Optional[float], p_xgb: Optional[float]) -> Optional[float]:
-    """
-    Usa stack_meta["stack_features"], ex: ["proba_cb","proba_rf","proba_xgb"] ou ["proba_cb","proba_rf"]
-    """
     if not _stack_model or not _stack_features:
         return None
     try:
@@ -756,7 +779,6 @@ def _stack_predict_proba(p_cb: Optional[float], p_rf: Optional[float], p_xgb: Op
         for f in _stack_features:
             v = mapping.get(f)
             if v is None:
-                # se faltar alguma base exigida pelo stack, não dá para servir stack
                 return None
             vec.append(float(v))
         X = np.asarray([vec], dtype=float)
@@ -767,12 +789,6 @@ def _stack_predict_proba(p_cb: Optional[float], p_rf: Optional[float], p_xgb: Op
         return None
 
 def _choose_active_mode(forced_mode: Optional[str], p_avail: Dict[str, Optional[float]]) -> str:
-    """
-    Decide modo conforme prioridade:
-      - forced_mode (query/admin) se válido e disponível
-      - _current_mode (setado por ENV/admin)
-      - auto: stack > cb > xgb > rf
-    """
     def available(mode: str) -> bool:
         if mode == "stack": return p_avail.get("stack") is not None
         if mode == "cb":    return p_avail.get("cb")    is not None
@@ -784,11 +800,10 @@ def _choose_active_mode(forced_mode: Optional[str], p_avail: Dict[str, Optional[
         return forced_mode
     if _current_mode in ("stack","cb","xgb","rf") and available(_current_mode):
         return _current_mode
-    # auto
     for mode in ("stack","cb","xgb","rf"):
         if available(mode):
             return mode
-    return "cb"  # último fallback (mesmo que não exista, fluxo cuidará)
+    return "cb"
 
 def _thresholds_for_mode(mode: str) -> Tuple[float,float]:
     if mode == "stack":
@@ -798,7 +813,6 @@ def _thresholds_for_mode(mode: str) -> Tuple[float,float]:
     if mode == "rf":
         if _thresholds_rf:
             return float(_thresholds_rf.get("qvc_mid", 0.5)), float(_thresholds_rf.get("atc_high", 0.5))
-        # tenta reaproveitar thresholds do stack/cb se específicos não existirem
         return float(_thresholds_stack.get("qvc_mid", _thresholds_cb.get("qvc_mid", 0.5))), \
                float(_thresholds_stack.get("atc_high", _thresholds_cb.get("atc_high", 0.5)))
     if mode == "xgb":
@@ -809,16 +823,9 @@ def _thresholds_for_mode(mode: str) -> Tuple[float,float]:
     return 0.5, 0.5
 
 def _compute_all_probs(feats_dict: Dict[str, Any]) -> Tuple[Dict[str,float], Dict[str, Optional[float]]]:
-    """
-    Retorna:
-      p_map: {"comprou": p_ESCOHIDO, "quase": .., "desinteressado": ..}
-      p_raw: {"cb": float|None, "rf": float|None, "xgb": float|None, "stack": float|None, "mode": str}
-    """
-    # --- CatBoost probs multi-classe (ou binária)
     p_cb_map = {"comprou": None, "quase": 0.0, "desinteressado": None}
     p_cb = None
     if _cb_model and _FEATURE_NAMES_FROM_META:
-        # alinhar à ordem do meta
         row_values = []
         numeric_defaults = {
             "hour","dow","month","is_weekend","os_version_num","is_android","is_ios",
@@ -833,14 +840,10 @@ def _compute_all_probs(feats_dict: Dict[str, Any]) -> Tuple[Dict[str,float], Dic
         p_cb_map = _cb_predict_proba(row_values, _CAT_IDX_FROM_META) or {"comprou": None, "quase": 0.0, "desinteressado": None}
         p_cb = p_cb_map.get("comprou")
 
-    # --- RF/XGB binários
     p_rf = _rf_predict_proba(feats_dict)
     p_xgb = _xgb_predict_proba(feats_dict)
-
-    # --- STACK (usa as bases que tiver, conforme stack_meta)
     p_stack = _stack_predict_proba(p_cb, p_rf, p_xgb)
 
-    # modo escolhido
     p_avail = {"cb": p_cb, "rf": p_rf, "xgb": p_xgb, "stack": p_stack}
     return p_cb_map, p_avail
 
@@ -1069,7 +1072,6 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         thr_q, thr_a = _thresholds_for_mode("rf")
         p_map = {"comprou": p_c, "quase": 0.0, "desinteressado": 1.0 - p_c}
     else:
-        # fallback total: sem modelos -> neutro
         p_c, thr_q, thr_a = 0.0, 0.5, 0.5
         p_map = {"comprou": 0.0, "quase": 0.0, "desinteressado": 1.0}
         active_mode = "none"
@@ -1140,7 +1142,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             print("[meta] ATC exceção:", e)
             meta_sent = "error"
 
-    # ===== Log CSV (mantém o schema original) =====
+    # ===== Log CSV =====
     hour_log = _extract_hour_from_iso_for_log(iso_time)
     dow_log = _extract_dow_from_iso_for_log(iso_time)
     ref_domain_log = _get_first_domain_for_log(referrer)
@@ -1248,22 +1250,15 @@ async def admin_upload_models_bundle(
 ):
     if token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
-    try:
-        if cb:   open(MODEL_CB_PATH, "wb").write(await cb.read())
-        if meta:
-            data = await meta.read()
-            _ = json.loads(data.decode("utf-8"))
-            open(MODEL_META_PATH, "wb").write(data)
-        if rf:   open(MODEL_RF_PATH, "wb").write(await rf.read())
-        if xgb:  open(MODEL_XGB_PATH, "wb").write(await xgb.read())
-        if stack: open(MODEL_STACK_PATH, "wb").write(await stack.read())
-        if stack_meta:
-            data = await stack_meta.read()
-            _ = json.loads(data.decode("utf-8"))
-            open(STACK_META_PATH, "wb").write(data)
-        if te:   open(TE_STATS_PATH, "wb").write(await te.read())
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"falha ao salvar arquivo(s): {e}")
+    # Leitura única + parse condicional
+    if cb:        await _save_upload_once(cb,   MODEL_CB_PATH,      expect_json=False)
+    if meta:      await _save_upload_once(meta, MODEL_META_PATH,    expect_json=True)
+    if rf:        await _save_upload_once(rf,   MODEL_RF_PATH,      expect_json=False)
+    if xgb:       await _save_upload_once(xgb,  MODEL_XGB_PATH,     expect_json=False)  # modelo XGB em JSON → sem parse
+    if stack:     await _save_upload_once(stack,MODEL_STACK_PATH,   expect_json=False)
+    if stack_meta:await _save_upload_once(stack_meta, STACK_META_PATH, expect_json=True)
+    if te:        await _save_upload_once(te,   TE_STATS_PATH,      expect_json=True)
+
     _load_models_if_available()
     return {
         "ok": True,
@@ -1276,19 +1271,9 @@ async def admin_upload_models_bundle(
 async def admin_upload_model_simple(token: str = Form(...), model: UploadFile = File(...), meta: UploadFile = File(None)):
     if token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
-    try:
-        with open(MODEL_CB_PATH, "wb") as out:
-            out.write(await model.read())
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"falha ao salvar model: {e}")
+    await _save_upload_once(model, MODEL_CB_PATH, expect_json=False)
     if meta:
-        try:
-            data = await meta.read()
-            _ = json.loads(data.decode("utf-8"))
-            with open(MODEL_META_PATH, "wb") as out:
-                out.write(data)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
+        await _save_upload_once(meta, MODEL_META_PATH, expect_json=True)
     _load_models_if_available()
     return {"ok": True, "models_loaded": {"cb": bool(_cb_model)}, "thr_cb": _thresholds_cb, "te_loaded": bool(_TE_STATS)}
 
@@ -1301,32 +1286,35 @@ async def admin_upload_model(
     te: UploadFile = File(None),
     x_admin_token: str = Header(None)
 ):
+    """
+    Endpoint corrigido:
+    - Leitura única de cada UploadFile
+    - Só valida JSON quando necessário (meta, stack_meta, te)
+    - Salva binários diretamente (.cbm, .joblib, xgb.json)
+    """
     if x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
+
+    # Compat: aceitar tanto (model_file/meta_file) quanto (model/meta)
     up_model = model_file or model
+    up_meta  = meta_file  or meta
+
+    # Salva principais
     if up_model:
-        try:
-            open(MODEL_CB_PATH, "wb").write(await up_model.read())
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"falha ao salvar model: {e}")
-    up_meta = meta_file or meta
+        await _save_upload_once(up_model, MODEL_CB_PATH, expect_json=False)
     if up_meta:
-        try:
-            data = await up_meta.read()
-            _ = json.loads(data.decode("utf-8"))
-            open(MODEL_META_PATH, "wb").write(data)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
-    # extras
+        await _save_upload_once(up_meta,  MODEL_META_PATH, expect_json=True)
+
+    # Salva extras (sem parse, exceto quando explicitamente JSON de config)
     try:
-        if rf:   open(MODEL_RF_PATH, "wb").write(await rf.read())
-        if xgb:  open(MODEL_XGB_PATH, "wb").write(await xgb.read())
-        if stack: open(MODEL_STACK_PATH, "wb").write(await stack.read())
-        if stack_meta:
-            data = await stack_meta.read()
-            _ = json.loads(data.decode("utf-8"))
-            open(STACK_META_PATH, "wb").write(data)
-        if te:   open(TE_STATS_PATH, "wb").write(await te.read())
+        if rf:        await _save_upload_once(rf,        MODEL_RF_PATH,     expect_json=False)
+        if xgb:       await _save_upload_once(xgb,       MODEL_XGB_PATH,    expect_json=False)  # modelo em JSON → sem parse
+        if stack:     await _save_upload_once(stack,     MODEL_STACK_PATH,  expect_json=False)
+        if stack_meta:await _save_upload_once(stack_meta,STACK_META_PATH,   expect_json=True)   # JSON de ordem/thresholds
+        if te:        await _save_upload_once(te,        TE_STATS_PATH,     expect_json=True)   # JSON de TE (opcional)
+    except HTTPException:
+        # repassa erro com mensagem clara (e status adequado)
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"falha ao salvar arquivo(s) extras: {e}")
 
