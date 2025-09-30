@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK)
-+ Meta Ads (CAPI) + TikTok Events API
+FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI) + TikTok Events API
 (versão consolidada) — UTMContent / UTMContent01 / UTMNumered
 
-Correções TikTok:
-- Usa 'event_time' (e não 'timestamp').
-- Eventos válidos: ViewContent, AddToCart, Purchase, etc. (NADA de 'CompletePayment').
-- Função send_tiktok_event com log amigável do corpo de resposta.
-- Pensado para disparar AddToCart com a MESMA regra usada no Meta.
+Correções:
+- TikTok: usa `event_time` (antes estava `timestamp`) e eventos válidos ("ViewContent", "AddToCart").
+- AddToCart do TikTok segue a MESMA regra do Meta (gatilho pelo mesmo `is_atc_flag`).
+- Removida duplicação no carregamento XGBoost.
+- Removido `global _thresholds_stack` redundante dentro de bloco (causava SyntaxError).
+- Ajustes finos de indentação.
 
 REQUISITOS:
 - NÃO resolver/abrir short-link da Shopee antes de gerar o short oficial (SKIP_RESOLVE=1 por padrão).
@@ -90,6 +90,7 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 MODEL_CB_PATH        = os.path.join(MODELS_DIR, "model_comprou.cbm")
 MODEL_META_PATH      = os.path.join(MODELS_DIR, "model_meta_comprou.json")
 TE_STATS_PATH        = os.path.join(MODELS_DIR, "te_stats.json")          # opcional (fallback)
+
 MODEL_RF_PATH        = os.path.join(MODELS_DIR, "rf.joblib")
 MODEL_XGB_PATH       = os.path.join(MODELS_DIR, "xgb.json")
 MODEL_STACK_PATH     = os.path.join(MODELS_DIR, "stack_model.joblib")
@@ -694,10 +695,12 @@ def _load_models_if_available():
             import xgboost as xgb
             _loaded_libs["xgboost"] = True
             try:
+                # Modelo salvo via XGBClassifier.save_model(...)
                 clf = xgb.XGBClassifier()
                 clf.load_model(MODEL_XGB_PATH)
                 _xgb_model = clf
             except Exception:
+                # Fallback: modelo salvo como Booster puro
                 bst = xgb.Booster()
                 bst.load_model(MODEL_XGB_PATH)
                 _xgb_model = bst
@@ -715,18 +718,17 @@ def _load_models_if_available():
             _stack_model = joblib.load(MODEL_STACK_PATH)
         except Exception as e:
             print("[STACK] erro ao carregar stack_model:", e)
-   if os.path.exists(STACK_META_PATH):
-    try:
-        sm = json.load(open(STACK_META_PATH, "r", encoding="utf-8"))
-        _stack_features = list(sm.get("stack_features", []))
-        if "thresholds" in sm:
-            _thresholds_stack = {
-                "qvc_mid": float(sm["thresholds"].get("qvc_mid", _thresholds_stack["qvc_mid"])),
-                "atc_high": float(sm["thresholds"].get("atc_high", _thresholds_stack["atc_high"])),
-            }
-    except Exception as e:
-        print("[STACK] erro ao carregar stack_meta:", e)
-
+    if os.path.exists(STACK_META_PATH):
+        try:
+            sm = json.load(open(STACK_META_PATH, "r", encoding="utf-8"))
+            _stack_features = list(sm.get("stack_features", []))
+            if "thresholds" in sm:
+                _thresholds_stack = {
+                    "qvc_mid": float(sm["thresholds"].get("qvc_mid", _thresholds_stack["qvc_mid"])),
+                    "atc_high": float(sm["thresholds"].get("atc_high", _thresholds_stack["atc_high"])),
+                }
+        except Exception as e:
+            print("[STACK] erro ao carregar stack_meta:", e)
 
     print(f"[models] loaded: cb={bool(_cb_model)} rf={bool(_rf_model)} xgb={bool(_xgb_model)} stack={bool(_stack_model)}")
     print(f"[meta] n_features={len(_FEATURE_NAMES_FROM_META)} cat_idx={_CAT_IDX_FROM_META} pos_id={_POS_LABEL_ID} pos_idx={_POS_IDX}")
@@ -804,13 +806,19 @@ def _xgb_predict_proba(feats_dict: Dict[str, Any]) -> Optional[float]:
         traceback.print_exc()
         return None
 
+
 def _stack_predict_proba(p_cb: Optional[float], p_rf: Optional[float], p_xgb: Optional[float]) -> Optional[float]:
     if not _stack_model or not _stack_features:
         return None
     try:
         import numpy as np
         mapping = {"proba_cb": p_cb, "proba_rf": p_rf, "proba_xgb": p_xgb}
-        vec = [float(mapping.get(f)) for f in _stack_features]
+        vec = []
+        for f in _stack_features:
+            v = mapping.get(f)
+            if v is None:
+                return None
+            vec.append(float(v))
         X = np.asarray([vec], dtype=float)
         proba = _stack_model.predict_proba(X)[0]
         return float(proba[1]) if len(proba) >= 2 else None
@@ -915,7 +923,7 @@ def send_tiktok_event(
             "value": float(value),
             "content_type": "product",
             "content_id": content_ids[0] if content_ids else None,
-            "contents": contents_payload,
+            "contents": contents_payload,   # [{"id": "...", "quantity": 1}]
         }
     }
 
@@ -978,13 +986,6 @@ def _background_flusher():
         time.sleep(FLUSH_MAX_SECONDS)
 
 threading.Thread(target=_background_flusher, daemon=True).start()
-
-# ======== (FIM DA 1ª METADE) ========
-# A próxima parte traz:
-# - rotas /health, /robots.txt, /, /privacy
-# - handler principal (/{full_path:path}) com Meta + TikTok (VC, ATC, Purchase)
-# - páginas/admin e uploads de modelos
-# - flush on exit e uvicorn.run
 
 # ===================== Rotas =====================
 @app.get("/health")
@@ -1053,12 +1054,7 @@ def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str,
 
 # ===================== Handler principal =====================
 @app.get("/{full_path:path}")
-def track_number_and_redirect(
-    request: Request,
-    full_path: str = Path(...),
-    cat: Optional[str] = Query(None),
-    mode: Optional[str] = Query(None)
-):
+def track_number_and_redirect(request: Request, full_path: str = Path(...), cat: Optional[str] = Query(None), mode: Optional[str] = Query(None)):
     # Interpretação da URL de entrada (sem resolver short, por padrão)
     try:
         incoming_url, in_mode = _build_incoming_from_request(request, full_path)
@@ -1078,6 +1074,7 @@ def track_number_and_redirect(
 
     # ===== Interpretar URL de entrada SEM resolver =====
     parts_in = urlsplit(incoming_url)
+
     if SKIP_RESOLVE:
         resolved_url = _fix_scheme(incoming_url)
     else:
@@ -1285,7 +1282,6 @@ def track_number_and_redirect(
             tiktok_sent = "error"
 
     # # (Opcional) TikTok: evento final de conversão
-    # # Se desejar manter um evento de conversão adicional, use "Purchase"
     # if is_atc_flag == 1:
     #     try:
     #         _ = send_tiktok_event(
@@ -1593,5 +1589,3 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
-
-
