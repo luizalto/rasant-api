@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI)
-(versão mesclada e corrigida) — UTMContent / UTMContent01 / UTMNumered
+(versão consolidada) — UTMContent / UTMContent01 / UTMNumered
 
-REQUISITO DE NEGÓCIO (atual):
-- NÃO resolver/abrir short-link da Shopee antes de gerar o short oficial.
+REQUISITOS:
+- NÃO resolver/abrir short-link da Shopee antes de gerar o short oficial (SKIP_RESOLVE=1 por padrão).
 - A UTM deve vir do parâmetro `uc` da querystring.
 - A partir de `uc`, derivar:
   * UTMContent     = base (sem URL colada; apenas [A-Za-z0-9-]).
@@ -12,10 +12,10 @@ REQUISITO DE NEGÓCIO (atual):
   * UTMNumered     = (UTMContent01 se existir, senão UTMContent) + 'N' + contador infinito.
 - Apenas substituir o valor de utm_content na URL ALVO (NÃO criar "utm_numbered=").
 - subId3 (API Shopee) = UTMNumered (sanitizado p/ alfanumérico).
-- Não “colar” URL dentro da UTM, nem concatenar duas UTMs.
+- Predição usa **somente** utm_original (UTMContent base).
 
 OBS:
-- Se quiser reativar o comportamento antigo (resolver short antes), defina SKIP_RESOLVE=0.
+- Para reativar a resolução de short antes, defina SKIP_RESOLVE=0.
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -549,7 +549,7 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
     device_city_combo   = (f"{device_bucket}__{geo_city}").lower()
     utm_partofday_combo = (f"{utm_original}__{part_of_day}").lower()
 
-    # TE encoders
+    # TE encoders — sempre usando utm_original (base)
     utm_n,  utm_br  = _apply_te("utm_original", str(utm_original or ""))
     ref_n,  ref_br  = _apply_te("ref_domain",   str(ref_domain))
     devb_n, devb_br = _apply_te("device_bucket",str(device_bucket))
@@ -1425,3 +1425,4 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
+
