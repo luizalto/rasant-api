@@ -715,18 +715,18 @@ def _load_models_if_available():
             _stack_model = joblib.load(MODEL_STACK_PATH)
         except Exception as e:
             print("[STACK] erro ao carregar stack_model:", e)
-    if os.path.exists(STACK_META_PATH):
-        try:
-            sm = json.load(open(STACK_META_PATH, "r", encoding="utf-8"))
-            _stack_features = list(sm.get("stack_features", []))
-            if "thresholds" in sm:
-                global _thresholds_stack
-                _thresholds_stack = {
-                    "qvc_mid": float(sm["thresholds"].get("qvc_mid", _thresholds_stack["qvc_mid"])),
-                    "atc_high": float(sm["thresholds"].get("atc_high", _thresholds_stack["atc_high"])),
-                }
-        except Exception as e:
-            print("[STACK] erro ao carregar stack_meta:", e)
+   if os.path.exists(STACK_META_PATH):
+    try:
+        sm = json.load(open(STACK_META_PATH, "r", encoding="utf-8"))
+        _stack_features = list(sm.get("stack_features", []))
+        if "thresholds" in sm:
+            _thresholds_stack = {
+                "qvc_mid": float(sm["thresholds"].get("qvc_mid", _thresholds_stack["qvc_mid"])),
+                "atc_high": float(sm["thresholds"].get("atc_high", _thresholds_stack["atc_high"])),
+            }
+    except Exception as e:
+        print("[STACK] erro ao carregar stack_meta:", e)
+
 
     print(f"[models] loaded: cb={bool(_cb_model)} rf={bool(_rf_model)} xgb={bool(_xgb_model)} stack={bool(_stack_model)}")
     print(f"[meta] n_features={len(_FEATURE_NAMES_FROM_META)} cat_idx={_CAT_IDX_FROM_META} pos_id={_POS_LABEL_ID} pos_idx={_POS_IDX}")
@@ -1593,4 +1593,5 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
+
 
