@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI)
+FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI) + TikTok Events API
 (versão consolidada) — UTMContent / UTMContent01 / UTMNumered
 
 REQUISITOS:
@@ -61,6 +61,12 @@ META_ACCESS_TOKEN     = os.getenv("META_ACCESS_TOKEN") or os.getenv("FB_ACCESS_T
 META_GRAPH_VERSION    = os.getenv("META_GRAPH_VERSION", "v17.0")
 META_TEST_EVENT_CODE  = os.getenv("META_TEST_EVENT_CODE")  # opcional
 
+# TikTok Events API
+TIKTOK_PIXEL_ID       = os.getenv("TIKTOK_PIXEL_ID", "")
+TIKTOK_ACCESS_TOKEN   = os.getenv("TIKTOK_ACCESS_TOKEN", "")
+TIKTOK_API_BASE       = os.getenv("TIKTOK_API_BASE", "https://business-api.tiktok.com/open_api")
+TIKTOK_API_TRACK_URL  = f"{TIKTOK_API_BASE}/v1.3/pixel/track/"
+
 # Seleção de modelo (server)
 SERVING_MODE_ENV      = (os.getenv("SERVING_MODE", "auto") or "auto").strip().lower()  # auto|cb|rf|xgb|stack
 
@@ -83,7 +89,7 @@ MODEL_STACK_PATH     = os.path.join(MODELS_DIR, "stack_model.joblib")
 STACK_META_PATH      = os.path.join(MODELS_DIR, "stack_meta.json")
 
 # ===================== App / Clients =====================
-app = FastAPI(title="Shopee UTM → ShortLink + Geo + Predict (Multi-Model) + CAPI")
+app = FastAPI(title="Shopee UTM → ShortLink + Geo + Predict (Multi-Model) + CAPI + TikTok")
 
 # Redis
 r = redis.from_url(REDIS_URL)
@@ -220,7 +226,9 @@ CSV_HEADERS = [
     # métricas derivadas (modo ativo)
     "pcomprou_pct","thr_qvc_pct","thr_atc_pct","gap_qvc","gap_atc","pct_of_atc",
     # eventos meta
-    "meta_event_sent","meta_view_sent"
+    "meta_event_sent","meta_view_sent",
+    # eventos tiktok
+    "tiktok_event_sent","tiktok_view_sent"
 ]
 
 # ===================== Utils =====================
@@ -846,6 +854,63 @@ def _compute_all_probs(feats_dict: Dict[str, Any]) -> Tuple[Dict[str,float], Dic
 
 _load_models_if_available()
 
+# ===================== TikTok helper =====================
+def send_tiktok_event(
+    event_name: str,
+    event_id: str,
+    ts: int,
+    page_url: str,
+    ip: str,
+    user_agent: str,
+    ttclid: Optional[str],
+    currency: str,
+    value: float,
+    content_ids: List[str],
+    contents_payload: List[Dict[str, Any]],
+) -> str:
+    """
+    Envia um evento para o TikTok Events API (v1.3).
+    Requer: TIKTOK_PIXEL_ID e TIKTOK_ACCESS_TOKEN.
+    """
+    if not (TIKTOK_PIXEL_ID and TIKTOK_ACCESS_TOKEN):
+        return "skipped:no_tiktok_creds"
+
+    payload = {
+        "pixel_code": TIKTOK_PIXEL_ID,
+        "event": event_name,                # "ViewContent", "CompletePayment"
+        "event_id": event_id,               # dedup
+        "timestamp": ts,                    # segundos
+        "context": {
+            "ad": {"callback": ttclid} if ttclid else {},
+            "page": {"url": page_url},
+            "user": {
+                "ip": ip,
+                "user_agent": user_agent
+            }
+        },
+        "properties": {
+            "currency": currency,           # "BRL"
+            "value": float(value),
+            "content_type": "product",
+            "content_id": content_ids[0] if content_ids else None,
+            "contents": contents_payload,   # [{"id": "...", "quantity": 1}]
+        }
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "Access-Token": TIKTOK_ACCESS_TOKEN,
+    }
+
+    try:
+        resp = session.post(TIKTOK_API_TRACK_URL, headers=headers, json=payload, timeout=8)
+        if resp.status_code < 400:
+            return "ok"
+        return f"error:{resp.status_code}"
+    except Exception as e:
+        print("[tiktok] exceção:", e)
+        return "error"
+
 # ===================== GCS flush =====================
 def _day_key(ts: int) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts))
@@ -966,6 +1031,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     referrer = headers.get("referer") or "-"
     user_agent = headers.get("user-agent", "-")
     fbclid = request.query_params.get("fbclid")
+    ttclid = request.query_params.get("ttclid")  # TikTok click id (se houver)
     ip_addr = (request.client.host if request.client else "0.0.0.0")
     device_name, os_family, os_version = parse_device_info(user_agent)
 
@@ -1028,7 +1094,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_cookie, "eid": eid_cookie, "mode": in_mode
     }, ensure_ascii=False))
 
-    # ===== external_id / user_data_meta =====
+    # ===== external_id / user_data_meta (Meta) =====
     external_id = eid_cookie or _sha256_lower(f"{user_agent}|{ip_addr}")
     user_data_meta = {
         "client_ip_address": ip_addr,
@@ -1108,7 +1174,27 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             print("[meta] VC exceção:", e)
             meta_view = "error"
 
-    # ===== Meta: AddToCart =====
+    # ===== TikTok: ViewContent =====
+    tiktok_view = ""
+    try:
+        tiktok_view = send_tiktok_event(
+            event_name="ViewContent",
+            event_id=utm_numbered,
+            ts=ts,
+            page_url=origin_url,
+            ip=ip_addr,
+            user_agent=user_agent,
+            ttclid=ttclid,
+            currency="BRL",
+            value=0.0,
+            content_ids=content_ids,
+            contents_payload=contents_payload,
+        )
+    except Exception as e:
+        print("[tiktok] VC exceção:", e)
+        tiktok_view = "error"
+
+    # ===== Meta: AddToCart (sua definição de "comprou") =====
     if META_PIXEL_ID and META_ACCESS_TOKEN and is_atc_flag == 1:
         atc_payload = {
             "data": [{
@@ -1136,6 +1222,27 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         except Exception as e:
             print("[meta] ATC exceção:", e)
             meta_sent = "error"
+
+    # ===== TikTok: CompletePayment (equivalente a Purchase) quando is_atc_flag == 1 =====
+    tiktok_sent = ""
+    if is_atc_flag == 1:
+        try:
+            tiktok_sent = send_tiktok_event(
+                event_name="CompletePayment",
+                event_id=utm_numbered,
+                ts=ts,
+                page_url=origin_url,
+                ip=ip_addr,
+                user_agent=user_agent,
+                ttclid=ttclid,
+                currency="BRL",
+                value=0.0,  # se desejar enviar valor do item/ordem, ajustar aqui
+                content_ids=content_ids,
+                contents_payload=contents_payload,
+            )
+        except Exception as e:
+            print("[tiktok] Purchase exceção:", e)
+            tiktok_sent = "error"
 
     # ===== Log CSV =====
     hour_log = _extract_hour_from_iso_for_log(iso_time)
@@ -1165,7 +1272,8 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         pred_label, float(p_map.get("comprou",0.0)), float(p_map.get("quase",0.0)), float(p_map.get("desinteressado",0.0)),
         float(thr_q), float(thr_a), int(is_qvc_flag), int(is_atc_flag),
         pcomprou_pct, thr_qvc_pct, thr_atc_pct, gap_qvc, gap_atc, pct_of_atc,
-        meta_sent, meta_view
+        meta_sent, meta_view,
+        tiktok_sent, tiktok_view
     ]
     with _buffer_lock:
         _buffer_rows.append(csv_row)
@@ -1425,4 +1533,3 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
-
