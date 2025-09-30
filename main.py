@@ -1,24 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI)
-(versão multi-model: suporta CatBoost, RandomForest, XGBoost e Stacking com LogisticRegression)
+FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost) + Meta Ads (CAPI)
+(versão ajustada: thresholds_cb + TE embutido no meta)
 
-Correções:
-- Leitura única de UploadFile.
-- Parse condicional só para JSONs de config (meta, stack_meta, te_stats).
-- Suporte a aliases de campos nos uploads (/admin/upload_model e /admin/upload_models_bundle).
-
-Seleção do modo:
-- ENV SERVING_MODE: auto | cb | rf | xgb | stack  (padrão: auto)
-- Override por query param `mode` (para teste), ex: /minha-rota?mode=stack
-
-Arquivos aceitos em ./models:
-- CatBoost: model_comprou.cbm
-- Meta     : model_meta_comprou.json  (feature_names, cat_idx, thresholds, thresholds_cb, te_stats)
-- RF       : rf.joblib
-- XGB      : xgb.json   (modelo do XGBoost salvo em JSON — salvo SEM parse)
-- Stack    : stack_model.joblib + stack_meta.json  (stack_features, thresholds)
-- TE       : te_stats.json (opcional; fallback)
+Principais ajustes vs original:
+- _load_model_if_available():
+    * thresholds: preferir "thresholds_cb" (CatBoost puro) → depois "thresholds" (stack) → fallback 0.5
+    * TE: carregar "te_stats" de dentro do model_meta_comprou.json; fallback para ./models/te_stats.json
+- Predição mantém CatBoost puro (coerente com thresholds_cb).
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -35,8 +24,8 @@ from datetime import datetime
 DEFAULT_TIMEOUT       = float(os.getenv("HTTP_TIMEOUT", "10"))
 
 # GCS
-GCS_BUCKET            = os.getenv("GCS_BUCKET")
-GCS_PREFIX            = os.getenv("GCS_PREFIX", "logs/")
+GCS_BUCKET            = os.getenv("GCS_BUCKET")              # ex: "meu-bucket"
+GCS_PREFIX            = os.getenv("GCS_PREFIX", "logs/")     # ex: "logs/"
 FLUSH_MAX_ROWS        = int(os.getenv("FLUSH_MAX_ROWS", "500"))
 FLUSH_MAX_SECONDS     = int(os.getenv("FLUSH_MAX_SECONDS", "30"))
 
@@ -53,32 +42,27 @@ GEO_CACHE_PREFIX      = os.getenv("GEO_CACHE_PREFIX", "geo:")
 
 VIDEO_ID              = os.getenv("VIDEO_ID", "v15")
 
+# Shopee Affiliate
+SHOPEE_APP_ID         = os.getenv("SHOPEE_APP_ID", "")
+SHOPEE_APP_SECRET     = os.getenv("SHOPEE_APP_SECRET", "")
+SHOPEE_ENDPOINT       = os.getenv("SHOPEE_ENDPOINT", "https://open-api.affiliate.shopee.com.br/graphql")
+
 # Meta Ads (CAPI)
 META_PIXEL_ID         = os.getenv("META_PIXEL_ID") or os.getenv("FB_PIXEL_ID")
 META_ACCESS_TOKEN     = os.getenv("META_ACCESS_TOKEN") or os.getenv("FB_ACCESS_TOKEN")
 META_GRAPH_VERSION    = os.getenv("META_GRAPH_VERSION", "v17.0")
 META_TEST_EVENT_CODE  = os.getenv("META_TEST_EVENT_CODE")  # opcional
 
-# Seleção de modelo (server)
-SERVING_MODE_ENV      = (os.getenv("SERVING_MODE", "auto") or "auto").strip().lower()  # auto|cb|rf|xgb|stack
-
 # Modelos
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR      = os.path.join(BASE_DIR, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
-
-# Caminhos principais
-MODEL_CB_PATH        = os.path.join(MODELS_DIR, "model_comprou.cbm")
-MODEL_META_PATH      = os.path.join(MODELS_DIR, "model_meta_comprou.json")
-TE_STATS_PATH        = os.path.join(MODELS_DIR, "te_stats.json")          # opcional (fallback)
-
-MODEL_RF_PATH        = os.path.join(MODELS_DIR, "rf.joblib")
-MODEL_XGB_PATH       = os.path.join(MODELS_DIR, "xgb.json")
-MODEL_STACK_PATH     = os.path.join(MODELS_DIR, "stack_model.joblib")
-STACK_META_PATH      = os.path.join(MODELS_DIR, "stack_meta.json")
+MODEL_PATH      = os.path.join(MODELS_DIR, "model_comprou.cbm")
+MODEL_META_PATH = os.path.join(MODELS_DIR, "model_meta_comprou.json")
+TE_STATS_PATH   = os.path.join(MODELS_DIR, "te_stats.json")  # opcional (fallback)
 
 # ===================== App / Clients =====================
-app = FastAPI(title="Shopee UTM → ShortLink + Geo + Predict (Multi-Model) + CAPI")
+app = FastAPI(title="Shopee UTM → ShortLink + Geo + Predict + CAPI")
 
 # Redis
 r = redis.from_url(REDIS_URL)
@@ -87,7 +71,7 @@ try:
 except Exception:
     pass
 
-# GCS (lazy)
+# GCS (lazy: só importa client se GCS_BUCKET existir)
 _bucket = None
 if GCS_BUCKET:
     try:
@@ -103,47 +87,6 @@ session = requests.Session()
 _adapter = requests.adapters.HTTPAdapter(pool_connections=30, pool_maxsize=100)
 session.mount("http://", _adapter)
 session.mount("https://", _adapter)
-
-# ===================== Upload helpers =====================
-async def _save_upload_once(file: UploadFile, dest_path: str, *, expect_json: bool = False) -> bool:
-    """
-    Lê UMA ÚNICA vez um UploadFile e salva no disco.
-    - expect_json=True: valida JSON (não-vazio e parseável).
-    - expect_json=False: salva bytes como vieram (inclui xgb.json do XGBoost, sem parse).
-    Retorna True se salvou, False se 'file' é None.
-    """
-    if file is None:
-        return False
-    try:
-        data = await file.read()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"falha ao ler {getattr(file, 'filename', dest_path)}: {e}")
-
-    if data is None:
-        data = b""
-
-    if expect_json:
-        text = data.decode("utf-8", errors="ignore")
-        if not text.strip():
-            raise HTTPException(status_code=400, detail=f"{os.path.basename(dest_path)} vazio (JSON esperado).")
-        try:
-            json.loads(text)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"{os.path.basename(dest_path)} JSON inválido: {e}")
-
-    try:
-        with open(dest_path, "wb") as out:
-            out.write(data)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"falha ao salvar {dest_path}: {e}")
-    return True
-
-def _first_non_none(*candidates: Optional[UploadFile]) -> Optional[UploadFile]:
-    """Retorna o primeiro UploadFile não-nulo dentre aliases."""
-    for c in candidates:
-        if c is not None:
-            return c
-    return None
 
 # ===================== Helpers URL / Shopee =====================
 SHORT_DOMAINS = ("s.shopee.com.br", "s.shopee.com")
@@ -194,7 +137,7 @@ def _set_utm_content_preserving_order(url: str, new_value: str) -> str:
             break
     if not replaced:
         items.append("utm_content=" + new_value)
-    new_qs = "&join&".replace("join", "").join([s for s in items if s])  # não quebra ordem dos outros params
+    new_qs = "&".join([s for s in items if s])
     return urlunsplit((parts.scheme, parts.netloc, parts.path, new_qs, parts.fragment))
 
 def add_or_update_query_param(raw_url: str, key: str, value: str) -> str:
@@ -227,24 +170,31 @@ def _build_content_identifiers(origin_url: str) -> Tuple[List[str], List[Dict[st
 def _gen_fbp(ts: int) -> str:
     return f"fb.1.{ts}.{random.randint(10**15, 10**16 - 1)}"
 
-def _gen_fbc_from_fbp(fbp: str, ts: int) -> str:
-    return f"fb.1.{ts}.{_sha256_lower(fbp)[:16]}"
-
 # ===================== CSV buffer =====================
 _buffer_lock = threading.Lock()
 _buffer_rows: List[List[str]] = []
 _last_flush_ts = time.time()
 
 CSV_HEADERS = [
+    # tempos e request
     "timestamp","iso_time","ip","user_agent","referrer",
+    # urls
     "short_link_in","resolved_url","final_url","category",
-    "utm_original","utm_original_01","utm_numbered","fbclid","fbp","fbc",
+    # utm
+    "utm_original","utm_numbered","fbclid","fbp","fbc",
+    # device
     "device_name","os_family","os_version",
+    # geo
     "geo_status","geo_country","geo_region","geo_state","geo_city","geo_zip","geo_lat","geo_lon","geo_isp","geo_org","geo_asn",
+    # features básicas calculadas
     "part_of_day","hour","dow","ref_domain","os_version_num","is_android","is_ios",
+    # predição
     "pred_label","p_comprou","p_quase","p_desinteressado",
+    # thresholds (do meta do modelo) e flags
     "thr_qvc","thr_atc","is_qvc","is_atc",
+    # métricas derivadas (para ver o quão perto/longe do threshold)
     "pcomprou_pct","thr_qvc_pct","thr_atc_pct","gap_qvc","gap_atc","pct_of_atc",
+    # eventos meta
     "meta_event_sent","meta_view_sent"
 ]
 
@@ -327,11 +277,8 @@ def sanitize_subid_for_shopee(value: str) -> str:
     return cleaned[:_SUBID_MAXLEN] if cleaned else "na"
 
 def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
-    SHOPEE_APP_ID  = os.getenv("SHOPEE_APP_ID", "")
-    SHOPEE_SECRET  = os.getenv("SHOPEE_APP_SECRET", "")
-    SHOPEE_ENDPOINT= os.getenv("SHOPEE_ENDPOINT", "https://open-api.affiliate.shopee.com.br/graphql")
-    if not SHOPEE_APP_ID or not SHOPEE_SECRET:
-        return origin_url  # fallback
+    if not SHOPEE_APP_ID or not SHOPEE_APP_SECRET:
+        return origin_url  # fallback se não houver credencial
     payload_obj = {
         "query": ("mutation{generateShortLink(input:{"
                   f"originUrl:\"{origin_url}\","
@@ -340,7 +287,7 @@ def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
     }
     payload = json.dumps(payload_obj, separators=(',', ':'), ensure_ascii=False)
     ts = str(int(time.time()))
-    signature = hashlib.sha256((SHOPEE_APP_ID + ts + payload + SHOPEE_SECRET).encode("utf-8")).hexdigest()
+    signature = hashlib.sha256((SHOPEE_APP_ID + ts + payload + SHOPEE_APP_SECRET).encode("utf-8")).hexdigest()
     headers = {"Authorization": f"SHA256 Credential={SHOPEE_APP_ID}, Timestamp={ts}, Signature={signature}",
                "Content-Type": "application/json"}
     try:
@@ -389,33 +336,26 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
         print("[geo_lookup] erro:", e)
         return {"geo_status":"fail"}
 
-# ===================== Multi-Model: estado global =====================
-_cb_model = None
-_rf_model = None
-_xgb_model = None
-_stack_model = None  # LogisticRegression
-
-_stack_features: List[str] = []
-_loaded_libs = {"catboost": False, "xgboost": False}
+# ===================== Predição (CatBoost) =====================
+_model = None
+_model_classes: List[str] = []  # nomes das classes
+_thresholds: Dict[str, float] = {}  # qvc_mid / atc_high
+_thr_qvc = None
+_thr_atc = None
 
 _FEATURE_NAMES_FROM_META: List[str] = []
 _CAT_IDX_FROM_META: List[int] = []
+
 _TE_STATS = None
 _TE_PRIORS = None
 
+# classe positiva
 _POS_LABEL_NAME = "comprou"
 _POS_LABEL_ID = 1
 _POS_IDX = None
 
-_thresholds_stack = {"qvc_mid": 0.5, "atc_high": 0.5}
-_thresholds_cb    = {"qvc_mid": 0.5, "atc_high": 0.5}
-_thresholds_rf    = None
-_thresholds_xgb   = None
-
-_current_mode = SERVING_MODE_ENV
-
-# ===================== TE helpers =====================
 def _load_te_if_available():
+    """Fallback para ./models/te_stats.json"""
     global _TE_STATS, _TE_PRIORS
     if os.path.exists(TE_STATS_PATH):
         try:
@@ -426,17 +366,6 @@ def _load_te_if_available():
         except Exception as e:
             print("[TE] erro ao carregar te_stats.json:", e)
 
-def _apply_te(colname: str, value: str) -> Tuple[float,float]:
-    if not _TE_STATS or colname not in _TE_STATS:
-        return 0.0, 0.0
-    stats_map = _TE_STATS[colname]
-    prior = float((_TE_PRIORS or {}).get(colname, 0.0))
-    rec = stats_map.get(value)
-    if rec:
-        return float(rec.get("count", 0.0)), float(rec.get("buy_rate", prior))
-    return 0.0, prior
-
-# ===================== feature builders =====================
 def _norm_text(s: str) -> str:
     import unicodedata
     s = (s or "").strip().lower()
@@ -510,6 +439,16 @@ def _extract_dow_from_iso_for_log(t):
     except:
         return time.localtime().tm_wday
 
+def _apply_te(colname: str, value: str) -> Tuple[float,float]:
+    if not _TE_STATS or colname not in _TE_STATS:
+        return 0.0, 0.0
+    stats_map = _TE_STATS[colname]
+    prior = float((_TE_PRIORS or {}).get(colname, 0.0))
+    rec = stats_map.get(value)
+    if rec:
+        return float(rec.get("count", 0.0)), float(rec.get("buy_rate", prior))
+    return 0.0, prior
+
 def _features_full_dict(os_family, device_name, os_version, referrer, utm_original,
                         iso_time=None, geo: Optional[Dict[str,Any]]=None) -> Dict[str, Any]:
     hour = _extract_hour_from_iso_for_log(iso_time)
@@ -536,171 +475,138 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
     device_city_combo   = (f"{device_bucket}__{geo_city}").lower()
     utm_partofday_combo = (f"{utm_original}__{part_of_day}").lower()
 
+    # Target encodings opcionais (iguais às do treino)
     utm_n,  utm_br  = _apply_te("utm_original", str(utm_original or ""))
     ref_n,  ref_br  = _apply_te("ref_domain",   str(ref_domain))
     devb_n, devb_br = _apply_te("device_bucket",str(device_bucket))
     city_n, city_br = _apply_te("geo_city",     str(geo_city))
 
     return {
+        # categóricas
         "device_bucket": device_bucket, "os_family": os_family or "", "part_of_day": part_of_day,
         "geo_macro": geo_macro, "geo_region": geo_region, "geo_city": geo_city, "geo_zip": geo_zip,
         "geo_isp": geo_isp, "geo_org": geo_org, "ref_domain": ref_domain, "utm_original": utm_original or "",
         "device_city_combo": device_city_combo, "utm_partofday_combo": utm_partofday_combo,
+        # numéricas “puras”
         "hour": float(hour), "dow": float(dow), "month": float(month),
         "is_weekend": float(is_weekend),
         "os_version_num": float(os_ver_num), "is_android": float(is_android), "is_ios": float(is_ios),
+        # flags auxiliares (não entram no treino padrão; mantidos aqui para logs/consistência)
         "is_private_ip_flag": 0.0, "is_bot_flag": 0.0, "geo_fail_flag": float(geo_fail_flag), "has_utm_flag": float(1 if utm_original else 0),
+        # target encodings
         "utm_n": float(utm_n), "utm_br": float(utm_br),
         "ref_n": float(ref_n), "ref_br": float(ref_br),
         "devb_n": float(devb_n), "devb_br": float(devb_br),
         "city_n": float(city_n), "city_br": float(city_br),
     }
 
-# ===================== loaders =====================
-def _load_models_if_available():
-    global _cb_model, _rf_model, _xgb_model, _stack_model, _stack_features
+def _row_in_meta_order(feats_dict: Dict[str, Any]) -> Tuple[List[Any], List[int]]:
+    numeric_defaults = {
+        "hour","dow","month","is_weekend","os_version_num","is_android","is_ios",
+        "utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br",
+        "is_private_ip_flag","is_bot_flag","geo_fail_flag","has_utm_flag"
+    }
+    ordered = []
+    for col in _FEATURE_NAMES_FROM_META:
+        v = feats_dict.get(col)
+        if v is None:
+            v = 0.0 if col in numeric_defaults else ""
+        ordered.append(v)
+    return ordered, _CAT_IDX_FROM_META
+
+def _load_model_if_available():
+    """Carrega CatBoost + meta (features/cats/thresholds) e TE; configura classe positiva."""
+    global _model, _model_classes, _thresholds, _thr_qvc, _thr_atc
     global _FEATURE_NAMES_FROM_META, _CAT_IDX_FROM_META
     global _POS_LABEL_NAME, _POS_LABEL_ID, _POS_IDX
-    global _thresholds_stack, _thresholds_cb, _thresholds_rf, _thresholds_xgb
     global _TE_STATS, _TE_PRIORS
-    global _loaded_libs
 
-    _thresholds_stack = {"qvc_mid": 0.5, "atc_high": 0.5}
-    _thresholds_cb    = {"qvc_mid": 0.5, "atc_high": 0.5}
-    _thresholds_rf    = None
-    _thresholds_xgb   = None
-    _stack_features   = []
-    _POS_LABEL_NAME   = "comprou"
-    _POS_LABEL_ID     = 1
-    _POS_IDX          = None
-
-    meta = None
-    if os.path.exists(MODEL_META_PATH):
-        try:
-            meta = json.load(open(MODEL_META_PATH, "r", encoding="utf-8"))
-        except Exception as e:
-            print("[model-meta] erro ao ler:", e)
-
-    if meta:
-        _FEATURE_NAMES_FROM_META = list(meta.get("feature_names", []))
-        _CAT_IDX_FROM_META = list(meta.get("cat_idx", []))
-
-        t_stack = meta.get("thresholds") or {}
-        _thresholds_stack = {
-            "qvc_mid": float(t_stack.get("qvc_mid", 0.5)),
-            "atc_high": float(t_stack.get("atc_high", 0.5)),
-        }
-        t_cb = meta.get("thresholds_cb") or {}
-        _thresholds_cb = {
-            "qvc_mid": float(t_cb.get("qvc_mid", _thresholds_stack["qvc_mid"])),
-            "atc_high": float(t_cb.get("atc_high", _thresholds_stack["atc_high"])),
-        }
-        if "thresholds_rf" in meta:
-            _thresholds_rf = {
-                "qvc_mid": float(meta["thresholds_rf"].get("qvc_mid", 0.5)),
-                "atc_high": float(meta["thresholds_rf"].get("atc_high", 0.5)),
-            }
-        if "thresholds_xgb" in meta:
-            _thresholds_xgb = {
-                "qvc_mid": float(meta["thresholds_xgb"].get("qvc_mid", 0.5)),
-                "atc_high": float(meta["thresholds_xgb"].get("atc_high", 0.5)),
-            }
-
-        _POS_LABEL_NAME = meta.get("positive_label") or "comprou"
-        mapping = meta.get("mapping") or {}
-        try:
-            _POS_LABEL_ID = int(mapping.get(_POS_LABEL_NAME, 1))
-        except Exception:
-            _POS_LABEL_ID = 1
-
-        te = meta.get("te_stats")
-        if isinstance(te, dict):
-            _TE_STATS  = te.get("stats", {})
-            _TE_PRIORS = te.get("priors", {})
-            print("[TE] stats carregadas do model_meta_comprou.json.")
-        else:
-            _load_te_if_available()
-    else:
-        _FEATURE_NAMES_FROM_META = []
-        _CAT_IDX_FROM_META = []
-        _load_te_if_available()
-
-    _cb_model = None
     try:
-        if os.path.exists(MODEL_CB_PATH):
-            from catboost import CatBoostClassifier
-            _loaded_libs["catboost"] = True
+        from catboost import CatBoostClassifier
+        if os.path.exists(MODEL_PATH):
             m = CatBoostClassifier()
-            m.load_model(MODEL_CB_PATH)
-            _cb_model = m
+            m.load_model(MODEL_PATH)
+            _model = m
+
+            # classes do catboost (binário usualmente [0,1])
+            _model_classes = [str(x) for x in getattr(m, "classes_", [])] or ["0", "1"]
+
+            # defaults
+            _POS_LABEL_NAME = "comprou"
+            _POS_LABEL_ID = 1
+            _POS_IDX = None
+
+            meta = None
+            if os.path.exists(MODEL_META_PATH):
+                meta = json.load(open(MODEL_META_PATH, "r", encoding="utf-8"))
+
+                _FEATURE_NAMES_FROM_META = list(meta.get("feature_names", []))
+                _CAT_IDX_FROM_META = list(meta.get("cat_idx", []))
+
+                # thresholds: preferir thresholds_cb (CatBoost puro)
+                thr = meta.get("thresholds_cb") or meta.get("thresholds") or {}
+                _thresholds = {"qvc_mid": thr.get("qvc_mid"), "atc_high": thr.get("atc_high")}
+                _thr_qvc = float(_thresholds.get("qvc_mid") or 0.5)
+                _thr_atc = float(_thresholds.get("atc_high") or _thr_qvc or 0.5)
+
+                _POS_LABEL_NAME = meta.get("positive_label") or "comprou"
+                mapping = meta.get("mapping") or {}
+                try:
+                    _POS_LABEL_ID = int(mapping.get(_POS_LABEL_NAME, 1))
+                except Exception:
+                    _POS_LABEL_ID = 1
+
+                # TE embutido no meta (preferencial)
+                te = meta.get("te_stats")
+                if isinstance(te, dict):
+                    _TE_STATS  = te.get("stats", {})
+                    _TE_PRIORS = te.get("priors", {})
+                    print("[TE] stats carregadas do model_meta_comprou.json.")
+                else:
+                    _load_te_if_available()
+            else:
+                _FEATURE_NAMES_FROM_META = []
+                _CAT_IDX_FROM_META = []
+                _thr_qvc = 0.5
+                _thr_atc = 0.5
+                _load_te_if_available()
+
+            # descobrir índice da classe positiva dentro de model.classes_
             try:
-                classes_raw = list(getattr(_cb_model, "classes_", [0, 1]))
+                classes_raw = list(getattr(_model, "classes_", [0, 1]))
                 _POS_IDX = classes_raw.index(_POS_LABEL_ID) if _POS_LABEL_ID in classes_raw else (1 if len(classes_raw) == 2 else None)
             except Exception:
                 _POS_IDX = 1
+
+            print(f"[model] carregado. thr_qvc={_thr_qvc} thr_atc={_thr_atc} n_feats={len(_FEATURE_NAMES_FROM_META)} pos_id={_POS_LABEL_ID} pos_idx={_POS_IDX} TE_loaded={'yes' if _TE_STATS else 'no'}")
+        else:
+            print("[model] arquivo não encontrado:", MODEL_PATH)
     except Exception as e:
-        print("[CatBoost] erro ao carregar:", e)
+        print("[model] erro ao carregar:", e)
 
-    _rf_model = None
-    if os.path.exists(MODEL_RF_PATH):
-        try:
-            import joblib
-            _rf_model = joblib.load(MODEL_RF_PATH)
-        except Exception as e:
-            print("[RF] erro ao carregar:", e)
-
-    _xgb_model = None
-    try:
-        if os.path.exists(MODEL_XGB_PATH):
-            import xgboost as xgb
-            _loaded_libs["xgboost"] = True
-            model = xgb.XGBClassifier()
-            model.load_model(MODEL_XGB_PATH)
-            _xgb_model = model
-    except Exception as e:
-        print("[XGB] erro ao carregar:", e)
-
-    _stack_model = None
-    _stack_features = []
-    if os.path.exists(MODEL_STACK_PATH):
-        try:
-            import joblib
-            _stack_model = joblib.load(MODEL_STACK_PATH)
-        except Exception as e:
-            print("[STACK] erro ao carregar stack_model:", e)
-    if os.path.exists(STACK_META_PATH):
-        try:
-            sm = json.load(open(STACK_META_PATH, "r", encoding="utf-8"))
-            _stack_features = list(sm.get("stack_features", []))
-            if "thresholds" in sm:
-                _thresholds_stack = {
-                    "qvc_mid": float(sm["thresholds"].get("qvc_mid", _thresholds_stack["qvc_mid"])),
-                    "atc_high": float(sm["thresholds"].get("atc_high", _thresholds_stack["atc_high"])),
-                }
-        except Exception as e:
-            print("[STACK] erro ao carregar stack_meta:", e)
-
-    print(f"[models] loaded: cb={bool(_cb_model)} rf={bool(_rf_model)} xgb={bool(_xgb_model)} stack={bool(_stack_model)}")
-    print(f"[meta] n_features={len(_FEATURE_NAMES_FROM_META)} cat_idx={_CAT_IDX_FROM_META} pos_id={_POS_LABEL_ID} pos_idx={_POS_IDX}")
-    print(f"[thr] stack={_thresholds_stack} cb={_thresholds_cb} rf={_thresholds_rf} xgb={_thresholds_xgb} TE={'yes' if _TE_STATS else 'no'}")
-
-def _cb_predict_proba(row_values: List[Any], cat_idx: List[int]) -> Dict[str, float]:
+def predict_proba_single(row_values: List[Any], cat_idx: List[int]) -> Dict[str, float]:
+    """Retorna dict com probabilidades por classe (binário ou multi)."""
     try:
         from catboost import Pool
         import pandas as pd
-        if not _cb_model:
+        if not _model:
             return {}
         X_df  = pd.DataFrame([row_values], columns=_FEATURE_NAMES_FROM_META)
         pool  = Pool(X_df, cat_features=cat_idx)
-        probs = _cb_model.predict_proba(pool)[0]
+        probs = _model.predict_proba(pool)[0]
+
+        # Binário (2 saídas): p_pos no índice da classe positiva detectada
         if len(probs) == 2:
             pos_idx = _POS_IDX if _POS_IDX is not None else 1
             p_pos = float(probs[pos_idx])
             p_neg = float(probs[1 - pos_idx])
             return {"comprou": p_pos, "quase": 0.0, "desinteressado": p_neg}
+
+        # Multiclasse
         out = {"comprou": 0.0, "quase": 0.0, "desinteressado": 0.0}
-        for i, cls in enumerate([str(c).lower() for c in (getattr(_cb_model, "classes_", []) or [0,1])]):
-            if i >= len(probs): break
+        for i, cls in enumerate([str(c).lower() for c in _model_classes]):
+            if i >= len(probs):
+                break
             if "comprou" in cls or cls in ("1",):
                 out["comprou"] = float(probs[i])
             elif "quase" in cls:
@@ -709,126 +615,10 @@ def _cb_predict_proba(row_values: List[Any], cat_idx: List[int]) -> Dict[str, fl
                 out["desinteressado"] = float(probs[i])
         return out
     except Exception as e:
-        print("[predict-cb] erro:", e)
+        print("[predict] erro:", e)
         return {}
 
-def _rf_xgb_feature_vector_from(feats_dict: Dict[str, Any]) -> List[float]:
-    cols = ["hour","dow","is_weekend","os_version_num","is_android","is_ios",
-            "utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br"]
-    return [float(feats_dict.get(c, 0.0)) for c in cols]
-
-def _rf_predict_proba(feats_dict: Dict[str, Any]) -> Optional[float]:
-    if not _rf_model:
-        return None
-    try:
-        import numpy as np
-        X = np.asarray([_rf_xgb_feature_vector_from(feats_dict)], dtype=float)
-        proba = _rf_model.predict_proba(X)[0]
-        return float(proba[1]) if len(proba) >= 2 else None
-    except Exception as e:
-        print("[predict-rf] erro:", e)
-        return None
-
-def _xgb_predict_proba(feats_dict: Dict[str, Any]) -> Optional[float]:
-    if not _xgb_model:
-        return None
-    try:
-        import numpy as np
-        X = np.asarray([_rf_xgb_feature_vector_from(feats_dict)], dtype=float)
-        proba = _xgb_model.predict_proba(X)[0]
-        return float(proba[1]) if len(proba) >= 2 else None
-    except Exception as e:
-        print("[predict-xgb] erro:", e)
-        return None
-
-def _stack_predict_proba(p_cb: Optional[float], p_rf: Optional[float], p_xgb: Optional[float]) -> Optional[float]:
-    if not _stack_model or not _stack_features:
-        return None
-    try:
-        import numpy as np
-        mapping = {"proba_cb": p_cb, "proba_rf": p_rf, "proba_xgb": p_xgb}
-        vec = []
-        for f in _stack_features:
-            v = mapping.get(f)
-            if v is None:
-                return None
-            vec.append(float(v))
-        X = np.asarray([vec], dtype=float)
-        proba = _stack_model.predict_proba(X)[0]
-        return float(proba[1]) if len(proba) >= 2 else None
-    except Exception as e:
-        print("[predict-stack] erro:", e)
-        return None
-
-def _choose_active_mode(forced_mode: Optional[str], p_avail: Dict[str, Optional[float]]) -> str:
-    def available(mode: str) -> bool:
-        if mode == "stack": return p_avail.get("stack") is not None
-        if mode == "cb":    return p_avail.get("cb")    is not None
-        if mode == "xgb":   return p_avail.get("xgb")   is not None
-        if mode == "rf":    return p_avail.get("rf")    is not None
-        return False
-
-    if forced_mode in ("stack","cb","xgb","rf") and available(forced_mode):
-        return forced_mode
-    if _current_mode in ("stack","cb","xgb","rf") and available(_current_mode):
-        return _current_mode
-    for mode in ("stack","cb","xgb","rf"):
-        if available(mode):
-            return mode
-    return "cb"
-
-def _thresholds_for_mode(mode: str) -> Tuple[float,float]:
-    if mode == "stack":
-        return float(_thresholds_stack.get("qvc_mid", 0.5)), float(_thresholds_stack.get("atc_high", 0.5))
-    if mode == "cb":
-        return float(_thresholds_cb.get("qvc_mid", 0.5)), float(_thresholds_cb.get("atc_high", 0.5))
-    if mode == "rf":
-        if _thresholds_rf:
-            return float(_thresholds_rf.get("qvc_mid", 0.5)), float(_thresholds_rf.get("atc_high", 0.5))
-        return float(_thresholds_stack.get("qvc_mid", _thresholds_cb.get("qvc_mid", 0.5))), \
-               float(_thresholds_stack.get("atc_high", _thresholds_cb.get("atc_high", 0.5)))
-    if mode == "xgb":
-        if _thresholds_xgb:
-            return float(_thresholds_xgb.get("qvc_mid", 0.5)), float(_thresholds_xgb.get("atc_high", 0.5))
-        return float(_thresholds_stack.get("qvc_mid", _thresholds_cb.get("qvc_mid", 0.5))), \
-               float(_thresholds_stack.get("atc_high", _thresholds_cb.get("atc_high", 0.5)))
-    return 0.5, 0.5
-
-def _compute_all_probs(feats_dict: Dict[str, Any]) -> Tuple[Dict[str,float], Dict[str, Optional[float]]]:
-    p_cb_map = {"comprou": None, "quase": 0.0, "desinteressado": None}
-    p_cb = None
-    if _cb_model and _FEATURE_NAMES_FROM_META:
-        row_values = []
-        numeric_defaults = {
-            "hour","dow","month","is_weekend","os_version_num","is_android","is_ios",
-            "utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br",
-            "is_private_ip_flag","is_bot_flag","geo_fail_flag","has_utm_flag"
-        }
-        for col in _FEATURE_NAMES_FROM_META:
-            v = feats_dict.get(col)
-            if v is None:
-                v = 0.0 if col in numeric_defaults else ""
-            row_values.append(v)
-        p_cb_map = _cb_predict_proba(row_values, _CAT_IDX_FROM_META) or {"comprou": None, "quase": 0.0, "desinteressado": None}
-        p_cb = p_cb_map.get("comprou")
-
-    p_rf = _rf_predict_proba(feats_dict)
-    p_xgb = _xgb_predict_proba(feats_dict)
-    p_stack = _stack_predict_proba(p_cb, p_rf, p_xgb)
-
-    p_avail = {"cb": p_cb, "rf": p_rf, "xgb": p_xgb, "stack": p_stack}
-    return p_cb_map, p_avail
-
-_load_models_if_available()
-
-# ===================== UTM Pré-filtro =====================
-_UTM_A_SUFFIX_PATTERN = re.compile(r"^(?P<base>.*?)(?P<suf>A\d+)$")
-def split_utm_A_suffix(utm: str) -> Tuple[str, str]:
-    s = (utm or "").strip()
-    m = _UTM_A_SUFFIX_PATTERN.match(s)
-    if m:
-        return m.group("base"), m.group("suf")
-    return s, ""
+_load_model_if_available()
 
 # ===================== GCS flush =====================
 def _day_key(ts: int) -> str:
@@ -879,20 +669,9 @@ def health():
         ttl = None
     return {
         "ok": True, "ts": int(time.time()), "bucket": GCS_BUCKET, "prefix": GCS_PREFIX,
-        "video_id": VIDEO_ID,
-        "models_loaded": {
-            "cb": bool(_cb_model),
-            "rf": bool(_rf_model),
-            "xgb": bool(_xgb_model),
-            "stack": bool(_stack_model),
-        },
-        "serving_mode_current": _current_mode,
-        "meta": {"n_features": len(_FEATURE_NAMES_FROM_META), "cat_idx": _CAT_IDX_FROM_META},
-        "thr_stack": _thresholds_stack,
-        "thr_cb": _thresholds_cb,
-        "thr_rf": _thresholds_rf,
-        "thr_xgb": _thresholds_xgb,
-        "counter_ttl": ttl,
+        "video_id": VIDEO_ID, "model_loaded": bool(_model), "classes": _model_classes,
+        "thr_qvc": _thr_qvc, "thr_atc": _thr_atc, "n_features_meta": len(_FEATURE_NAMES_FROM_META),
+        "cat_idx_meta": _CAT_IDX_FROM_META, "counter_ttl": ttl,
         "te_loaded": bool(_TE_STATS)
     }
 
@@ -903,18 +682,6 @@ def robots():
 @app.get("/")
 def root():
     return PlainTextResponse("OK", status_code=200)
-
-@app.get("/privacy", response_class=HTMLResponse)
-async def privacy():
-    try:
-        privacy_path = os.path.join(BASE_DIR, "privacy.html")
-        with open(privacy_path, "r", encoding="utf-8") as f:
-            html = f.read()
-        return HTMLResponse(content=html, status_code=200, headers={
-            "Cache-Control": "public, max-age=3600"
-        })
-    except FileNotFoundError:
-        return PlainTextResponse("privacy.html não encontrado", status_code=404)
 
 def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str, str]:
     link_q = request.query_params.get("link")
@@ -936,9 +703,10 @@ def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str,
 
 # ===================== Handler principal =====================
 @app.get("/{full_path:path}")
-def track_number_and_redirect(request: Request, full_path: str = Path(...), cat: Optional[str] = Query(None), mode: Optional[str] = Query(None)):
+def track_number_and_redirect(request: Request, full_path: str = Path(...), cat: Optional[str] = Query(None)):
+    # ===== Entrada =====
     try:
-        incoming_url, in_mode = _build_incoming_from_request(request, full_path)
+        incoming_url, mode = _build_incoming_from_request(request, full_path)
     except HTTPException as he:
         return JSONResponse({"ok": False, "error": he.detail}, status_code=he.status_code)
 
@@ -952,6 +720,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     ip_addr = (request.client.host if request.client else "0.0.0.0")
     device_name, os_family, os_version = parse_device_info(user_agent)
 
+    # ===== Resolve url =====
     parts_in = urlsplit(incoming_url)
     resolved_url = _resolve_short_follow(incoming_url) if _is_short_domain(parts_in.netloc) else _fix_scheme(incoming_url)
 
@@ -961,16 +730,10 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     if not _is_allowed_long(parts_res.netloc) and not _is_short_domain(parts_res.netloc):
         return JSONResponse({"ok": False, "error": f"Domínio não permitido: {parts_res.netloc}"}, status_code=400)
 
+    # ===== UTM / numbering =====
     outer_uc = request.query_params.get("uc")
-    utm_original_in = outer_uc or extract_utm_content_from_url(incoming_url) or extract_utm_content_from_url(resolved_url) or ""
-
-    base, suf = split_utm_A_suffix(utm_original_in)
-    utm_original = base
-    utm_original_01 = (base + suf) if suf else ""
-
-    primary_for_ops = utm_original_01 if utm_original_01 else utm_original
-
-    clean_base = re.sub(r'[^A-Za-z0-9]', '', primary_for_ops or "") or "n"
+    utm_original = outer_uc or extract_utm_content_from_url(incoming_url) or extract_utm_content_from_url(resolved_url) or ""
+    clean_base = re.sub(r'[^A-Za-z0-9]', '', utm_original or "") or "n"
     utm_numbered = f"{clean_base}N{incr_counter()}"
 
     url_with_utm = _set_utm_content_preserving_order(resolved_url, utm_numbered)
@@ -978,76 +741,60 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     if _is_short_domain(urlsplit(origin_url).netloc):
         origin_url = _resolve_short_follow(origin_url)
 
+    # ===== content_ids/contents =====
     content_ids, contents_payload = _build_content_identifiers(origin_url)
 
-    sub_id_api = sanitize_subid_for_shopee(primary_for_ops) or "na"
+    # ===== short oficial (se houver credencial) =====
+    sub_id_api = sanitize_subid_for_shopee(utm_numbered)
     dest = generate_short_link(origin_url, sub_id_api)
 
+    # ===== Cookies / IDs =====
     fbp_cookie = get_cookie_value(cookie_header, "_fbp") or _gen_fbp(ts)
+    fbc_val    = build_fbc_from_fbclid(fbclid, creation_ts=ts)
 
-    fbc_cookie = get_cookie_value(cookie_header, "_fbc")
-    fbc_from_fbclid = build_fbc_from_fbclid(fbclid, creation_ts=ts) if fbclid else None
-    if fbc_from_fbclid:
-        fbc_cookie = fbc_from_fbclid
-    if not fbc_cookie:
-        fbc_cookie = _gen_fbc_from_fbp(fbp_cookie, ts)
-
-    eid_cookie = get_cookie_value(cookie_header, "_eid") or _sha256_lower(fbp_cookie)
-
+    # snapshot p/ consulta posterior
     r.setex(f"{USERDATA_KEY_PREFIX}{utm_numbered}", USERDATA_TTL_SECONDS, json.dumps({
         "ip": ip_addr, "ua": user_agent, "referrer": referrer,
         "event_source_url": origin_url, "short_link": dest,
-        "vc_time": ts, "utm_original": utm_original, "utm_original_01": utm_original_01, "utm_numbered": utm_numbered,
-        "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_cookie, "eid": eid_cookie, "mode": in_mode
+        "vc_time": ts, "utm_original": utm_original, "utm_numbered": utm_numbered,
+        "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_val, "mode": mode
     }))
 
-    external_id = eid_cookie or _sha256_lower(f"{user_agent}|{ip_addr}")
+    # ===== external_id =====
+    external_id = _sha256_lower(utm_numbered.lower()) if utm_numbered else _sha256_lower(f"{fbp_cookie}|{user_agent}|{ip_addr}")
 
+    # ===== user data meta =====
     user_data_meta = {
         "client_ip_address": ip_addr,
         "client_user_agent": user_agent,
         "external_id": external_id,
         **({"fbp": fbp_cookie} if fbp_cookie else {}),
-        **({"fbc": fbc_cookie} if fbc_cookie else {})
+        **({"fbc": fbc_val} if fbc_val else {})
     }
 
+    # ===== Geo + Features + Pred =====
     geo = geo_lookup(ip_addr)
-    feats_dict = _features_full_dict(os_family, device_name, os_version, referrer, utm_original, iso_time, geo)
+    p_map = {"comprou": 0.0, "quase": 0.0, "desinteressado": 0.0}
+    pred_label = "desinteressado"
+    is_qvc_flag = 0
+    is_atc_flag = 0
 
-    p_cb_map, p_avail = _compute_all_probs(feats_dict)
-    p_cb  = p_avail.get("cb")
-    p_rf  = p_avail.get("rf")
-    p_xgb = p_avail.get("xgb")
-    p_stack = p_avail.get("stack")
+    try:
+        feats_dict = _features_full_dict(os_family, device_name, os_version, referrer, utm_original, iso_time, geo)
+        if _model and _FEATURE_NAMES_FROM_META:
+            row_values, cat_idx = _row_in_meta_order(feats_dict)
+            probs = predict_proba_single(row_values, cat_idx)
+            for k in list(probs.keys()):
+                p_map[k] = float(probs[k])
 
-    forced_mode = (mode or "").strip().lower() if mode else None
-    active_mode = _choose_active_mode(forced_mode, p_avail)
+            p_c = float(p_map.get("comprou", 0.0))
+            is_qvc_flag = 1 if p_c >= (_thr_qvc or 0.5) else 0
+            is_atc_flag = 1 if p_c >= (_thr_atc or _thr_qvc or 0.5) else 0
+            pred_label = "comprou" if is_atc_flag else ("comprou_qvc" if is_qvc_flag else "desinteressado")
+    except Exception as e:
+        print("[predict] erro:", e)
 
-    if active_mode == "stack" and p_stack is not None:
-        p_c = float(p_stack)
-        thr_q, thr_a = _thresholds_for_mode("stack")
-        p_map = {"comprou": p_c, "quase": 0.0, "desinteressado": 1.0 - p_c}
-    elif active_mode == "cb" and p_cb is not None:
-        p_c = float(p_cb)
-        thr_q, thr_a = _thresholds_for_mode("cb")
-        p_map = {"comprou": p_c, "quase": float(p_cb_map.get("quase", 0.0)), "desinteressado": float(p_cb_map.get("desinteressado", 1.0 - p_c))}
-    elif active_mode == "xgb" and p_xgb is not None:
-        p_c = float(p_xgb)
-        thr_q, thr_a = _thresholds_for_mode("xgb")
-        p_map = {"comprou": p_c, "quase": 0.0, "desinteressado": 1.0 - p_c}
-    elif active_mode == "rf" and p_rf is not None:
-        p_c = float(p_rf)
-        thr_q, thr_a = _thresholds_for_mode("rf")
-        p_map = {"comprou": p_c, "quase": 0.0, "desinteressado": 1.0 - p_c}
-    else:
-        p_c, thr_q, thr_a = 0.0, 0.5, 0.5
-        p_map = {"comprou": 0.0, "quase": 0.0, "desinteressado": 1.0}
-        active_mode = "none"
-
-    is_qvc_flag = 1 if p_c >= thr_q else 0
-    is_atc_flag = 1 if p_c >= thr_a else 0
-    pred_label = f"{'comprou' if is_atc_flag else ('comprou_qvc' if is_qvc_flag else 'desinteressado')}"
-
+    # ===== Meta: ViewContent sempre =====
     meta_sent = ""
     meta_view = ""
     if META_PIXEL_ID and META_ACCESS_TOKEN:
@@ -1061,7 +808,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                 "user_data": user_data_meta,
                 "custom_data": {
                     "currency": "BRL",
-                    "value": 0,
+                    "value": 0.0,
                     "content_type": "product",
                     "content_ids": content_ids,
                     "contents": contents_payload
@@ -1079,6 +826,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             print("[meta] VC exceção:", e)
             meta_view = "error"
 
+    # ===== Meta: AddToCart somente quando p_comprou >= thr_atc =====
     if META_PIXEL_ID and META_ACCESS_TOKEN and is_atc_flag == 1:
         atc_payload = {
             "data": [{
@@ -1090,7 +838,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                 "user_data": user_data_meta,
                 "custom_data": {
                     "currency": "BRL",
-                    "value": 0,
+                    "value": 0.0,
                     "content_type": "product",
                     "content_ids": content_ids,
                     "contents": contents_payload
@@ -1108,6 +856,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             print("[meta] ATC exceção:", e)
             meta_sent = "error"
 
+    # ===== Log CSV =====
     hour_log = _extract_hour_from_iso_for_log(iso_time)
     dow_log = _extract_dow_from_iso_for_log(iso_time)
     ref_domain_log = _get_first_domain_for_log(referrer)
@@ -1115,6 +864,10 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     is_android_log = 1 if "android" in (os_family or "").lower() else 0
     is_ios_log     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
     part_of_day_log = _part_of_day_from_hour(hour_log)
+
+    p_c = float(p_map.get("comprou", 0.0))
+    thr_q = float(_thr_qvc or 0.5)
+    thr_a = float(_thr_atc or thr_q or 0.5)
 
     pcomprou_pct = p_c * 100.0
     thr_qvc_pct  = thr_q * 100.0
@@ -1126,28 +879,23 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     csv_row = [
         ts, iso_time, ip_addr, user_agent, referrer,
         incoming_url, resolved_url, origin_url, (cat or ""),
-        utm_original, utm_original_01, utm_numbered, fbclid or "", fbp_cookie or "", fbc_cookie or "",
+        utm_original, utm_numbered, fbclid or "", fbp_cookie or "", build_fbc_from_fbclid(fbclid, ts) or "",
         device_name, os_family, os_version,
         geo.get("geo_status",""), geo.get("geo_country",""), geo.get("geo_region",""), geo.get("geo_state",""),
         geo.get("geo_city",""), geo.get("geo_zip",""), geo.get("geo_lat",""), geo.get("geo_lon",""),
         geo.get("geo_isp",""), geo.get("geo_org",""), geo.get("geo_asn",""),
         part_of_day_log, hour_log, dow_log, ref_domain_log, os_version_num_log, is_android_log, is_ios_log,
-        pred_label, float(p_map.get("comprou",0.0)), float(p_map.get("quase",0.0)), float(p_map.get("desinteressado",0.0)),
-        float(thr_q), float(thr_a), int(is_qvc_flag), int(is_atc_flag),
+        pred_label, p_c, float(p_map.get("quase",0.0)), float(p_map.get("desinteressado",0.0)),
+        thr_q, thr_a, int(is_qvc_flag), int(is_atc_flag),
         pcomprou_pct, thr_qvc_pct, thr_atc_pct, gap_qvc, gap_atc, pct_of_atc,
         meta_sent, meta_view
     ]
     with _buffer_lock:
         _buffer_rows.append(csv_row)
 
+    # ===== Intersticial Pinterest =====
     def _is_pinterest(ua: str) -> bool:
         return "pinterest" in (ua or "").lower()
-
-    set_cookie_headers = [
-        f"_fbp={fbp_cookie}; Path=/; Max-Age=63072000; SameSite=Lax",
-        f"_fbc={fbc_cookie}; Path=/; Max-Age=63072000; SameSite=Lax",
-        f"_eid={eid_cookie}; Path=/; Max-Age=63072000; SameSite=Lax",
-    ]
 
     if _is_pinterest(user_agent):
         html = f"""<!doctype html>
@@ -1159,12 +907,11 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 </head><body>Redirecionando…</body></html>"""
         return HTMLResponse(content=html, status_code=200, headers={
             "Cache-Control": "no-store, max-age=0", "X-Content-Type-Options": "nosniff",
-            "Set-Cookie": ", ".join(set_cookie_headers)
         })
 
     return RedirectResponse(dest, status_code=302, headers={
         "Cache-Control": "no-store, max-age=0",
-        "Set-Cookie": ", ".join(set_cookie_headers)
+        "Set-Cookie": f"_fbp={fbp_cookie}; Path=/; Max-Age=63072000; SameSite=Lax"
     })
 
 # ===================== Admin =====================
@@ -1172,180 +919,76 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 def admin_page():
     return """
     <html>
-      <head><meta charset="utf-8"><title>Upload do Modelo (Multi-Model)</title></head>
-      <body style="font-family: sans-serif; max-width: 720px; margin: 40px auto;">
-        <h2>Enviar modelos</h2>
-        <p><b>Arquivos aceitos (opcionais):</b></p>
-        <ul>
-          <li><code>model_comprou.cbm</code> (CatBoost) — campos aceitos: <code>model</code>, <code>cb</code>, <code>cb_model</code></li>
-          <li><code>model_meta_comprou.json</code> (meta) — campos: <code>meta</code>, <code>meta_file</code></li>
-          <li><code>rf.joblib</code> (RandomForest) — campos: <code>rf</code>, <code>rf_model</code></li>
-          <li><code>xgb.json</code> (XGBoost) — campos: <code>xgb</code>, <code>xgb_model</code> (salvo sem parse)</li>
-          <li><code>stack_model.joblib</code> (Stack) — campos: <code>stack</code>, <code>stack_model</code></li>
-          <li><code>stack_meta.json</code> (Stack Meta, JSON) — campo: <code>stack_meta</code></li>
-          <li><code>te_stats.json</code> (Target Encoding, JSON) — campo: <code>te</code></li>
-        </ul>
-        <form method="post" action="/admin/upload_models_bundle" enctype="multipart/form-data">
+      <head><meta charset="utf-8"><title>Upload do Modelo</title></head>
+      <body style="font-family: sans-serif; max-width: 640px; margin: 40px auto;">
+        <h2>Enviar modelo CatBoost (alinhado ao treino)</h2>
+        <p><b>Arquivos esperados:</b> model_comprou.cbm e model_meta_comprou.json (opcional: te_stats.json)</p>
+        <form method="post" action="/admin/upload_model_simple" enctype="multipart/form-data">
           <div>Token (X-Admin-Token): <input name="token" type="password" required /></div><br/>
-          <div>model_comprou.cbm: <input name="model" type="file" /></div><br/>
-          <div>model_meta_comprou.json: <input name="meta" type="file" /></div><br/>
-          <div>rf.joblib: <input name="rf" type="file" /></div><br/>
-          <div>xgb.json: <input name="xgb" type="file" /></div><br/>
-          <div>stack_model.joblib: <input name="stack" type="file" /></div><br/>
-          <div>stack_meta.json: <input name="stack_meta" type="file" /></div><br/>
-          <div>te_stats.json: <input name="te" type="file" /></div><br/>
+          <div>model_comprou.cbm: <input name="model" type="file" required /></div><br/>
+          <div>model_meta_comprou.json (opcional): <input name="meta" type="file" /></div><br/>
           <button type="submit">Enviar</button>
         </form>
-        <p>Depois de enviar, abra <code>/health</code> para conferir modelos e thresholds carregados.</p>
+        <p>Depois de enviar, abra <code>/health</code> para conferir <b>model_loaded: true</b>, thresholds e TE loaded.</p>
       </body>
     </html>
     """
-
-@app.post("/admin/upload_models_bundle")
-async def admin_upload_models_bundle(
-    token: str = Form(...),
-    # nomes principais
-    cb: UploadFile = File(None),
-    meta: UploadFile = File(None),
-    rf: UploadFile = File(None),
-    xgb: UploadFile = File(None),
-    stack: UploadFile = File(None),
-    stack_meta: UploadFile = File(None),
-    te: UploadFile = File(None),
-    # aliases comuns
-    model: UploadFile = File(None),
-    cb_model: UploadFile = File(None),
-    rf_model: UploadFile = File(None),
-    xgb_model: UploadFile = File(None),
-    stack_model: UploadFile = File(None),
-):
-    if token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="unauthorized")
-
-    # aliases -> efetivos
-    up_cb    = _first_non_none(cb, model, cb_model)
-    up_meta  = meta
-    up_rf    = _first_non_none(rf, rf_model)
-    up_xgb   = _first_non_none(xgb, xgb_model)
-    up_stack = _first_non_none(stack, stack_model)
-    up_stack_meta = stack_meta
-    up_te    = te
-
-    if up_cb:        await _save_upload_once(up_cb,        MODEL_CB_PATH,    expect_json=False)
-    if up_meta:      await _save_upload_once(up_meta,      MODEL_META_PATH,  expect_json=True)
-    if up_rf:        await _save_upload_once(up_rf,        MODEL_RF_PATH,    expect_json=False)
-    if up_xgb:       await _save_upload_once(up_xgb,       MODEL_XGB_PATH,   expect_json=False)  # sem parse
-    if up_stack:     await _save_upload_once(up_stack,     MODEL_STACK_PATH, expect_json=False)
-    if up_stack_meta:await _save_upload_once(up_stack_meta,STACK_META_PATH,  expect_json=True)
-    if up_te:        await _save_upload_once(up_te,        TE_STATS_PATH,    expect_json=True)
-
-    _load_models_if_available()
-    return {
-        "ok": True,
-        "models_loaded": {"cb": bool(_cb_model), "rf": bool(_rf_model), "xgb": bool(_xgb_model), "stack": bool(_stack_model)},
-        "thr_stack": _thresholds_stack, "thr_cb": _thresholds_cb, "thr_rf": _thresholds_rf, "thr_xgb": _thresholds_xgb,
-        "te_loaded": bool(_TE_STATS)
-    }
 
 @app.post("/admin/upload_model_simple")
 async def admin_upload_model_simple(token: str = Form(...), model: UploadFile = File(...), meta: UploadFile = File(None)):
     if token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
-    await _save_upload_once(model, MODEL_CB_PATH, expect_json=False)
+    try:
+        with open(MODEL_PATH, "wb") as out:
+            out.write(await model.read())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"falha ao salvar model: {e}")
     if meta:
-        await _save_upload_once(meta, MODEL_META_PATH, expect_json=True)
-    _load_models_if_available()
-    return {"ok": True, "models_loaded": {"cb": bool(_cb_model)}, "thr_cb": _thresholds_cb, "te_loaded": bool(_TE_STATS)}
+        try:
+            data = await meta.read()
+            _ = json.loads(data.decode("utf-8"))
+            with open(MODEL_META_PATH, "wb") as out:
+                out.write(data)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
+    _load_model_if_available()
+    return {"ok": True, "model_loaded": bool(_model), "thr_qvc": _thr_qvc, "thr_atc": _thr_atc, "te_loaded": bool(_TE_STATS)}
 
 @app.post("/admin/upload_model")
 async def admin_upload_model(
-    # compat: nomes antigos e atuais
     model_file: UploadFile = File(None), meta_file: UploadFile = File(None),
     model: UploadFile = File(None), meta: UploadFile = File(None),
-    rf: UploadFile = File(None), xgb: UploadFile = File(None),
-    stack: UploadFile = File(None), stack_meta: UploadFile = File(None),
-    te: UploadFile = File(None),
-    # aliases adicionais aceitos
-    cb: UploadFile = File(None), cb_model: UploadFile = File(None),
-    rf_model: UploadFile = File(None), xgb_model: UploadFile = File(None),
-    stack_model: UploadFile = File(None),
     x_admin_token: str = Header(None)
 ):
-    """
-    Endpoint robusto:
-    - Leitura única dos arquivos.
-    - JSON obrigatório apenas para: meta, stack_meta, te.
-    - xgb.json é salvo SEM parse (modelo em JSON).
-    - Aceita aliases: rf/rf_model, xgb/xgb_model, stack/stack_model, cb/model/cb_model, meta/meta_file.
-    """
     if x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
-
-    # mapeia aliases -> efetivos
-    up_model = _first_non_none(model_file, model, cb, cb_model)   # CatBoost
-    up_meta  = _first_non_none(meta_file, meta)                   # JSON do meta
-    up_rf    = _first_non_none(rf, rf_model)                      # RF
-    up_xgb   = _first_non_none(xgb, xgb_model)                    # XGB (json, sem parse)
-    up_stack = _first_non_none(stack, stack_model)                # Stack model.joblib
-    up_stack_meta = stack_meta                                    # Stack meta (JSON)
-    up_te    = te                                                 # TE (JSON)
-
-    # salva efetivos
-    if up_model:
-        await _save_upload_once(up_model, MODEL_CB_PATH, expect_json=False)
-    if up_meta:
-        await _save_upload_once(up_meta, MODEL_META_PATH, expect_json=True)
-
+    up_model = model_file or model
+    if not up_model:
+        raise HTTPException(status_code=400, detail="model file ausente (campo model_file ou model)")
     try:
-        if up_rf:        await _save_upload_once(up_rf,        MODEL_RF_PATH,    expect_json=False)
-        if up_xgb:       await _save_upload_once(up_xgb,       MODEL_XGB_PATH,   expect_json=False)  # sem parse
-        if up_stack:     await _save_upload_once(up_stack,     MODEL_STACK_PATH, expect_json=False)
-        if up_stack_meta:await _save_upload_once(up_stack_meta,STACK_META_PATH,  expect_json=True)
-        if up_te:        await _save_upload_once(up_te,        TE_STATS_PATH,    expect_json=True)
-    except HTTPException:
-        raise
+        with open(MODEL_PATH, "wb") as out:
+            out.write(await up_model.read())
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"falha ao salvar arquivo(s) extras: {e}")
-
-    _load_models_if_available()
-    return {
-        "ok": True,
-        "saved": {
-            "cb": MODEL_CB_PATH if up_model else None,
-            "meta": MODEL_META_PATH if up_meta else None,
-            "rf": MODEL_RF_PATH if up_rf else None,
-            "xgb": MODEL_XGB_PATH if up_xgb else None,
-            "stack": MODEL_STACK_PATH if up_stack else None,
-            "stack_meta": STACK_META_PATH if up_stack_meta else None,
-            "te": TE_STATS_PATH if up_te else None
-        },
-        "models_loaded": {"cb": bool(_cb_model), "rf": bool(_rf_model), "xgb": bool(_xgb_model), "stack": bool(_stack_model)},
-        "thr_stack": _thresholds_stack, "thr_cb": _thresholds_cb, "thr_rf": _thresholds_rf, "thr_xgb": _thresholds_xgb,
-        "te_loaded": bool(_TE_STATS)
-    }
+        raise HTTPException(status_code=500, detail=f"falha ao salvar model: {e}")
+    up_meta = meta_file or meta
+    if up_meta:
+        try:
+            data = await up_meta.read()
+            _ = json.loads(data.decode("utf-8"))
+            with open(MODEL_META_PATH, "wb") as out:
+                out.write(data)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"meta_file inválido: {e}")
+    _load_model_if_available()
+    return {"ok": True, "saved": {"model": MODEL_PATH, "meta": (MODEL_META_PATH if up_meta else None)},
+            "model_loaded": bool(_model), "thr_qvc": _thr_qvc, "thr_atc": _thr_atc, "te_loaded": bool(_TE_STATS)}
 
 @app.post("/admin/reload_model")
 def admin_reload_model(x_admin_token: str = Header(None)):
     if x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
-    _load_models_if_available()
-    return {
-        "ok": True,
-        "models_loaded": {"cb": bool(_cb_model), "rf": bool(_rf_model), "xgb": bool(_xgb_model), "stack": bool(_stack_model)},
-        "thr_stack": _thresholds_stack, "thr_cb": _thresholds_cb, "thr_rf": _thresholds_rf, "thr_xgb": _thresholds_xgb,
-        "te_loaded": bool(_TE_STATS)
-    }
-
-@app.post("/admin/set_mode")
-def admin_set_mode(mode: str = Query(...), x_admin_token: str = Header(None)):
-    global _current_mode
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    m = (mode or "").strip().lower()
-    if m not in ("auto","cb","rf","xgb","stack"):
-        raise HTTPException(status_code=400, detail="invalid_mode")
-    _current_mode = m
-    return {"ok": True, "serving_mode_current": _current_mode}
+    _load_model_if_available()
+    return {"ok": True, "model_loaded": bool(_model), "thr_qvc": _thr_qvc, "thr_atc": _thr_atc, "te_loaded": bool(_TE_STATS)}
 
 @app.get("/admin/flush")
 def admin_flush(token: str):
