@@ -1,9 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI) + TikTok Events API
-(versão consolidada e corrigida)
-- TikTok: ViewContent e AddToCart com content_id e value numérico (mesmo requisito do Meta).
-- Sem duplicações, sem 'global usado antes da declaração', sem erros de indentação.
+FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK)
++ Meta Ads (CAPI) + TikTok Events API (ViewContent & AddToCart)
+(versão final)
+
+Regras/observações importantes:
+- NÃO resolver/abrir short-link da Shopee antes de gerar o short oficial (SKIP_RESOLVE=1 por padrão).
+- A UTM vem do parâmetro `uc`. A partir de `uc` derivamos:
+  * UTMContent (base, [A-Za-z0-9-])
+  * UTMContent01 (base + '-A\\d+' se existir)
+  * UTMNumered = (UTMContent01 se existir senão UTMContent) + 'N' + contador
+- Apenas substituímos utm_content na URL alvo.
+- subId3 (API Shopee) = UTMNumered (sanitizado).
+- Predição usa somente utm_original (UTMContent base).
+- META CAPI: só envia `fbc` quando houver `fbclid`. Caso contrário, omite.
+- TikTok: envia ViewContent sempre; AddToCart quando `is_atc_flag==1` (mesmo requisito do Meta).
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -55,7 +66,7 @@ TIKTOK_ACCESS_TOKEN   = os.getenv("TIKTOK_ACCESS_TOKEN", "")
 TIKTOK_API_BASE       = os.getenv("TIKTOK_API_BASE", "https://business-api.tiktok.com/open_api")
 TIKTOK_API_TRACK_URL  = f"{TIKTOK_API_BASE}/v1.3/pixel/track/"
 
-# Seleção de modelo (server)
+# Seleção de modelo
 SERVING_MODE_ENV      = (os.getenv("SERVING_MODE", "auto") or "auto").strip().lower()  # auto|cb|rf|xgb|stack
 
 # Comportamento de resolução de URL (1 = NÃO resolver short, default; 0 = resolver)
@@ -131,6 +142,7 @@ def _is_allowed_long(domain: str) -> bool:
     return apex_ok or suf_ok
 
 def _resolve_short_follow(url: str) -> str:
+    """Mantido para compatibilidade; só será usado se SKIP_RESOLVE=0."""
     try:
         resp = session.head(url, allow_redirects=True, timeout=DEFAULT_TIMEOUT)
         final_url = resp.url
@@ -171,22 +183,29 @@ def _extract_shopee_ids(u: str) -> Tuple[Optional[str], Optional[str]]:
         return m.group(1), m.group(2)
     return None, None
 
-def _build_content_identifiers(origin_url: str) -> Tuple[List[str], List[Dict[str, Any]]]:
+def _build_content_identifiers(origin_url: str) -> Tuple[List[str], List[Dict[str, Any]], str]:
+    """Retorna (content_ids, contents, content_name_fallback)."""
     shop_id, item_id = _extract_shopee_ids(origin_url)
     if shop_id and item_id:
         cid = f"{shop_id}.{item_id}"
+        name = f"shopee-{cid}"
     else:
         parts = urlsplit(origin_url)
         base = (parts.path or "/") + ("?" + parts.query if parts.query else "")
         cid  = _sha256_lower(base)[:16]
-    return [cid], [{"id": cid, "quantity": 1}]
+        name = f"item-{cid}"
+    return [cid], [{"id": cid, "quantity": 1}], name
 
 # ===================== AM / IDs =====================
 def _gen_fbp(ts: int) -> str:
     return f"fb.1.{ts}.{random.randint(10**15, 10**16 - 1)}"
 
-def _gen_fbc_from_fbp(fbp: str, ts: int) -> str:
-    return f"fb.1.{ts}.{_sha256_lower(fbp)[:16]}"
+def build_fbc_from_fbclid(fbclid: Optional[str], creation_ts: Optional[int] = None) -> Optional[str]:
+    if not fbclid:
+        return None
+    if creation_ts is None:
+        creation_ts = int(time.time())
+    return f"fb.1.{creation_ts}.{fbclid}"
 
 # ===================== CSV buffer =====================
 _buffer_lock = threading.Lock()
@@ -226,13 +245,6 @@ def get_cookie_value(cookie_header: Optional[str], name: str) -> Optional[str]:
         pass
     return None
 
-def build_fbc_from_fbclid(fbclid: Optional[str], creation_ts: Optional[int] = None) -> Optional[str]:
-    if not fbclid:
-        return None
-    if creation_ts is None:
-        creation_ts = int(time.time())
-    return f"fb.1.{creation_ts}.{fbclid}"
-
 def parse_device_info(ua: str):
     ua = ua or "-"
     ua_l = ua.lower()
@@ -252,42 +264,43 @@ def parse_device_info(ua: str):
     device_name = "iPhone" if "iphone" in ua_l else ("Android" if "android" in ua_l else "Desktop")
     return device_name, os_family, os_version
 
-# ===== Normalizador de UTM (corta URLs grudadas e aceita sufixo -A\d+) =====
+# ===== Normalizador de UTM (corta URLs grudadas e aceita sufixo -A\\d+) =====
 _URL_CUT_RE = re.compile(r'(https?:\/\/|www\.|[a-z0-9-]+\.(?:com|br|net|org)(?:\/|$))', re.I)
 
 def _normalize_utm_content(raw: str) -> Tuple[str, str]:
+    """
+    Retorna (UTMContent, UTMContent01).
+    - Corta qualquer URL/host que apareça no valor.
+    - Mantém apenas [A-Za-z0-9-].
+    - Suporta sufixo '-A\\d+' para compor o UTMContent01.
+    """
     s = (raw or "").strip()
+
+    # Corta na 1ª marca de URL
     m = _URL_CUT_RE.search(s)
     if m:
         s = s[:m.start()]
+
+    # Defesa extra
     idx_http = s.lower().find("http")
     if idx_http != -1:
         s = s[:idx_http]
+
+    # Limpeza
     s = re.sub(r'^[\s\-_]+|[\s\-_]+$', '', s)
     s = re.sub(r'[^A-Za-z0-9\-]+', '', s)
     s = re.sub(r'-{2,}', '-', s)
+
     m2 = re.match(r'^(?P<base>[A-Za-z0-9\-]*?)(?:-?(?P<suf>A\d+))?$', s)
     if not m2:
         return s, ""
+
     base = (m2.group("base") or "").strip("-")
     suf  = m2.group("suf") or ""
+
     utm_content    = base
     utm_content_01 = f"{base}-{suf}" if suf else ""
     return utm_content, utm_content_01
-
-def resolve_short_link(short_url: str) -> Tuple[str, Dict[str, Optional[str]]]:
-    current = short_url
-    final_url = short_url
-    subids = {}
-    try:
-        resp = session.get(current, allow_redirects=False, timeout=DEFAULT_TIMEOUT,
-                           headers={"User-Agent": "Mozilla/5.0 (resolver/1.0)"})
-        if 300 <= resp.status_code < 400 and "Location" in resp.headers:
-            location = resp.headers["Location"]
-            final_url = urllib.parse.urljoin(current, location)
-    except Exception:
-        pass
-    return final_url, subids
 
 # Shopee short-link
 _SUBID_MAXLEN = int(os.getenv("SHOPEE_SUBID_MAXLEN", "50"))
@@ -299,6 +312,7 @@ def sanitize_subid_for_shopee(value: str) -> str:
     return cleaned[:_SUBID_MAXLEN] if cleaned else "na"
 
 def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
+    # Sempre gerar via API; sem credenciais -> 502
     if not SHOPEE_APP_ID or not SHOPEE_APP_SECRET:
         raise HTTPException(status_code=502, detail="shortlink_unavailable: missing Shopee credentials")
     payload_obj = {
@@ -505,6 +519,7 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
     device_city_combo   = (f"{device_bucket}__{geo_city}").lower()
     utm_partofday_combo = (f"{utm_original}__{part_of_day}").lower()
 
+    # TE encoders — sempre usando utm_original (base)
     utm_n,  utm_br  = _apply_te("utm_original", str(utm_original or ""))
     ref_n,  ref_br  = _apply_te("ref_domain",   str(ref_domain))
     devb_n, devb_br = _apply_te("device_bucket",str(device_bucket))
@@ -527,19 +542,11 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
 
 # ===================== loaders =====================
 def _load_models_if_available():
-    """
-    Carrega artefatos disponíveis:
-      - CatBoost (cb)
-      - RandomForest (rf)
-      - XGBoost (xgb)
-      - Stack (LogReg)
-      - Meta (features, thresholds, TE)
-    """
     global _cb_model, _rf_model, _xgb_model, _stack_model, _stack_features
     global _FEATURE_NAMES_FROM_META, _CAT_IDX_FROM_META
     global _POS_LABEL_NAME, _POS_LABEL_ID, _POS_IDX
     global _thresholds_stack, _thresholds_cb, _thresholds_rf, _thresholds_xgb
-    global _TE_STATS, _TE_PRIORS, _loaded_libs
+    global _TE_STATS, _TE_PRIORS, _loaded_libs, _current_mode
 
     _thresholds_stack = {"qvc_mid": 0.5, "atc_high": 0.5}
     _thresholds_cb    = {"qvc_mid": 0.5, "atc_high": 0.5}
@@ -722,10 +729,12 @@ def _xgb_predict_proba(feats_dict: Dict[str, Any]) -> Optional[float]:
         import numpy as np
         X_np = np.asarray([_rf_xgb_feature_vector_from(feats_dict)], dtype=float)
 
+        # Caso 1: wrapper sklearn (XGBClassifier)
         if hasattr(_xgb_model, "predict_proba"):
             proba = _xgb_model.predict_proba(X_np)[0]
             return float(proba[1]) if len(proba) >= 2 else None
 
+        # Caso 2: Booster puro
         import xgboost as xgb
         dmat = xgb.DMatrix(X_np)
         p = _xgb_model.predict(dmat)
@@ -833,41 +842,52 @@ def send_tiktok_event(
     value: float,
     content_ids: List[str],
     contents_payload: List[Dict[str, Any]],
+    content_name: Optional[str],
+    external_id: Optional[str],
 ) -> str:
     """
-    Envia evento para TikTok Events API (v1.3).
+    Envia um evento para o TikTok Events API (v1.3).
     Requer: TIKTOK_PIXEL_ID e TIKTOK_ACCESS_TOKEN.
+    Inclui user.external_id para elevar EMQ (sem e-mail/telefone).
     """
     if not (TIKTOK_PIXEL_ID and TIKTOK_ACCESS_TOKEN):
         return "skipped:no_tiktok_creds"
 
-    # TikTok exige value numérico e content_id. Vamos garantir isso:
-    try:
-        value = float(value)
-    except Exception:
-        value = 0.0
-    content_id = content_ids[0] if content_ids else None
+    user_block = {
+        "ip": ip,
+        "user_agent": user_agent
+    }
+    if external_id:
+        user_block["external_id"] = external_id
+
+    context_block = {
+        "page": {"url": page_url},
+        "user": user_block
+    }
+    if ttclid:
+        context_block["ad"] = {"callback": ttclid}
 
     payload = {
         "pixel_code": TIKTOK_PIXEL_ID,
-        "event": event_name,                 # "ViewContent", "AddToCart" etc
-        "event_id": event_id,                # dedup
-        "timestamp": ts,                     # seconds
-        "context": {
-            "ad": {"callback": ttclid} if ttclid else {},
-            "page": {"url": page_url},
-            "user": {"ip": ip, "user_agent": user_agent}
-        },
+        "event": event_name,                # "ViewContent", "AddToCart"
+        "event_id": event_id,               # dedup
+        "timestamp": ts,                    # segundos
+        "context": context_block,
         "properties": {
-            "currency": currency,            # "BRL"
-            "value": value,                  # number
+            "currency": currency,           # "BRL"
+            "value": float(value),
             "content_type": "product",
-            "content_id": content_id,
-            "contents": contents_payload     # [{"id": "...", "quantity": 1}]
+            "content_id": content_ids[0] if content_ids else None,
+            "content_name": content_name or (content_ids[0] if content_ids else None),
+            "contents": contents_payload,   # [{"id": "...", "quantity": 1}]
+            "url": page_url
         }
     }
 
-    headers = {"Content-Type": "application/json", "Access-Token": TIKTOK_ACCESS_TOKEN}
+    headers = {
+        "Content-Type": "application/json",
+        "Access-Token": TIKTOK_ACCESS_TOKEN,
+    }
 
     try:
         resp = session.post(TIKTOK_API_TRACK_URL, headers=headers, json=payload, timeout=8)
@@ -953,7 +973,7 @@ def robots():
 def root():
     return PlainTextResponse("OK", status_code=200)
 
-# (opcional) /privacy – se quiser, coloque o arquivo privacy.html no mesmo diretório
+# (opcional) /privacy
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy():
     try:
@@ -1020,21 +1040,18 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     if not outer_uc:
         return JSONResponse({"ok": False, "error": "utm_missing_uc"}, status_code=400)
 
-    # Normaliza e separa (corta URLs coladas, aceita '-A\\d+')
     utm_original, utm_original_01 = _normalize_utm_content(outer_uc)
 
     # Semente p/ numeração: prioriza UTMContent01; se vazio, usa UTMContent
     seed_for_numbering = (utm_original_01 or utm_original)
-
-    # UTMNumered = seed (permitindo hífen) + 'N' + contador
     seed_clean_for_numbered = re.sub(r'[^A-Za-z0-9\-]', '', seed_for_numbering) or "n"
     utm_numbered = f"{seed_clean_for_numbered}N{incr_counter()}"
 
-    # Substitui APENAS o utm_content na URL (não adiciona nenhum outro parâmetro)
+    # Substitui APENAS o utm_content na URL
     origin_url = _set_utm_content_preserving_order(resolved_url, utm_numbered)
 
-    # ===== content_ids / contents =====
-    content_ids, contents_payload = _build_content_identifiers(origin_url)
+    # ===== content_ids / contents / content_name =====
+    content_ids, contents_payload, content_name = _build_content_identifiers(origin_url)
 
     # ===== Short oficial (sempre) — subId3 = UTMNumered (sanitizado) =====
     sub_id_api = sanitize_subid_for_shopee(utm_numbered) or "na"
@@ -1042,21 +1059,20 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 
     # ===== Cookies / IDs persistentes =====
     fbp_cookie = get_cookie_value(cookie_header, "_fbp") or _gen_fbp(ts)
-    fbc_cookie = get_cookie_value(cookie_header, "_fbc") or _gen_fbc_from_fbp(fbp_cookie, ts)
-    if fbclid:
-        fbc_cookie = build_fbc_from_fbclid(fbclid, creation_ts=ts) or fbc_cookie
+    # fbc: SOMENTE se houve fbclid
+    fbc_cookie_send = build_fbc_from_fbclid(fbclid, creation_ts=ts) if fbclid else None
     eid_cookie = get_cookie_value(cookie_header, "_eid") or _sha256_lower(fbp_cookie)
 
     r.setex(f"{USERDATA_KEY_PREFIX}{utm_numbered}", USERDATA_TTL_SECONDS, json.dumps({
         "ip": ip_addr, "ua": user_agent, "referrer": referrer,
         "event_source_url": origin_url, "short_link": dest,
         "vc_time": ts,
-        "utm_original": utm_original,           # UTMContent (base)
-        "utm_original_01": utm_original_01,     # UTMContent01 (com -A.. ou vazio)
+        "utm_original": utm_original,
+        "utm_original_01": utm_original_01,
         "subid_base": utm_original,
         "subid_full": (utm_original_01 or utm_original),
-        "utm_numbered": utm_numbered,           # UTMNumered (aplicado em utm_content e subId3)
-        "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_cookie, "eid": eid_cookie, "mode": in_mode
+        "utm_numbered": utm_numbered,
+        "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_cookie_send or "", "eid": eid_cookie, "mode": in_mode
     }, ensure_ascii=False))
 
     # ===== external_id / user_data_meta (Meta) =====
@@ -1066,7 +1082,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         "client_user_agent": user_agent,
         "external_id": external_id,
         **({"fbp": fbp_cookie} if fbp_cookie else {}),
-        **({"fbc": fbc_cookie} if fbc_cookie else {})
+        **({"fbc": fbc_cookie_send} if fbc_cookie_send else {})
     }
 
     # ===== Geo + Features =====
@@ -1154,12 +1170,14 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             value=0.0,
             content_ids=content_ids,
             contents_payload=contents_payload,
+            content_name=content_name,
+            external_id=external_id,
         )
     except Exception as e:
         print("[tiktok] VC exceção:", e)
         tiktok_view = "error"
 
-    # ===== Meta: AddToCart (mesma condição de "is_atc_flag == 1") =====
+    # ===== Meta: AddToCart =====
     if META_PIXEL_ID and META_ACCESS_TOKEN and is_atc_flag == 1:
         atc_payload = {
             "data": [{
@@ -1188,7 +1206,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             print("[meta] ATC exceção:", e)
             meta_sent = "error"
 
-    # ===== TikTok: AddToCart quando is_atc_flag == 1 (mesmo requisito do Meta) =====
+    # ===== TikTok: AddToCart (mesmo requisito do Meta) =====
     tiktok_sent = ""
     if is_atc_flag == 1:
         try:
@@ -1204,9 +1222,11 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                 value=0.0,
                 content_ids=content_ids,
                 contents_payload=contents_payload,
+                content_name=content_name,
+                external_id=external_id,
             )
         except Exception as e:
-            print("[tiktok] ATC exceção:", e)
+            print("[tiktok] AddToCart exceção:", e)
             tiktok_sent = "error"
 
     # ===== Log CSV =====
@@ -1228,7 +1248,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     csv_row = [
         ts, iso_time, ip_addr, user_agent, referrer,
         incoming_url, resolved_url, origin_url, (cat or ""),
-        utm_original, utm_original_01, utm_original, (utm_original_01 or utm_original), utm_numbered, fbclid or "", fbp_cookie or "", fbc_cookie or "",
+        utm_original, utm_original_01, utm_original, (utm_original_01 or utm_original), utm_numbered, fbclid or "", fbp_cookie or "", fbc_cookie_send or "",
         device_name, os_family, os_version,
         geo.get("geo_status",""), geo.get("geo_country",""), geo.get("geo_region",""), geo.get("geo_state",""),
         geo.get("geo_city",""), geo.get("geo_zip",""), geo.get("geo_lat",""), geo.get("geo_lon",""),
@@ -1249,9 +1269,11 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 
     set_cookie_headers = [
         f"_fbp={fbp_cookie}; Path=/; Max-Age=63072000; SameSite=Lax",
-        f"_fbc={fbc_cookie}; Path=/; Max-Age=63072000; SameSite=Lax",
         f"_eid={eid_cookie}; Path=/; Max-Age=63072000; SameSite=Lax",
     ]
+    # _fbc como cookie é opcional; não influencia CAPI. Se quiser manter:
+    if fbc_cookie_send:
+        set_cookie_headers.append(f"_fbc={fbc_cookie_send}; Path=/; Max-Age=63072000; SameSite=Lax")
 
     if _is_pinterest(user_agent):
         html = f"""<!doctype html>
@@ -1457,17 +1479,6 @@ def admin_reload_model(x_admin_token: str = Header(None)):
         "thr_stack": _thresholds_stack, "thr_cb": _thresholds_cb, "thr_rf": _thresholds_rf, "thr_xgb": _thresholds_xgb,
         "te_loaded": bool(_TE_STATS)
     }
-
-@app.post("/admin/set_mode")
-def admin_set_mode(mode: str = Query(...), x_admin_token: str = Header(None)):
-    global _current_mode
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    m = (mode or "").strip().lower()
-    if m not in ("auto","cb","rf","xgb","stack"):
-        raise HTTPException(status_code=400, detail="invalid_mode")
-    _current_mode = m
-    return {"ok": True, "serving_mode_current": _current_mode}
 
 @app.get("/admin/flush")
 def admin_flush(token: str):
