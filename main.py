@@ -971,9 +971,34 @@ def health():
 def robots():
     return PlainTextResponse("User-agent: *\nDisallow:\n", status_code=200)
 
-@app.get("/")
-def root():
-    return PlainTextResponse("OK", status_code=200)
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def home():
+    """
+    Página inicial institucional p/ aprovação (Pinterest/afins).
+    Serve o arquivo index.html da raiz do projeto.
+    """
+    try:
+        index_path = os.path.join(BASE_DIR, "index.html")
+        with open(index_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        # Cache leve só para reduzir latência, sem atrapalhar updates
+        headers = {"Cache-Control": "public, max-age=3600"}
+        return HTMLResponse(content=html, status_code=200, headers=headers)
+    except FileNotFoundError:
+        # Fallback seguro caso o arquivo não esteja no container
+        return HTMLResponse(
+            content="""
+            <!doctype html><meta charset="utf-8">
+            <title>Rasant</title>
+            <body style="font-family:system-ui;padding:24px;background:#0b0d12;color:#f8fafc">
+              <h1>Rasant</h1>
+              <p>Página inicial temporária. Coloque <code>index.html</code> na raiz do projeto.</p>
+              <p><a href="/privacy" style="color:#2F6FD7">Política de Privacidade</a></p>
+            </body>
+            """,
+            status_code=200
+        )
+
 
 # (opcional) /privacy
 @app.get("/privacy", response_class=HTMLResponse)
@@ -1516,3 +1541,4 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
+
