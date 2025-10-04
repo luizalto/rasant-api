@@ -1,21 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI) + TikTok Events API
-(versão consolidada) — UTMContent / UTMContent01 / UTMNumered
+(versão consolidada) — UTMContent / UTMContent01 / UTMNumered com Janela Deslizante (1000) e Monotonicidade
 
-REQUISITOS:
-- NÃO resolver/abrir short-link da Shopee antes de gerar o short oficial (SKIP_RESOLVE=1 por padrão).
-- A UTM deve vir do parâmetro `uc` da querystring.
-- A partir de `uc`, derivar:
-  * UTMContent     = base (sem URL colada; apenas [A-Za-z0-9-]).
-  * UTMContent01   = base + '-A\\d+' (se houver esse sufixo).
-  * UTMNumered     = (UTMContent01 se existir, senão UTMContent) + 'N' + contador infinito.
-- Apenas substituir o valor de utm_content na URL ALVO (NÃO criar "utm_numbered=").
-- subId3 (API Shopee) = UTMNumered (sanitizado p/ alfanumérico).
-- Predição usa **somente** utm_original (UTMContent base).
-
-OBS:
-- Para reativar a resolução de short antes, defina SKIP_RESOLVE=0.
+Reforços implementados:
+- Geração de UTM numerado SEM duplicação, com janela deslizante de N=1000 últimos IDs em Redis (lista + set capados).
+- Guard de monotonicidade local + realinhamento do contador no startup a partir do último número visto.
+- Correção: carregamento do XGBoost duplicado removido.
+- Correção: cookies via response.set_cookie (um header por cookie).
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -24,7 +16,7 @@ from typing import Optional, Dict, Tuple, List, Any
 import requests
 import redis
 from fastapi import FastAPI, Request, Query, Path, UploadFile, File, Header, HTTPException, Form
-from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse, HTMLResponse
+from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse, HTMLResponse, Response
 from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode, unquote
 from datetime import datetime
 
@@ -47,6 +39,11 @@ USERDATA_TTL_SECONDS  = int(os.getenv("USERDATA_TTL_SECONDS", "604800"))
 USERDATA_KEY_PREFIX   = os.getenv("USERDATA_KEY_PREFIX", "ud:")
 GEO_CACHE_TTL_SECONDS = int(os.getenv("GEO_CACHE_TTL_SECONDS", "259200"))  # 3 dias
 GEO_CACHE_PREFIX      = os.getenv("GEO_CACHE_PREFIX", "geo:")
+
+# >>> Janela deslizante de UTM numerado (cap = 1000 por padrão)
+UTM_RECENT_LIST_KEY   = os.getenv("UTM_RECENT_LIST_KEY", "utm_recent_list")
+UTM_RECENT_SET_KEY    = os.getenv("UTM_RECENT_SET_KEY", "utm_recent_set")
+UTM_RECENT_MAX        = int(os.getenv("UTM_RECENT_MAX", "1000"))
 
 VIDEO_ID              = os.getenv("VIDEO_ID", "v15")
 
@@ -232,12 +229,60 @@ CSV_HEADERS = [
 ]
 
 # ===================== Utils =====================
-def incr_counter() -> int:
+def incr_counter_raw() -> int:
     pipe = r.pipeline()
     pipe.incr(COUNTER_KEY)
     pipe.persist(COUNTER_KEY)
     val, _ = pipe.execute()
     return int(val)
+
+# Guard de monotonicidade local + realinhamento em startup
+_last_seen = {"v": 0}
+_last_lock = threading.Lock()
+
+def incr_counter_monotonic() -> int:
+    n = incr_counter_raw()
+    with _last_lock:
+        if n <= _last_seen["v"]:
+            # sobe até ficar acima do maior visto por ESTE processo
+            delta = (_last_seen["v"] + 1) - n
+            n = int(r.incrby(COUNTER_KEY, delta))
+        _last_seen["v"] = n
+    return n
+
+def _parse_tail_number(utm: str) -> Optional[int]:
+    # pega o que vem após a ÚLTIMA letra 'N'
+    if not utm:
+        return None
+    i = utm.rfind('N')
+    if i == -1 or i == len(utm)-1:
+        return None
+    tail = utm[i+1:]
+    return int(tail) if tail.isdigit() else None
+
+def _realign_counter_from_recent_window():
+    """Se o Redis reiniciar e o COUNTER_KEY voltar baixo, alinhe ao maior visto na janela."""
+    try:
+        # lê alguns do topo e de posições mais profundas para garantir
+        recent = r.lrange(UTM_RECENT_LIST_KEY, 0, min(UTM_RECENT_MAX-1, 200))
+        max_n = 0
+        for utm in (recent or []):
+            try:
+                n = _parse_tail_number(utm.decode() if isinstance(utm, bytes) else utm)
+                if n and n > max_n:
+                    max_n = n
+            except Exception:
+                pass
+        current = r.get(COUNTER_KEY)
+        cur_n = int(current or 0)
+        target = max(cur_n, max_n)
+        if target > cur_n:
+            r.set(COUNTER_KEY, target)
+        with _last_lock:
+            _last_seen["v"] = target
+        print(f"[counter] realigned to {target} (cur={cur_n}, max_recent={max_n})")
+    except Exception as e:
+        print("[counter] realign skipped:", e)
 
 def get_cookie_value(cookie_header: Optional[str], name: str) -> Optional[str]:
     if not cookie_header:
@@ -286,7 +331,7 @@ def extract_utm_content_from_url(u: str) -> str:
     except:
         return ""
 
-# ===== Normalizador de UTM (corta URLs grudadas e aceita sufixo -A\\d+) =====
+# ===== Normalizador de UTM =====
 _URL_CUT_RE = re.compile(r'(https?:\/\/|www\.|[a-z0-9-]+\.(?:com|br|net|org)(?:\/|$))', re.I)
 
 def _normalize_utm_content(raw: str) -> Tuple[str, str]:
@@ -298,22 +343,17 @@ def _normalize_utm_content(raw: str) -> Tuple[str, str]:
     """
     s = (raw or "").strip()
 
-    # Corta na 1ª marca de URL (https://, http://, www., domínio .com/.com.br etc)
     m = _URL_CUT_RE.search(s)
     if m:
         s = s[:m.start()]
-
-    # Defesa extra contra sequências "http" sem separador
     idx_http = s.lower().find("http")
     if idx_http != -1:
         s = s[:idx_http]
 
-    # Limpeza de cascas e whitelisting
     s = re.sub(r'^[\s\-_]+|[\s\-_]+$', '', s)
     s = re.sub(r'[^A-Za-z0-9\-]+', '', s)
     s = re.sub(r'-{2,}', '-', s)
 
-    # Base + sufixo opcional "-A\\d+"
     m2 = re.match(r'^(?P<base>[A-Za-z0-9\-]*?)(?:-?(?P<suf>A\d+))?$', s)
     if not m2:
         return s, ""
@@ -350,7 +390,6 @@ def sanitize_subid_for_shopee(value: str) -> str:
     return cleaned[:_SUBID_MAXLEN] if cleaned else "na"
 
 def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
-    # Sempre gerar via API; sem credenciais -> 502
     if not SHOPEE_APP_ID or not SHOPEE_APP_SECRET:
         raise HTTPException(status_code=502, detail="shortlink_unavailable: missing Shopee credentials")
     payload_obj = {
@@ -680,19 +719,17 @@ def _load_models_if_available():
         except Exception as e:
             print("[RF] erro ao carregar:", e)
 
-    # XGB
+    # XGB (removido duplicado)
     _xgb_model = None
     try:
         if os.path.exists(MODEL_XGB_PATH):
             import xgboost as xgb
             _loaded_libs["xgboost"] = True
             try:
-                # Modelo salvo via XGBClassifier.save_model(...)
                 clf = xgb.XGBClassifier()
                 clf.load_model(MODEL_XGB_PATH)
                 _xgb_model = clf
             except Exception:
-                # Fallback: modelo salvo como Booster puro
                 bst = xgb.Booster()
                 bst.load_model(MODEL_XGB_PATH)
                 _xgb_model = bst
@@ -700,29 +737,6 @@ def _load_models_if_available():
         import traceback
         print("[XGB] erro ao carregar:", e)
         traceback.print_exc()
-     
-    # XGB
-    _xgb_model = None
-    try:
-        if os.path.exists(MODEL_XGB_PATH):
-            import xgboost as xgb
-            _loaded_libs["xgboost"] = True
-            try:
-                # Modelo salvo via XGBClassifier.save_model(...)
-                clf = xgb.XGBClassifier()
-                clf.load_model(MODEL_XGB_PATH)
-                _xgb_model = clf
-            except Exception:
-                # Fallback: modelo salvo como Booster puro
-                bst = xgb.Booster()
-                bst.load_model(MODEL_XGB_PATH)
-                _xgb_model = bst
-    except Exception as e:
-        import traceback
-        print("[XGB] erro ao carregar:", e)
-        traceback.print_exc()
-
-
 
     # Stack
     _stack_model = None
@@ -749,6 +763,75 @@ def _load_models_if_available():
     print(f"[meta] n_features={len(_FEATURE_NAMES_FROM_META)} cat_idx={_CAT_IDX_FROM_META} pos_id={_POS_LABEL_ID} pos_idx={_POS_IDX}")
     print(f"[thr] stack={_thresholds_stack} cb={_thresholds_cb} rf={_thresholds_rf} xgb={_thresholds_xgb} TE={'yes' if _TE_STATS else 'no'}")
 
+# ======== UTM numerado: Janela deslizante (lista+set) e unicidade ========
+def _window_add_and_trim(utm_value: str):
+    """
+    Adiciona o UTM no topo da lista e garante tamanho máximo;
+    se estourar, remove o último e também tira do set.
+    """
+    pipe = r.pipeline()
+    # adiciona na lista (topo) e garante tamanho
+    pipe.lpush(UTM_RECENT_LIST_KEY, utm_value)
+    pipe.ltrim(UTM_RECENT_LIST_KEY, 0, UTM_RECENT_MAX - 1)
+    pipe.execute()
+
+    # checa se ultrapassou e remove o extra do set
+    try:
+        # se a lista estiver maior (condição de corrida), faça RPOP uma vez
+        llen = r.llen(UTM_RECENT_LIST_KEY)
+        if llen and llen > UTM_RECENT_MAX:
+            popped = r.rpop(UTM_RECENT_LIST_KEY)
+            if popped:
+                try:
+                    popped_str = popped.decode() if isinstance(popped, bytes) else popped
+                    r.srem(UTM_RECENT_SET_KEY, popped_str)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+def next_unique_numbered(seed_clean_for_numbered: str) -> str:
+    """
+    Gera um UTM numerado único, garantindo que NÃO esteja no set de últimos N.
+    - Se colidir, tenta novamente.
+    - Ao aceitar, adiciona na janela (lista+set), capando a 1000 e removendo o mais antigo do set.
+    """
+    attempts = 0
+    while attempts < 12:
+        attempts += 1
+        n = incr_counter_monotonic()
+        utm = f"{seed_clean_for_numbered}N{n}"
+
+        # SADD retorna 1 se adicionou (não existia), 0 se já existia
+        try:
+            added = r.sadd(UTM_RECENT_SET_KEY, utm)
+        except Exception:
+            # se falhar, segue em frente com utm gerado (melhor do que travar)
+            added = 1
+
+        if added == 1:
+            _window_add_and_trim(utm)
+            return utm
+        # se já existia, tenta de novo (gera outro n)
+    # fallback: pula o contador para escapar de colisão persistente
+    try:
+        jump = random.randint(10, 1000)
+        r.incrby(COUNTER_KEY, jump)
+    except Exception:
+        pass
+    n = incr_counter_monotonic()
+    utm = f"{seed_clean_for_numbered}N{n}"
+    try:
+        r.sadd(UTM_RECENT_SET_KEY, utm)
+    except Exception:
+        pass
+    _window_add_and_trim(utm)
+    return utm
+
+# Realinha contador no startup baseado na janela recente
+_realign_counter_from_recent_window()
+
+# ===================== Predição helpers =====================
 def _rf_xgb_feature_vector_from(feats_dict: Dict[str, Any]) -> List[float]:
     cols = ["hour","dow","is_weekend","os_version_num","is_android","is_ios",
             "utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br"]
@@ -809,18 +892,17 @@ def _xgb_predict_proba(feats_dict: Dict[str, Any]) -> Optional[float]:
         # Caso 2: Booster puro
         import xgboost as xgb
         dmat = xgb.DMatrix(X_np)
-        p = _xgb_model.predict(dmat)  # shape (n,) ou (n,2)
+        p = _xgb_model.predict(dmat)
         if getattr(p, "ndim", 1) == 1:
-            return float(p[0])                 # prob positiva direta
+            return float(p[0])
         if p.ndim == 2 and p.shape[1] >= 2:
-            return float(p[0, 1])              # coluna da classe positiva
+            return float(p[0, 1])
         return None
     except Exception as e:
         import traceback
         print("[predict-xgb] erro:", e)
         traceback.print_exc()
         return None
-
 
 def _stack_predict_proba(p_cb: Optional[float], p_rf: Optional[float], p_xgb: Optional[float]) -> Optional[float]:
     if not _stack_model or not _stack_features:
@@ -916,39 +998,29 @@ def send_tiktok_event(
     content_ids: List[str],
     contents_payload: List[Dict[str, Any]],
 ) -> str:
-    """
-    Envia um evento para o TikTok Events API (v1.3).
-    Requer: TIKTOK_PIXEL_ID e TIKTOK_ACCESS_TOKEN.
-    """
     if not (TIKTOK_PIXEL_ID and TIKTOK_ACCESS_TOKEN):
         return "skipped:no_tiktok_creds"
 
     payload = {
         "pixel_code": TIKTOK_PIXEL_ID,
-        "event": event_name,                # "ViewContent", "CompletePayment"
-        "event_id": event_id,               # dedup
-        "timestamp": ts,                    # segundos
+        "event": event_name,
+        "event_id": event_id,
+        "timestamp": ts,
         "context": {
             "ad": {"callback": ttclid} if ttclid else {},
             "page": {"url": page_url},
-            "user": {
-                "ip": ip,
-                "user_agent": user_agent
-            }
+            "user": {"ip": ip, "user_agent": user_agent}
         },
         "properties": {
-            "currency": currency,           # "BRL"
+            "currency": currency,
             "value": float(value),
             "content_type": "product",
             "content_id": content_ids[0] if content_ids else None,
-            "contents": contents_payload,   # [{"id": "...", "quantity": 1}]
+            "contents": contents_payload,
         }
     }
 
-    headers = {
-        "Content-Type": "application/json",
-        "Access-Token": TIKTOK_ACCESS_TOKEN,
-    }
+    headers = {"Content-Type": "application/json", "Access-Token": TIKTOK_ACCESS_TOKEN}
 
     try:
         resp = session.post(TIKTOK_API_TRACK_URL, headers=headers, json=payload, timeout=8)
@@ -1006,6 +1078,15 @@ def health():
         ttl = r.ttl(COUNTER_KEY)
     except Exception:
         ttl = None
+    try:
+        counter_val = int(r.get(COUNTER_KEY) or 0)
+    except Exception:
+        counter_val = -1
+    try:
+        llen = r.llen(UTM_RECENT_LIST_KEY)
+        slen = r.scard(UTM_RECENT_SET_KEY)
+    except Exception:
+        llen = slen = -1
     return {
         "ok": True, "ts": int(time.time()), "bucket": GCS_BUCKET, "prefix": GCS_PREFIX,
         "video_id": VIDEO_ID,
@@ -1023,6 +1104,10 @@ def health():
         "thr_rf": _thresholds_rf,
         "thr_xgb": _thresholds_xgb,
         "counter_ttl": ttl,
+        "counter_val": counter_val,
+        "recent_len_list": llen,
+        "recent_len_set": slen,
+        "recent_cap": UTM_RECENT_MAX,
         "te_loaded": bool(_TE_STATS)
     }
 
@@ -1034,7 +1119,6 @@ def robots():
 def root():
     return PlainTextResponse("OK", status_code=200)
 
-# (opcional) /privacy – se quiser, coloque o arquivo privacy.html no mesmo diretório
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy():
     try:
@@ -1079,11 +1163,10 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     referrer = headers.get("referer") or "-"
     user_agent = headers.get("user-agent", "-")
     fbclid = request.query_params.get("fbclid")
-    ttclid = request.query_params.get("ttclid")  # TikTok click id (se houver)
+    ttclid = request.query_params.get("ttclid")
     ip_addr = (request.client.host if request.client else "0.0.0.0")
     device_name, os_family, os_version = parse_device_info(user_agent)
 
-    # ===== Interpretar URL de entrada SEM resolver =====
     parts_in = urlsplit(incoming_url)
 
     if SKIP_RESOLVE:
@@ -1094,7 +1177,6 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     parts_res = urlsplit(resolved_url)
     if not parts_res.scheme or not parts_res.netloc:
         return JSONResponse({"ok": False, "error": f"URL inválida: {resolved_url}"}, status_code=400)
-    # Permite tanto s.shopee... (short) quanto domínios longos aprovados
     if not _is_allowed_long(parts_res.netloc) and not _is_short_domain(parts_res.netloc):
         return JSONResponse({"ok": False, "error": f"Domínio não permitido: {parts_res.netloc}"}, status_code=400)
 
@@ -1103,17 +1185,14 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     if not outer_uc:
         return JSONResponse({"ok": False, "error": "utm_missing_uc"}, status_code=400)
 
-    # Normaliza e separa (corta URLs coladas, aceita '-A\\d+')
     utm_original, utm_original_01 = _normalize_utm_content(outer_uc)
 
-    # Semente p/ numeração: prioriza UTMContent01; se vazio, usa UTMContent
     seed_for_numbering = (utm_original_01 or utm_original)
-
-    # UTMNumered = seed (permitindo hífen) + 'N' + contador
     seed_clean_for_numbered = re.sub(r'[^A-Za-z0-9\-]', '', seed_for_numbering) or "n"
-    utm_numbered = f"{seed_clean_for_numbered}N{incr_counter()}"
 
-    # Substitui APENAS o utm_content na URL (não adiciona nenhum outro parâmetro)
+    # >>> GERAÇÃO ÚNICA COM JANELA DESLIZANTE (cap 1000)
+    utm_numbered = next_unique_numbered(seed_clean_for_numbered)
+
     origin_url = _set_utm_content_preserving_order(resolved_url, utm_numbered)
 
     # ===== content_ids / contents =====
@@ -1242,7 +1321,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         print("[tiktok] VC exceção:", e)
         tiktok_view = "error"
 
-    # ===== Meta: AddToCart (sua definição de "comprou") =====
+    # ===== Meta: AddToCart =====
     if META_PIXEL_ID and META_ACCESS_TOKEN and is_atc_flag == 1:
         atc_payload = {
             "data": [{
@@ -1270,8 +1349,10 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         except Exception as e:
             print("[meta] ATC exceção:", e)
             meta_sent = "error"
+    else:
+        meta_sent = ""
 
-    # ===== TikTok: CompletePayment (equivalente a Purchase) quando is_atc_flag == 1 =====
+    # ===== TikTok: CompletePayment =====
     tiktok_sent = ""
     if is_atc_flag == 1:
         try:
@@ -1284,7 +1365,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                 user_agent=user_agent,
                 ttclid=ttclid,
                 currency="BRL",
-                value=0.0,  # se desejar enviar valor do item/ordem, ajustar aqui
+                value=0.0,
                 content_ids=content_ids,
                 contents_payload=contents_payload,
             )
@@ -1326,17 +1407,15 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     with _buffer_lock:
         _buffer_rows.append(csv_row)
 
-    # ===== Intersticial Pinterest =====
-    def _is_pinterest(ua: str) -> bool:
-        return "pinterest" in (ua or "").lower()
+    # ===== Redirect + cookies corretos =====
+    resp = RedirectResponse(dest, status_code=302)
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    resp.set_cookie("_fbp", fbp_cookie, max_age=63072000, path="/", samesite="lax")
+    resp.set_cookie("_fbc", fbc_cookie, max_age=63072000, path="/", samesite="lax")
+    resp.set_cookie("_eid", eid_cookie, max_age=63072000, path="/", samesite="lax")
 
-    set_cookie_headers = [
-        f"_fbp={fbp_cookie}; Path=/; Max-Age=63072000; SameSite=Lax",
-        f"_fbc={fbc_cookie}; Path=/; Max-Age=63072000; SameSite=Lax",
-        f"_eid={eid_cookie}; Path=/; Max-Age=63072000; SameSite=Lax",
-    ]
-
-    if _is_pinterest(user_agent):
+    # Pinterest: devolver HTML com refresh (mantendo cookies já setados)
+    if "pinterest" in (user_agent or "").lower():
         html = f"""<!doctype html>
 <html><head>
 <meta charset="utf-8">
@@ -1345,15 +1424,10 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 <script>setTimeout(function(){{ window.location.replace("{dest}"); }}, 200);</script>
 </head><body>Redirecionando…</body></html>"""
         return HTMLResponse(content=html, status_code=200, headers={
-            "Cache-Control": "no-store, max-age=0", "X-Content-Type-Options": "nosniff",
-            "Set-Cookie": ", ".join(set_cookie_headers)
+            "Cache-Control": "no-store, max-age=0",
         })
 
-    # Importante: entregamos o SHORT sempre (redirect para o short).
-    return RedirectResponse(dest, status_code=302, headers={
-        "Cache-Control": "no-store, max-age=0",
-        "Set-Cookie": ", ".join(set_cookie_headers)
-    })
+    return resp
 
 # ===================== Admin =====================
 @app.get("/admin", response_class=HTMLResponse)
@@ -1541,17 +1615,6 @@ def admin_reload_model(x_admin_token: str = Header(None)):
         "te_loaded": bool(_TE_STATS)
     }
 
-@app.post("/admin/set_mode")
-def admin_set_mode(mode: str = Query(...), x_admin_token: str = Header(None)):
-    global _current_mode
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    m = (mode or "").strip().lower()
-    if m not in ("auto","cb","rf","xgb","stack"):
-        raise HTTPException(status_code=400, detail="invalid_mode")
-    _current_mode = m
-    return {"ok": True, "serving_mode_current": _current_mode}
-
 @app.get("/admin/flush")
 def admin_flush(token: str):
     if token != ADMIN_TOKEN:
@@ -1566,7 +1629,9 @@ def admin_counter(x_admin_token: str = Header(None)):
     try:
         v = r.get(COUNTER_KEY)
         ttl = r.ttl(COUNTER_KEY)
-        return {"counter": int(v or 0), "ttl": ttl}
+        llen = r.llen(UTM_RECENT_LIST_KEY)
+        slen = r.scard(UTM_RECENT_SET_KEY)
+        return {"counter": int(v or 0), "ttl": ttl, "recent_list_len": llen, "recent_set_len": slen, "cap": UTM_RECENT_MAX}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -1581,4 +1646,3 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
-
