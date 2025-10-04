@@ -2,9 +2,9 @@
 """
 FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK)
 + Meta Ads (CAPI) + TikTok Events API (ViewContent & AddToCart)
-(versão com dedupe de log por utm_numbered)
+(versão final)
 
-Principais pontos:
+Regras/observações importantes:
 - NÃO resolver/abrir short-link da Shopee antes de gerar o short oficial (SKIP_RESOLVE=1 por padrão).
 - A UTM vem do parâmetro `uc`. A partir de `uc` derivamos:
   * UTMContent (base, [A-Za-z0-9-])
@@ -14,8 +14,7 @@ Principais pontos:
 - subId3 (API Shopee) = UTMNumered (sanitizado).
 - Predição usa somente utm_original (UTMContent base).
 - META CAPI: só envia `fbc` quando houver `fbclid`. Caso contrário, omite.
-- TikTok: envia ViewContent sempre; AddToCart quando `is_atc_flag==1`.
-- ✅ DEDUPE: cada `utm_numbered` só é logado uma vez (Redis `SET NX` + TTL).
+- TikTok: envia ViewContent sempre; AddToCart quando `is_atc_flag==1` (mesmo requisito do Meta).
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -43,11 +42,10 @@ ADMIN_TOKEN           = os.getenv("ADMIN_TOKEN", "12345678")
 # Redis
 REDIS_URL             = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 COUNTER_KEY           = os.getenv("UTM_COUNTER_KEY", "utm_counter")
-USERDATA_TTL_SECONDS  = int(os.getenv("USERDATA_TTL_SECONDS", "604800"))   # 7 dias
+USERDATA_TTL_SECONDS  = int(os.getenv("USERDATA_TTL_SECONDS", "604800"))
 USERDATA_KEY_PREFIX   = os.getenv("USERDATA_KEY_PREFIX", "ud:")
 GEO_CACHE_TTL_SECONDS = int(os.getenv("GEO_CACHE_TTL_SECONDS", "259200"))  # 3 dias
 GEO_CACHE_PREFIX      = os.getenv("GEO_CACHE_PREFIX", "geo:")
-LOG_DEDUP_PREFIX      = os.getenv("LOG_DEDUP_PREFIX", "logdedup:")         # ✅ chave de dedupe
 
 VIDEO_ID              = os.getenv("VIDEO_ID", "v15")
 
@@ -266,7 +264,7 @@ def parse_device_info(ua: str):
     device_name = "iPhone" if "iphone" in ua_l else ("Android" if "android" in ua_l else "Desktop")
     return device_name, os_family, os_version
 
-# ===== Normalizador de UTM =====
+# ===== Normalizador de UTM (corta URLs grudadas e aceita sufixo -A\\d+) =====
 _URL_CUT_RE = re.compile(r'(https?:\/\/|www\.|[a-z0-9-]+\.(?:com|br|net|org)(?:\/|$))', re.I)
 
 def _normalize_utm_content(raw: str) -> Tuple[str, str]:
@@ -847,38 +845,55 @@ def send_tiktok_event(
     content_name: Optional[str],
     external_id: Optional[str],
 ) -> str:
+    """
+    Envia um evento para o TikTok Events API (v1.3).
+    Requer: TIKTOK_PIXEL_ID e TIKTOK_ACCESS_TOKEN.
+    Inclui user.external_id para elevar EMQ (sem e-mail/telefone).
+    """
     if not (TIKTOK_PIXEL_ID and TIKTOK_ACCESS_TOKEN):
         return "skipped:no_tiktok_creds"
 
-    user_block = {"ip": ip, "user_agent": user_agent}
+    user_block = {
+        "ip": ip,
+        "user_agent": user_agent
+    }
     if external_id:
         user_block["external_id"] = external_id
 
-    context_block = {"page": {"url": page_url}, "user": user_block}
+    context_block = {
+        "page": {"url": page_url},
+        "user": user_block
+    }
     if ttclid:
         context_block["ad"] = {"callback": ttclid}
 
     payload = {
         "pixel_code": TIKTOK_PIXEL_ID,
-        "event": event_name,
-        "event_id": event_id,     # dedup client-side
-        "timestamp": ts,
+        "event": event_name,                # "ViewContent", "AddToCart"
+        "event_id": event_id,               # dedup
+        "timestamp": ts,                    # segundos
         "context": context_block,
         "properties": {
-            "currency": "BRL",
+            "currency": currency,           # "BRL"
             "value": float(value),
             "content_type": "product",
             "content_id": content_ids[0] if content_ids else None,
             "content_name": content_name or (content_ids[0] if content_ids else None),
-            "contents": contents_payload,
+            "contents": contents_payload,   # [{"id": "...", "quantity": 1}]
             "url": page_url
         }
     }
 
-    headers = {"Content-Type": "application/json", "Access-Token": TIKTOK_ACCESS_TOKEN}
+    headers = {
+        "Content-Type": "application/json",
+        "Access-Token": TIKTOK_ACCESS_TOKEN,
+    }
+
     try:
         resp = session.post(TIKTOK_API_TRACK_URL, headers=headers, json=payload, timeout=8)
-        return "ok" if resp.status_code < 400 else f"error:{resp.status_code}"
+        if resp.status_code < 400:
+            return "ok"
+        return f"error:{resp.status_code}"
     except Exception as e:
         print("[tiktok] exceção:", e)
         return "error"
@@ -922,23 +937,6 @@ def _background_flusher():
 
 threading.Thread(target=_background_flusher, daemon=True).start()
 
-# ===================== DEDUPE helper (✅ novo) =====================
-def _try_mark_logged_once(utm_numbered: str, ttl: int = USERDATA_TTL_SECONDS) -> bool:
-    """
-    Marca no Redis que este utm_numbered já foi logado.
-    Usa SET NX + EX para garantir idempotência entre múltiplas requisições/instâncias.
-    Retorna True se marcou agora (pode logar), False se já estava marcado (não logar de novo).
-    """
-    try:
-        key = f"{LOG_DEDUP_PREFIX}{utm_numbered}"
-        # Redis-py: set(name, value, nx=True, ex=ttl) -> True se setou, None se não setou
-        ok = r.set(key, "1", nx=True, ex=ttl)
-        return bool(ok)
-    except Exception as e:
-        # Em caso de falha no Redis, para segurança, ainda logamos (retorna True)
-        print("[DEDUP] falha Redis:", e)
-        return True
-
 # ===================== Rotas =====================
 @app.get("/health")
 def health():
@@ -971,34 +969,9 @@ def health():
 def robots():
     return PlainTextResponse("User-agent: *\nDisallow:\n", status_code=200)
 
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-def home():
-    """
-    Página inicial institucional p/ aprovação (Pinterest/afins).
-    Serve o arquivo index.html da raiz do projeto.
-    """
-    try:
-        index_path = os.path.join(BASE_DIR, "index.html")
-        with open(index_path, "r", encoding="utf-8") as f:
-            html = f.read()
-        # Cache leve só para reduzir latência, sem atrapalhar updates
-        headers = {"Cache-Control": "public, max-age=3600"}
-        return HTMLResponse(content=html, status_code=200, headers=headers)
-    except FileNotFoundError:
-        # Fallback seguro caso o arquivo não esteja no container
-        return HTMLResponse(
-            content="""
-            <!doctype html><meta charset="utf-8">
-            <title>Rasant</title>
-            <body style="font-family:system-ui;padding:24px;background:#0b0d12;color:#f8fafc">
-              <h1>Rasant</h1>
-              <p>Página inicial temporária. Coloque <code>index.html</code> na raiz do projeto.</p>
-              <p><a href="/privacy" style="color:#2F6FD7">Política de Privacidade</a></p>
-            </body>
-            """,
-            status_code=200
-        )
-
+@app.get("/")
+def root():
+    return PlainTextResponse("OK", status_code=200)
 
 # (opcional) /privacy
 @app.get("/privacy", response_class=HTMLResponse)
@@ -1090,7 +1063,6 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     fbc_cookie_send = build_fbc_from_fbclid(fbclid, creation_ts=ts) if fbclid else None
     eid_cookie = get_cookie_value(cookie_header, "_eid") or _sha256_lower(fbp_cookie)
 
-    # Guarda dados do clique (independente do dedupe do log)
     r.setex(f"{USERDATA_KEY_PREFIX}{utm_numbered}", USERDATA_TTL_SECONDS, json.dumps({
         "ip": ip_addr, "ua": user_agent, "referrer": referrer,
         "event_source_url": origin_url, "short_link": dest,
@@ -1199,7 +1171,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             content_ids=content_ids,
             contents_payload=contents_payload,
             content_name=content_name,
-            external_id=eid_cookie or _sha256_lower(f"{user_agent}|{ip_addr}"),
+            external_id=external_id,
         )
     except Exception as e:
         print("[tiktok] VC exceção:", e)
@@ -1234,7 +1206,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             print("[meta] ATC exceção:", e)
             meta_sent = "error"
 
-    # ===== TikTok: AddToCart =====
+    # ===== TikTok: AddToCart (mesmo requisito do Meta) =====
     tiktok_sent = ""
     if is_atc_flag == 1:
         try:
@@ -1251,50 +1223,45 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                 content_ids=content_ids,
                 contents_payload=contents_payload,
                 content_name=content_name,
-                external_id=eid_cookie or _sha256_lower(f"{user_agent}|{ip_addr}"),
+                external_id=external_id,
             )
         except Exception as e:
             print("[tiktok] AddToCart exceção:", e)
             tiktok_sent = "error"
 
-    # ===== ✅ Log CSV com DE-DUPE por utm_numbered =====
-    # Só registra no CSV se ainda NÃO registrou este utm_numbered
-    if _try_mark_logged_once(utm_numbered, ttl=USERDATA_TTL_SECONDS):
-        hour_log = _extract_hour_from_iso_for_log(iso_time)
-        dow_log = _extract_dow_from_iso_for_log(iso_time)
-        ref_domain_log = _get_first_domain_for_log(referrer)
-        os_version_num_log = _version_num_for_log(os_version)
-        is_android_log = 1 if "android" in (os_family or "").lower() else 0
-        is_ios_log     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
-        part_of_day_log = _part_of_day_from_hour(hour_log)
+    # ===== Log CSV =====
+    hour_log = _extract_hour_from_iso_for_log(iso_time)
+    dow_log = _extract_dow_from_iso_for_log(iso_time)
+    ref_domain_log = _get_first_domain_for_log(referrer)
+    os_version_num_log = _version_num_for_log(os_version)
+    is_android_log = 1 if "android" in (os_family or "").lower() else 0
+    is_ios_log     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
+    part_of_day_log = _part_of_day_from_hour(hour_log)
 
-        pcomprou_pct = p_c * 100.0
-        thr_qvc_pct  = thr_q * 100.0
-        thr_atc_pct  = thr_a * 100.0
-        gap_qvc      = p_c - thr_q
-        gap_atc      = p_c - thr_a
-        pct_of_atc   = (p_c / thr_a * 100.0) if thr_a > 0 else 0.0
+    pcomprou_pct = p_c * 100.0
+    thr_qvc_pct  = thr_q * 100.0
+    thr_atc_pct  = thr_a * 100.0
+    gap_qvc      = p_c - thr_q
+    gap_atc      = p_c - thr_a
+    pct_of_atc   = (p_c / thr_a * 100.0) if thr_a > 0 else 0.0
 
-        csv_row = [
-            ts, iso_time, ip_addr, user_agent, referrer,
-            incoming_url, resolved_url, origin_url, (cat or ""),
-            utm_original, utm_original_01, utm_original, (utm_original_01 or utm_original), utm_numbered, fbclid or "", fbp_cookie or "", fbc_cookie_send or "",
-            device_name, os_family, os_version,
-            geo.get("geo_status",""), geo.get("geo_country",""), geo.get("geo_region",""), geo.get("geo_state",""),
-            geo.get("geo_city",""), geo.get("geo_zip",""), geo.get("geo_lat",""), geo.get("geo_lon",""),
-            geo.get("geo_isp",""), geo.get("geo_org",""), geo.get("geo_asn",""),
-            part_of_day_log, hour_log, dow_log, ref_domain_log, os_version_num_log, is_android_log, is_ios_log,
-            pred_label, float(p_map.get("comprou",0.0)), float(p_map.get("quase",0.0)), float(p_map.get("desinteressado",0.0)),
-            float(thr_q), float(thr_a), int(is_qvc_flag), int(is_atc_flag),
-            pcomprou_pct, thr_qvc_pct, thr_atc_pct, gap_qvc, gap_atc, pct_of_atc,
-            meta_sent, meta_view,
-            tiktok_sent, tiktok_view
-        ]
-        with _buffer_lock:
-            _buffer_rows.append(csv_row)
-    else:
-        # Já logado anteriormente → não duplica a linha no CSV
-        pass
+    csv_row = [
+        ts, iso_time, ip_addr, user_agent, referrer,
+        incoming_url, resolved_url, origin_url, (cat or ""),
+        utm_original, utm_original_01, utm_original, (utm_original_01 or utm_original), utm_numbered, fbclid or "", fbp_cookie or "", fbc_cookie_send or "",
+        device_name, os_family, os_version,
+        geo.get("geo_status",""), geo.get("geo_country",""), geo.get("geo_region",""), geo.get("geo_state",""),
+        geo.get("geo_city",""), geo.get("geo_zip",""), geo.get("geo_lat",""), geo.get("geo_lon",""),
+        geo.get("geo_isp",""), geo.get("geo_org",""), geo.get("geo_asn",""),
+        part_of_day_log, hour_log, dow_log, ref_domain_log, os_version_num_log, is_android_log, is_ios_log,
+        pred_label, float(p_map.get("comprou",0.0)), float(p_map.get("quase",0.0)), float(p_map.get("desinteressado",0.0)),
+        float(thr_q), float(thr_a), int(is_qvc_flag), int(is_atc_flag),
+        pcomprou_pct, thr_qvc_pct, thr_atc_pct, gap_qvc, gap_atc, pct_of_atc,
+        meta_sent, meta_view,
+        tiktok_sent, tiktok_view
+    ]
+    with _buffer_lock:
+        _buffer_rows.append(csv_row)
 
     # ===== Intersticial Pinterest =====
     def _is_pinterest(ua: str) -> bool:
@@ -1304,6 +1271,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         f"_fbp={fbp_cookie}; Path=/; Max-Age=63072000; SameSite=Lax",
         f"_eid={eid_cookie}; Path=/; Max-Age=63072000; SameSite=Lax",
     ]
+    # _fbc como cookie é opcional; não influencia CAPI. Se quiser manter:
     if fbc_cookie_send:
         set_cookie_headers.append(f"_fbc={fbc_cookie_send}; Path=/; Max-Age=63072000; SameSite=Lax")
 
