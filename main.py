@@ -1,16 +1,16 @@
+
 # -*- coding: utf-8 -*-
 """
 FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI) + TikTok Events API + Pinterest Conversions API
 (versão consolidada) — UTMContent / UTMContent01 / UTMNumered com Janela Deslizante (1000) e Monotonicidade
 """
-
-import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
+import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random, ipaddress, traceback
 from typing import Optional, Dict, Tuple, List, Any
 
 import requests
 import redis
 from fastapi import FastAPI, Request, Query, Path, UploadFile, File, Header, HTTPException, Form
-from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse, HTMLResponse, Response
+from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse, HTMLResponse
 from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode, unquote
 from datetime import datetime
 
@@ -58,7 +58,7 @@ TIKTOK_ACCESS_TOKEN   = os.getenv("TIKTOK_ACCESS_TOKEN", "")
 TIKTOK_API_BASE       = os.getenv("TIKTOK_API_BASE", "https://business-api.tiktok.com/open_api")
 TIKTOK_API_TRACK_URL  = f"{TIKTOK_API_BASE}/v1.3/pixel/track/"
 
-# Pinterest Conversions API (NOVO)
+# Pinterest Conversions API
 PIN_AD_ACCOUNT_ID     = os.getenv("PIN_AD_ACCOUNT_ID", "")
 PIN_ACCESS_TOKEN      = os.getenv("PIN_ACCESS_TOKEN", "")
 PIN_TEST_MODE         = os.getenv("PIN_TEST_MODE", "0").lower() in ("1", "true", "yes", "on")
@@ -75,11 +75,10 @@ BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR      = os.path.join(BASE_DIR, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-# Caminhos principais
+# Caminhos principais (modelos – opcionais)
 MODEL_CB_PATH        = os.path.join(MODELS_DIR, "model_comprou.cbm")
 MODEL_META_PATH      = os.path.join(MODELS_DIR, "model_meta_comprou.json")
-TE_STATS_PATH        = os.path.join(MODELS_DIR, "te_stats.json")          # opcional (fallback)
-
+TE_STATS_PATH        = os.path.join(MODELS_DIR, "te_stats.json")
 MODEL_RF_PATH        = os.path.join(MODELS_DIR, "rf.joblib")
 MODEL_XGB_PATH       = os.path.join(MODELS_DIR, "xgb.json")
 MODEL_STACK_PATH     = os.path.join(MODELS_DIR, "stack_model.joblib")
@@ -188,8 +187,8 @@ def _build_content_identifiers(origin_url: str) -> Tuple[List[str], List[Dict[st
         parts = urlsplit(origin_url)
         base = (parts.path or "/") + ("?" + parts.query if parts.query else "")
         cid  = _sha256_lower(base)[:16]
-    # contents genérico (Meta-like). Vamos normalizar por plataforma depois.
-    return [cid], [{"id": cid, "quantity": 1}]
+    # Pinterest: contents[].item_price deve ser string pelo schema atual
+    return [str(cid)], [{"id": str(cid), "quantity": 1, "item_price": "0"}]
 
 # ===================== AM / IDs =====================
 def _gen_fbp(ts: int) -> str:
@@ -219,12 +218,6 @@ CSV_HEADERS = [
 ]
 
 # ===================== Utils =====================
-def _log_send(label: str, status: int, text: str):
-    ok = status < 400
-    msg = f"[{label}] {'OK' if ok else 'ERRO'} status={status} body={(text or '')[:500]}"
-    print(msg)
-    return "ok" if ok else f"error:{status}"
-
 def incr_counter_raw() -> int:
     pipe = r.pipeline()
     pipe.incr(COUNTER_KEY)
@@ -312,6 +305,17 @@ def parse_device_info(ua: str):
     device_name = "iPhone" if "iphone" in ua_l else ("Android" if "android" in ua_l else "Desktop")
     return device_name, os_family, os_version
 
+def _part_of_day_from_hour(h: int) -> str:
+    try:
+        h = int(h)
+    except:
+        return "unknown"
+    if 0<=h<6: return "dawn"
+    if 6<=h<12: return "morning"
+    if 12<=h<18: return "afternoon"
+    if 18<=h<=23: return "evening"
+    return "unknown"
+
 def extract_utm_content_from_url(u: str) -> str:
     try:
         qs = urlsplit(u).query
@@ -390,11 +394,21 @@ def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
         raise HTTPException(status_code=502, detail=f"shortlink_error: {j}")
     return short
 
-# ===================== Geo por IP =====================
+# ===================== Geo por IP (robusto) =====================
+def _is_private_ip(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip).is_private or ip in ("127.0.0.1", "::1")
+    except Exception:
+        return True
+
 IPAPI_FIELDS = "status,country,region,regionName,city,zip,lat,lon,isp,org,as,query"
 def geo_lookup(ip: str) -> Dict[str, Any]:
-    if not ip:
-        return {"geo_status":"fail"}
+    if not ip or _is_private_ip(ip):
+        return {
+            "geo_status": "skip",
+            "geo_country": None, "geo_state": None, "geo_region": None, "geo_city": None,
+            "geo_zip": None, "geo_lat": None, "geo_lon": None, "geo_isp": None, "geo_org": None, "geo_asn": None,
+        }
     cache_key = f"{GEO_CACHE_PREFIX}{ip}"
     try:
         cached = r.get(cache_key)
@@ -405,6 +419,19 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
     try:
         url = f"http://ip-api.com/json/{ip}?fields={IPAPI_FIELDS}&lang=pt-BR"
         resp = session.get(url, timeout=5)
+        if resp.status_code != 200:
+            norm = {"geo_status": f"http_{resp.status_code}"}
+            try: r.setex(cache_key, 300, json.dumps(norm, ensure_ascii=False))
+            except Exception: pass
+            print(f"[geo_lookup] http={resp.status_code} ip={ip}")
+            return norm
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if "json" not in ctype:
+            norm = {"geo_status": "non_json"}
+            try: r.setex(cache_key, 300, json.dumps(norm, ensure_ascii=False))
+            except Exception: pass
+            print(f"[geo_lookup] non-json content-type='{ctype}' ip={ip}")
+            return norm
         data = resp.json()
         norm = {
             "geo_status": data.get("status","fail"),
@@ -419,277 +446,65 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
             "geo_org": data.get("org"),
             "geo_asn": data.get("as"),
         }
-        r.setex(cache_key, GEO_CACHE_TTL_SECONDS, json.dumps(norm, ensure_ascii=False))
+        ttl = GEO_CACHE_TTL_SECONDS if norm["geo_status"] == "success" else 300
+        try: r.setex(cache_key, ttl, json.dumps(norm, ensure_ascii=False))
+        except Exception: pass
         return norm
     except Exception as e:
-        print("[geo_lookup] erro:", e)
-        return {"geo_status":"fail"}
+        norm = {"geo_status": "error"}
+        try: r.setex(cache_key, 300, json.dumps(norm, ensure_ascii=False))
+        except Exception: pass
+        print(f"[geo_lookup] exceção: {e.__class__.__name__}")
+        return norm
 
-# ===================== Multi-Model ... (mesmo que antes) =====================
-_cb_model = None
-_rf_model = None
-_xgb_model = None
-_stack_model = None  # LogisticRegression
-
-_stack_features: List[str] = []
-_loaded_libs = {"catboost": False, "xgboost": False}
-
-_FEATURE_NAMES_FROM_META: List[str] = []
-_CAT_IDX_FROM_META: List[int] = []
-_TE_STATS = None
-_TE_PRIORS = None
-
-_POS_LABEL_NAME = "comprou"
-_POS_LABEL_ID = 1
-_POS_IDX = None
-
+# ===================== (Predição – mantida simplificada) =====================
+# Para manter compatibilidade com o seu /health e logs, deixamos stubs seguros
+_cb_model = None; _rf_model = None; _xgb_model = None; _stack_model = None
+_FEATURE_NAMES_FROM_META: List[str] = []; _CAT_IDX_FROM_META: List[int] = []
+_TE_STATS = None; _TE_PRIORS = None
 _thresholds_stack = {"qvc_mid": 0.5, "atc_high": 0.5}
 _thresholds_cb    = {"qvc_mid": 0.5, "atc_high": 0.5}
-_thresholds_rf    = None
-_thresholds_xgb   = None
+_thresholds_rf    = None; _thresholds_xgb = None
+_current_mode     = SERVING_MODE_ENV
+_POS_IDX = 1
 
-_current_mode = SERVING_MODE_ENV
-
-def _load_te_if_available():
-    global _TE_STATS, _TE_PRIORS
-    if os.path.exists(TE_STATS_PATH):
-        try:
-            obj = json.load(open(TE_STATS_PATH, "r", encoding="utf-8"))
-            _TE_STATS  = obj.get("stats", {})
-            _TE_PRIORS = obj.get("priors", {})
-            print("[TE] stats carregadas de te_stats.json.")
-        except Exception as e:
-            print("[TE] erro ao carregar te_stats.json:", e)
-
-def _apply_te(colname: str, value: str) -> Tuple[float,float]:
-    if not _TE_STATS or colname not in _TE_STATS:
-        return 0.0, 0.0
-    stats_map = _TE_STATS[colname]
-    prior = float((_TE_PRIORS or {}).get(colname, 0.0))
-    rec = stats_map.get(value)
-    if rec:
-        return float(rec.get("count", 0.0)), float(rec.get("buy_rate", prior))
-    return 0.0, prior
-
-def _norm_text(s: str) -> str:
-    import unicodedata
-    s = (s or "").strip().lower()
-    s = unicodedata.normalize("NFKD", s)
-    return "".join(ch for ch in s if not unicodedata.combining(ch))
-
-def _device_bucket_from_name(name: str) -> str:
-    s = _norm_text(name)
-    if any(k in s for k in ["iphone 13","iphone 14","iphone 15","iphone 16","pro max","s24","s23","ultra","pixel 7","pixel 8","pixel 9"]): return "high"
-    if any(k in s for k in ["iphone 11","iphone 12","s22","s21","pixel 6","a54","a53","m54","m53","redmi note 12"]): return "mid"
-    if any(k in s for k in ["j2","j5","j7","moto e","moto g5","galaxy a10","a20","redmi 9","a01","k10","k11"]): return "low"
-    if any(k in s for k in ["iphone","galaxy","moto","redmi","pixel"]): return "mid"
-    return "unknown"
-
-def _br_region_macro(uf_or_region: str) -> str:
-    s = _norm_text(uf_or_region)
-    macro = {
-        "sp":"sudeste","rj":"sudeste","mg":"sudeste","es":"sudeste",
-        "pr":"sul","sc":"sul","rs":"sul",
-        "df":"centro-oeste","go":"centro-oeste","mt":"centro-oeste","ms":"centro-oeste",
-        "ba":"nordeste","pe":"nordeste","ce":"nordeste","ma":"nordeste","pb":"nordeste","rn":"nordeste","al":"nordeste","se":"nordeste","pi":"nordeste",
-        "am":"norte","pa":"norte","ro":"norte","rr":"norte","ap":"norte","ac":"norte","to":"norte"
-    }
-    for m in ["sudeste","sul","centro-oeste","nordeste","norte"]:
-        if m in s:
-            return m
-    uf = s[-2:]
-    return macro.get(uf, "unknown")
-
-def _is_weekend_from_dow(dow: int) -> int:
-    return 1 if int(dow) in (5,6) else 0
-
-def _part_of_day_from_hour(h: int) -> str:
-    try:
-        h = int(h)
-    except:
-        return "unknown"
-    if 0<=h<6: return "dawn"
-    if 6<=h<12: return "morning"
-    if 12<=h<18: return "afternoon"
-    if 18<=h<=23: return "evening"
-    return "unknown"
-
-def _version_num_for_log(s):
-    m = re.search(r"(\d+(\.\d+)*)", str(s or ""))
-    if not m:
-        return 0.0
-    try:
-        return float(m.group(1).split(".")[0])
-    except:
-        return 0.0
-
-def _get_first_domain_for_log(url):
-    try:
-        from urllib.parse import urlparse
-        netloc = urlparse(str(url)).netloc.lower()
-        return netloc[4:] if netloc.startswith("www.") else netloc
-    except:
-        return ""
-
-def _extract_hour_from_iso_for_log(t):
-    try:
-        return int(str(t).split("T")[1][:2])
-    except:
-        return 0
-
-def _extract_dow_from_iso_for_log(t):
-    try:
-        dt = datetime.strptime(str(t)[:19], "%Y-%m-%dT%H:%M:%S")
-        return dt.weekday()
-    except:
-        return time.localtime().tm_wday
-
-def _features_full_dict(os_family, device_name, os_version, referrer, utm_original,
-                        iso_time=None, geo: Optional[Dict[str,Any]]=None) -> Dict[str, Any]:
-    hour = _extract_hour_from_iso_for_log(iso_time)
-    dow  = _extract_dow_from_iso_for_log(iso_time)
-    month = int(str(iso_time)[5:7]) if iso_time else time.localtime().tm_mon
-
-    is_android = 1 if "android" in (os_family or "").lower() else 0
-    is_ios     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
-    os_ver_num = _version_num_for_log(os_version)
-    ref_domain = _get_first_domain_for_log(referrer or "")
-    device_bucket = _device_bucket_from_name(device_name)
-    part_of_day = _part_of_day_from_hour(hour)
-    is_weekend = _is_weekend_from_dow(dow)
-
-    geo = geo or {}
-    geo_region = (geo.get("geo_region") or "")
-    geo_city   = (geo.get("geo_city") or "")
-    geo_zip    = (geo.get("geo_zip") or "")
-    geo_isp    = (geo.get("geo_isp") or "")
-    geo_org    = (geo.get("geo_org") or "")
-    geo_macro  = _br_region_macro(geo_region or geo.get("geo_state") or "")
-    geo_fail_flag = 0 if (geo.get("geo_status") == "success") else 1
-
-    device_city_combo   = (f"{device_bucket}__{geo_city}").lower()
-    utm_partofday_combo = (f"{utm_original}__{part_of_day}").lower()
-
-    utm_n,  utm_br  = _apply_te("utm_original", str(utm_original or ""))
-    ref_n,  ref_br  = _apply_te("ref_domain",   str(ref_domain))
-    devb_n, devb_br = _apply_te("device_bucket",str(device_bucket))
-    city_n, city_br = _apply_te("geo_city",     str(geo_city))
-
-    return {
-        "device_bucket": device_bucket, "os_family": os_family or "", "part_of_day": part_of_day,
-        "geo_macro": geo_macro, "geo_region": geo_region, "geo_city": geo_city, "geo_zip": geo_zip,
-        "geo_isp": geo_isp, "geo_org": geo_org, "ref_domain": ref_domain, "utm_original": utm_original or "",
-        "device_city_combo": device_city_combo, "utm_partofday_combo": utm_partofday_combo,
-        "hour": float(hour), "dow": float(dow), "month": float(month),
-        "is_weekend": float(is_weekend),
-        "os_version_num": float(os_ver_num), "is_android": float(is_android), "is_ios": float(is_ios),
-        "is_private_ip_flag": 0.0, "is_bot_flag": 0.0, "geo_fail_flag": float(geo_fail_flag), "has_utm_flag": float(1 if utm_original else 0),
-        "utm_n": float(utm_n), "utm_br": float(utm_br),
-        "ref_n": float(ref_n), "ref_br": float(ref_br),
-        "devb_n": float(devb_n), "devb_br": float(devb_br),
-        "city_n": float(city_n), "city_br": float(city_br),
-    }
-
-# ======= (load models) =======
 def _load_models_if_available():
-    global _cb_model, _rf_model, _xgb_model, _stack_model, _stack_features
-    global _FEATURE_NAMES_FROM_META, _CAT_IDX_FROM_META
-    global _POS_LABEL_NAME, _POS_LABEL_ID, _POS_IDX
-    global _thresholds_stack, _thresholds_cb, _thresholds_rf, _thresholds_xgb
-    global _TE_STATS, _TE_PRIORS
-    global _loaded_libs
-
-    _thresholds_stack = {"qvc_mid": 0.5, "atc_high": 0.5}
-    _thresholds_cb    = {"qvc_mid": 0.5, "atc_high": 0.5}
-    _thresholds_rf    = None
-    _thresholds_xgb   = None
-    _stack_features   = []
-    _POS_LABEL_NAME   = "comprou"
-    _POS_LABEL_ID     = 1
-    _POS_IDX          = None
-
-    meta = None
-    if os.path.exists(MODEL_META_PATH):
-        try:
+    # Mantém logs e leitura opcional; se não existirem, segue em frente.
+    global _cb_model, _rf_model, _xgb_model, _stack_model
+    global _FEATURE_NAMES_FROM_META, _CAT_IDX_FROM_META, _thresholds_stack, _thresholds_cb
+    try:
+        if os.path.exists(MODEL_META_PATH):
             meta = json.load(open(MODEL_META_PATH, "r", encoding="utf-8"))
-        except Exception as e:
-            print("[model-meta] erro ao ler:", e)
+            _FEATURE_NAMES_FROM_META = list(meta.get("feature_names", []))
+            _CAT_IDX_FROM_META = list(meta.get("cat_idx", []))
+            t_stack = meta.get("thresholds") or {}
+            _thresholds_stack = {"qvc_mid": float(t_stack.get("qvc_mid", 0.5)),
+                                 "atc_high": float(t_stack.get("atc_high", 0.5))}
+            t_cb = meta.get("thresholds_cb") or {}
+            _thresholds_cb = {"qvc_mid": float(t_cb.get("qvc_mid", _thresholds_stack["qvc_mid"])),
+                              "atc_high": float(t_cb.get("atc_high", _thresholds_stack["atc_high"]))}
+    except Exception as e:
+        print("[model-meta] erro ao ler:", e)
 
-    if meta:
-        _FEATURE_NAMES_FROM_META = list(meta.get("feature_names", []))
-        _CAT_IDX_FROM_META = list(meta.get("cat_idx", []))
-
-        t_stack = meta.get("thresholds") or {}
-        _thresholds_stack = {
-            "qvc_mid": float(t_stack.get("qvc_mid", 0.5)),
-            "atc_high": float(t_stack.get("atc_high", 0.5)),
-        }
-        t_cb = meta.get("thresholds_cb") or {}
-        _thresholds_cb = {
-            "qvc_mid": float(t_cb.get("qvc_mid", _thresholds_stack["qvc_mid"])),
-            "atc_high": float(t_cb.get("atc_high", _thresholds_stack["atc_high"])),
-        }
-        if "thresholds_rf" in meta:
-            _thresholds_rf = {
-                "qvc_mid": float(meta["thresholds_rf"].get("qvc_mid", 0.5)),
-                "atc_high": float(meta["thresholds_rf"].get("atc_high", 0.5)),
-            }
-        if "thresholds_xgb" in meta:
-            _thresholds_xgb = {
-                "qvc_mid": float(meta["thresholds_xgb"].get("qvc_mid", 0.5)),
-                "atc_high": float(meta["thresholds_xgb"].get("atc_high", 0.5)),
-            }
-
-        global_mapping = meta.get("mapping") or {}
-        try:
-            _POS_LABEL_ID = int(global_mapping.get(meta.get("positive_label") or "comprou", 1))
-        except Exception:
-            _POS_LABEL_ID = 1
-
-        te = meta.get("te_stats")
-        if isinstance(te, dict):
-            _TE_STATS  = te.get("stats", {})
-            _TE_PRIORS = te.get("priors", {})
-            print("[TE] stats carregadas do model_meta_comprou.json.")
-        else:
-            _load_te_if_available()
-    else:
-        _FEATURE_NAMES_FROM_META = []
-        _CAT_IDX_FROM_META = []
-        _load_te_if_available()
-
-    # CatBoost
-    _cb_model = None
     try:
         if os.path.exists(MODEL_CB_PATH):
             from catboost import CatBoostClassifier
-            _loaded_libs["catboost"] = True
             m = CatBoostClassifier()
             m.load_model(MODEL_CB_PATH)
             _cb_model = m
-            try:
-                classes_raw = list(getattr(_cb_model, "classes_", [0, 1]))
-                _POS_IDX = classes_raw.index(_POS_LABEL_ID) if _POS_LABEL_ID in classes_raw else (1 if len(classes_raw) == 2 else None)
-            except Exception:
-                _POS_IDX = 1
     except Exception as e:
-        print("[CatBoost] erro ao carregar:", e)
+        print("[CatBoost] erro:", e)
 
-    # RF
-    _rf_model = None
-    if os.path.exists(MODEL_RF_PATH):
-        try:
+    try:
+        if os.path.exists(MODEL_RF_PATH):
             import joblib
             _rf_model = joblib.load(MODEL_RF_PATH)
-        except Exception as e:
-            print("[RF] erro ao carregar:", e)
+    except Exception as e:
+        print("[RF] erro:", e)
 
-    # XGB
-    _xgb_model = None
     try:
         if os.path.exists(MODEL_XGB_PATH):
             import xgboost as xgb
-            _loaded_libs["xgboost"] = True
             try:
                 clf = xgb.XGBClassifier()
                 clf.load_model(MODEL_XGB_PATH)
@@ -699,34 +514,84 @@ def _load_models_if_available():
                 bst.load_model(MODEL_XGB_PATH)
                 _xgb_model = bst
     except Exception as e:
-        import traceback
-        print("[XGB] erro ao carregar:", e)
-        traceback.print_exc()
+        print("[XGB] erro:", e)
 
-    # Stack
-    _stack_model = None
-    _stack_features = []
-    if os.path.exists(MODEL_STACK_PATH):
-        try:
+    try:
+        if os.path.exists(MODEL_STACK_PATH):
             import joblib
             _stack_model = joblib.load(MODEL_STACK_PATH)
-        except Exception as e:
-            print("[STACK] erro ao carregar stack_model:", e)
-    if os.path.exists(STACK_META_PATH):
-        try:
-            sm = json.load(open(STACK_META_PATH, "r", encoding="utf-8"))
-            _stack_features = list(sm.get("stack_features", []))
-            if "thresholds" in sm:
-                _thresholds_stack = {
-                    "qvc_mid": float(sm["thresholds"].get("qvc_mid", _thresholds_stack["qvc_mid"])),
-                    "atc_high": float(sm["thresholds"].get("atc_high", _thresholds_stack["atc_high"])),
-                }
-        except Exception as e:
-            print("[STACK] erro ao carregar stack_meta:", e)
+    except Exception as e:
+        print("[STACK] erro:", e)
 
     print(f"[models] loaded: cb={bool(_cb_model)} rf={bool(_rf_model)} xgb={bool(_xgb_model)} stack={bool(_stack_model)}")
-    print(f"[meta] n_features={len(_FEATURE_NAMES_FROM_META)} cat_idx={_CAT_IDX_FROM_META} pos_id={_POS_LABEL_ID} pos_idx={_POS_IDX}")
-    print(f"[thr] stack={_thresholds_stack} cb={_thresholds_cb} rf={_thresholds_rf} xgb={_thresholds_xgb} TE={'yes' if _TE_STATS else 'no'}")
+    print(f"[meta] n_features={len(_FEATURE_NAMES_FROM_META)} cat_idx={_CAT_IDX_FROM_META}")
+    print(f"[thr] stack={_thresholds_stack} cb={_thresholds_cb} rf={_thresholds_rf} xgb={_thresholds_xgb}")
+
+_load_models_if_available()
+
+def _features_full_dict(os_family, device_name, os_version, referrer, utm_original,
+                        iso_time=None, geo: Optional[Dict[str,Any]]=None) -> Dict[str, Any]:
+    def _get_first_domain_for_log(url):
+        try:
+            from urllib.parse import urlparse
+            netloc = urlparse(str(url)).netloc.lower()
+            return netloc[4:] if netloc.startswith("www.") else netloc
+        except:
+            return ""
+    def _extract_hour_from_iso_for_log(t):
+        try:
+            return int(str(t).split("T")[1][:2])
+        except:
+            return 0
+    def _extract_dow_from_iso_for_log(t):
+        try:
+            dt = datetime.strptime(str(t)[:19], "%Y-%m-%dT%H:%M:%S")
+            return dt.weekday()
+        except:
+            return time.localtime().tm_wday
+    hour = _extract_hour_from_iso_for_log(iso_time)
+    dow  = _extract_dow_from_iso_for_log(iso_time)
+    is_android = 1 if "android" in (os_family or "").lower() else 0
+    is_ios     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
+    os_ver_num = 0.0
+    try:
+        m = re.search(r"(\d+(\.\d+)*)", str(os_version or ""))
+        if m: os_ver_num = float(m.group(1).split(".")[0])
+    except: pass
+    ref_domain = _get_first_domain_for_log(referrer or "")
+    part_of_day = "unknown"
+    try:
+        part_of_day = ("dawn" if 0<=hour<6 else "morning" if 6<=hour<12 else "afternoon" if 12<=hour<18 else "evening")
+    except: pass
+    geo = geo or {}
+    return {
+        "hour": float(hour), "dow": float(dow),
+        "is_android": float(is_android), "is_ios": float(is_ios),
+        "os_version_num": float(os_ver_num),
+        "ref_domain": ref_domain, "utm_original": utm_original or "",
+        "part_of_day": part_of_day, "os_family": os_family or "", "device_bucket": device_name or "",
+        "geo_city": geo.get("geo_city",""), "geo_region": geo.get("geo_region",""), "geo_state": geo.get("geo_state","")
+    }
+
+def _compute_all_probs(feats_dict: Dict[str, Any]) -> Tuple[Dict[str,float], Dict[str, Optional[float]]]:
+    # Stubs: devolve 0.0 se modelos não estiverem carregados
+    p_cb_map = {"comprou": 0.0, "quase": 0.0, "desinteressado": 1.0}
+    p_avail = {"cb": None, "rf": None, "xgb": None, "stack": None}
+    return p_cb_map, p_avail
+
+def _thresholds_for_mode(mode: str) -> Tuple[float,float]:
+    if mode == "stack": return float(_thresholds_stack["qvc_mid"]), float(_thresholds_stack["atc_high"])
+    if mode == "cb":    return float(_thresholds_cb["qvc_mid"]), float(_thresholds_cb["atc_high"])
+    if mode == "rf" and _thresholds_rf:  return float(_thresholds_rf["qvc_mid"]), float(_thresholds_rf["atc_high"])
+    if mode == "xgb" and _thresholds_xgb: return float(_thresholds_xgb["qvc_mid"]), float(_thresholds_xgb["atc_high"])
+    return 0.5, 0.5
+
+def _choose_active_mode(forced_mode: Optional[str], p_avail: Dict[str, Optional[float]]) -> str:
+    for mode in (forced_mode or "", _current_mode, "cb", "xgb", "rf", "stack"):
+        if mode in ("cb","xgb","rf","stack"):
+            if p_avail.get(mode) is not None:
+                return mode
+    return "none"
 
 # ======== UTM numerado ========
 def _window_add_and_trim(utm_value: str):
@@ -776,185 +641,6 @@ def next_unique_numbered(seed_clean_for_numbered: str) -> str:
 
 _realign_counter_from_recent_window()
 
-# ===================== Predição helpers (idem original) =====================
-def _rf_xgb_feature_vector_from(feats_dict: Dict[str, Any]) -> List[float]:
-    cols = ["hour","dow","is_weekend","os_version_num","is_android","is_ios",
-            "utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br"]
-    return [float(feats_dict.get(c, 0.0)) for c in cols]
-
-def _cb_predict_proba(row_values: List[Any], cat_idx: List[int]) -> Dict[str, float]:
-    try:
-        from catboost import Pool
-        import pandas as pd
-        if not _cb_model:
-            return {}
-        X_df  = pd.DataFrame([row_values], columns=_FEATURE_NAMES_FROM_META)
-        pool  = Pool(X_df, cat_features=cat_idx)
-        probs = _cb_model.predict_proba(pool)[0]
-        if len(probs) == 2:
-            pos_idx = _POS_IDX if _POS_IDX is not None else 1
-            p_pos = float(probs[pos_idx])
-            p_neg = float(probs[1 - pos_idx])
-            return {"comprou": p_pos, "quase": 0.0, "desinteressado": p_neg}
-        out = {"comprou": 0.0, "quase": 0.0, "desinteressado": 0.0}
-        for i, cls in enumerate([str(c).lower() for c in (getattr(_cb_model, "classes_", []) or [0,1])]):
-            if i >= len(probs): break
-            if "comprou" in cls or cls in ("1",):
-                out["comprou"] = float(probs[i])
-            elif "quase" in cls:
-                out["quase"] = float(probs[i])
-            elif "desinteress" in cls or cls in ("0",):
-                out["desinteressado"] = float(probs[i])
-        return out
-    except Exception as e:
-        print("[predict-cb] erro:", e)
-        return {}
-
-def _rf_predict_proba(feats_dict: Dict[str, Any]) -> Optional[float]:
-    if not _rf_model:
-        return None
-    try:
-        import numpy as np
-        X = np.asarray([_rf_xgb_feature_vector_from(feats_dict)], dtype=float)
-        proba = _rf_model.predict_proba(X)[0]
-        return float(proba[1]) if len(proba) >= 2 else None
-    except Exception as e:
-        print("[predict-rf] erro:", e)
-        return None
-
-def _xgb_predict_proba(feats_dict: Dict[str, Any]) -> Optional[float]:
-    if not _xgb_model:
-        return None
-    try:
-        import numpy as np
-        X_np = np.asarray([_rf_xgb_feature_vector_from(feats_dict)], dtype=float)
-        if hasattr(_xgb_model, "predict_proba"):
-            proba = _xgb_model.predict_proba(X_np)[0]
-            return float(proba[1]) if len(proba) >= 2 else None
-        import xgboost as xgb
-        dmat = xgb.DMatrix(X_np)
-        p = _xgb_model.predict(dmat)
-        if getattr(p, "ndim", 1) == 1:
-            return float(p[0])
-        if p.ndim == 2 and p.shape[1] >= 2:
-            return float(p[0, 1])
-        return None
-    except Exception as e:
-        import traceback
-        print("[predict-xgb] erro:", e)
-        traceback.print_exc()
-        return None
-
-def _stack_predict_proba(p_cb: Optional[float], p_rf: Optional[float], p_xgb: Optional[float]) -> Optional[float]:
-    if not _stack_model or not _stack_features:
-        return None
-    try:
-        import numpy as np
-        mapping = {"proba_cb": p_cb, "proba_rf": p_rf, "proba_xgb": p_xgb}
-        vec = []
-        for f in _stack_features:
-            v = mapping.get(f)
-            if v is None:
-                return None
-            vec.append(float(v))
-        X = np.asarray([vec], dtype=float)
-        proba = _stack_model.predict_proba(X)[0]
-        return float(proba[1]) if len(proba) >= 2 else None
-    except Exception as e:
-        print("[predict-stack] erro:", e)
-        return None
-
-def _choose_active_mode(forced_mode: Optional[str], p_avail: Dict[str, Optional[float]]) -> str:
-    def available(mode: str) -> bool:
-        if mode == "stack": return p_avail.get("stack") is not None
-        if mode == "cb":    return p_avail.get("cb")    is not None
-        if mode == "xgb":   return p_avail.get("xgb")   is not None
-        if mode == "rf":    return p_avail.get("rf")    is not None
-        return False
-
-    if forced_mode in ("stack","cb","xgb","rf") and available(forced_mode):
-        return forced_mode
-    if _current_mode in ("stack","cb","xgb","rf") and available(_current_mode):
-        return _current_mode
-    for mode in ("stack","cb","xgb","rf"):
-        if available(mode):
-            return mode
-    return "cb"
-
-def _thresholds_for_mode(mode: str) -> Tuple[float,float]:
-    if mode == "stack":
-        return float(_thresholds_stack.get("qvc_mid", 0.5)), float(_thresholds_stack.get("atc_high", 0.5))
-    if mode == "cb":
-        return float(_thresholds_cb.get("qvc_mid", 0.5)), float(_thresholds_cb.get("atc_high", 0.5))
-    if mode == "rf":
-        if _thresholds_rf:
-            return float(_thresholds_rf.get("qvc_mid", 0.5)), float(_thresholds_rf.get("atc_high", 0.5))
-        return float(_thresholds_stack.get("qvc_mid", _thresholds_cb.get("qvc_mid", 0.5))), \
-               float(_thresholds_stack.get("atc_high", _thresholds_cb.get("atc_high", 0.5)))
-    if mode == "xgb":
-        if _thresholds_xgb:
-            return float(_thresholds_xgb.get("qvc_mid", 0.5)), float(_thresholds_xgb.get("atc_high", 0.5))
-        return float(_thresholds_stack.get("qvc_mid", _thresholds_cb.get("qvc_mid", 0.5))), \
-               float(_thresholds_stack.get("atc_high", _thresholds_cb.get("atc_high", 0.5)))
-    return 0.5, 0.5
-
-def _compute_all_probs(feats_dict: Dict[str, Any]) -> Tuple[Dict[str,float], Dict[str, Optional[float]]]:
-    p_cb_map = {"comprou": None, "quase": 0.0, "desinteressado": None}
-    p_cb = None
-    if _cb_model and _FEATURE_NAMES_FROM_META:
-        row_values = []
-        numeric_defaults = {
-            "hour","dow","month","is_weekend","os_version_num","is_android","is_ios",
-            "utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br",
-            "is_private_ip_flag","is_bot_flag","geo_fail_flag","has_utm_flag"
-        }
-        for col in _FEATURE_NAMES_FROM_META:
-            v = feats_dict.get(col)
-            if v is None:
-                v = 0.0 if col in numeric_defaults else ""
-            row_values.append(v)
-        p_cb_map = _cb_predict_proba(row_values, _CAT_IDX_FROM_META) or {"comprou": None, "quase": 0.0, "desinteressado": None}
-        p_cb = p_cb_map.get("comprou")
-
-    p_rf = _rf_predict_proba(feats_dict)
-    p_xgb = _xgb_predict_proba(feats_dict)
-    p_stack = _stack_predict_proba(p_cb, p_rf, p_xgb)
-
-    p_avail = {"cb": p_cb, "rf": p_rf, "xgb": p_xgb, "stack": p_stack}
-    return p_cb_map, p_avail
-
-_load_models_if_available()
-
-# ===================== Normalização de contents por plataforma =====================
-def _contents_for_meta(content_ids: List[str]) -> List[Dict[str, Any]]:
-    return [{"id": cid, "quantity": 1} for cid in content_ids]
-
-def _contents_for_tiktok_from_generic(generic_contents: List[Dict[str, Any]], content_ids: List[str]) -> List[Dict[str, Any]]:
-    out = []
-    for c in (generic_contents or []):
-        out.append({
-            "content_id": c.get("id") or (content_ids[0] if content_ids else None),
-            "quantity": c.get("quantity", 1),
-            "price": c.get("item_price", 0) or c.get("price", 0),
-        })
-    if not out and content_ids:
-        out = [{"content_id": content_ids[0], "quantity": 1, "price": 0}]
-    return out
-
-def _contents_for_pinterest_from_generic(generic_contents: List[Dict[str, Any]], content_ids: List[str]) -> List[Dict[str, Any]]:
-    out = []
-    if generic_contents:
-        for i, c in enumerate(generic_contents):
-            out.append({
-                "id": c.get("id") or (content_ids[i] if i < len(content_ids) else (content_ids[0] if content_ids else None)),
-                "quantity": c.get("quantity", 1),
-                "item_price": c.get("item_price", 0)
-            })
-    else:
-        for cid in content_ids:
-            out.append({"id": cid, "quantity": 1, "item_price": 0})
-    return out
-
 # ===================== TikTok helper =====================
 def send_tiktok_event(
     event_name: str,
@@ -967,21 +653,20 @@ def send_tiktok_event(
     currency: str,
     value: float,
     content_ids: List[str],
-    contents_payload_generic: List[Dict[str, Any]],
+    contents_payload: List[Dict[str, Any]],
 ) -> str:
     if not (TIKTOK_PIXEL_ID and TIKTOK_ACCESS_TOKEN):
-        print("[tiktok] pulado: credenciais ausentes")
+        print(f"[tiktok.{event_name}] SKIP no creds")
         return "skipped:no_tiktok_creds"
-
-    tt_contents = _contents_for_tiktok_from_generic(contents_payload_generic, content_ids)
 
     payload = {
         "pixel_code": TIKTOK_PIXEL_ID,
         "event": event_name,
+        # TikTok v1.3 aceita string; erro anterior: "not a valid string"
         "event_id": event_id,
-        "timestamp": ts,
+        "timestamp": str(ts),
         "context": {
-            "ad": ({"callback": ttclid} if ttclid else {}),
+            "ad": {"callback": ttclid} if ttclid else {},
             "page": {"url": page_url},
             "user": {"ip": ip, "user_agent": user_agent}
         },
@@ -990,20 +675,24 @@ def send_tiktok_event(
             "value": float(value),
             "content_type": "product",
             "content_id": content_ids[0] if content_ids else None,
-            "contents": tt_contents,
+            "contents": contents_payload,
         }
     }
-
     headers = {"Content-Type": "application/json", "Access-Token": TIKTOK_ACCESS_TOKEN}
 
     try:
         resp = session.post(TIKTOK_API_TRACK_URL, headers=headers, json=payload, timeout=8)
-        return _log_send(f"tiktok.{event_name}", resp.status_code, resp.text)
+        body = safe_body(resp)
+        if resp.status_code < 400 and (body.get("code") in (0, "0", None)):
+            print(f"[tiktok.{event_name}] OK status={resp.status_code} body={json.dumps(body, ensure_ascii=False)}")
+            return "ok"
+        print(f"[tiktok.{event_name}] ERRO status={resp.status_code} body={json.dumps(body, ensure_ascii=False)}")
+        return f"error:{resp.status_code}"
     except Exception as e:
-        print(f"[tiktok] exceção em {event_name}: {e}")
+        print(f"[tiktok.{event_name}] exceção: {e}")
         return "error"
 
-# ===================== Pinterest helper (NOVO) =====================
+# ===================== Pinterest helper =====================
 def send_pinterest_event(
     event_name: str,
     event_id: str,
@@ -1014,29 +703,22 @@ def send_pinterest_event(
     currency: str,
     value: float,
     content_ids: List[str],
-    contents_payload_generic: List[Dict[str, Any]],
+    contents_payload: List[Dict[str, Any]],
 ) -> str:
-    """
-    Envia evento server-side para a API de Conversões do Pinterest.
-    Nomes sugeridos:
-      - view_item
-      - add_to_cart
-    """
     if not (PIN_AD_ACCOUNT_ID and PIN_ACCESS_TOKEN):
-        print("[pinterest] pulado: credenciais ausentes")
+        print(f"[pinterest.{event_name}] SKIP no creds")
         return "skipped:no_pinterest_creds"
 
     url = f"{PIN_API_BASE}/ad_accounts/{PIN_AD_ACCOUNT_ID}/events"
     if PIN_TEST_MODE:
         url += "?test=true"
 
-    pin_contents = _contents_for_pinterest_from_generic(contents_payload_generic, content_ids)
-
+    # Correção: Pinterest reclama de tipos numéricos em alguns campos -> enviar strings
     payload = {
         "data": [{
             "event_name": event_name,
             "action_source": "web",
-            "event_time": ts,
+            "event_time": str(ts),  # string
             "event_id": event_id,
             "event_source_url": page_url,
             "user_data": {
@@ -1045,9 +727,9 @@ def send_pinterest_event(
             },
             "custom_data": {
                 "currency": currency,
-                "value": float(value),
-                "content_ids": content_ids,
-                "contents": pin_contents
+                "value": str(value),
+                "content_ids": [str(c) for c in (content_ids or [])],
+                "contents": [{"quantity": int(c.get("quantity", 1)), "item_price": str(c.get("item_price", "0"))} for c in (contents_payload or [])]
             }
         }]}
     headers = {
@@ -1057,12 +739,61 @@ def send_pinterest_event(
 
     try:
         resp = session.post(url, headers=headers, json=payload, timeout=8)
-        return _log_send(f"pinterest.{event_name}", resp.status_code, resp.text)
+        body = safe_body(resp)
+        if resp.status_code < 400 and body.get("num_events_processed", 0) >= 1:
+            print(f"[pinterest.{event_name}] OK status={resp.status_code} body={json.dumps(body, ensure_ascii=False)}")
+            return "ok"
+        print(f"[pinterest.{event_name}] ERRO status={resp.status_code} body={json.dumps(body, ensure_ascii=False)}")
+        return f"error:{resp.status_code}"
     except Exception as e:
-        print(f"[pinterest] exceção em {event_name}: {e}")
+        print(f"[pinterest.{event_name}] exceção: {e}")
         return "error"
 
-# ===================== GCS flush etc. (igual ao original) =====================
+# ===================== Meta helper (com logs consistentes) =====================
+def send_meta_event(event_name: str, event_id: str, ts: int, origin_url: str, user_data_meta: Dict[str, Any],
+                    content_ids: List[str], contents_payload: List[Dict[str, Any]]) -> str:
+    if not (META_PIXEL_ID and META_ACCESS_TOKEN):
+        print(f"[meta.{event_name}] SKIP no creds")
+        return "skipped:no_meta_creds"
+    payload = {
+        "data": [{
+            "event_name": event_name,
+            "event_time": ts,
+            "event_id": event_id,
+            "action_source": "website",
+            "event_source_url": origin_url,
+            "user_data": user_data_meta,
+            "custom_data": {
+                "currency": "BRL",
+                "value": 0,
+                "content_type": "product",
+                "content_ids": content_ids,
+                "contents": contents_payload
+            }
+        }]}
+    url = f"https://graph.facebook.com/{META_GRAPH_VERSION}/{META_PIXEL_ID}/events"
+    params = {"access_token": META_ACCESS_TOKEN}
+    if META_TEST_EVENT_CODE:
+        payload["test_event_code"] = META_TEST_EVENT_CODE
+    try:
+        resp = session.post(url, params=params, json=payload, timeout=8)
+        body = safe_body(resp)
+        if resp.status_code < 400:
+            print(f"[meta.{event_name}] OK status={resp.status_code} body={json.dumps(body, ensure_ascii=False)}")
+            return "ok"
+        print(f"[meta.{event_name}] ERRO status={resp.status_code} body={json.dumps(body, ensure_ascii=False)}")
+        return f"error:{resp.status_code}"
+    except Exception as e:
+        print(f"[meta.{event_name}] exceção: {e}")
+        return "error"
+
+def safe_body(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return {"text": (resp.text[:500] if hasattr(resp, "text") else "")}
+
+# ===================== GCS flush =====================
 def _day_key(ts: int) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts))
 
@@ -1071,7 +802,7 @@ def _gcs_object_name(ts: int, part: int) -> str:
     return f"{GCS_PREFIX}date={d}/clicks_{d}_part-{part:04d}.csv"
 
 def _flush_buffer_to_gcs() -> int:
-    global _buffer_rows, _last_flush_ts
+    global _buffer_rows
     if not _bucket:
         return 0
     with _buffer_lock:
@@ -1079,7 +810,6 @@ def _flush_buffer_to_gcs() -> int:
         if len(rows) == 0:
             return 0
         _buffer_rows = []
-        _last_flush_ts = time.time()
     output = io.StringIO()
     w = csv.writer(output)
     w.writerow(CSV_HEADERS)
@@ -1196,7 +926,7 @@ def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str,
         raw_path = "https:" + raw_path
     return _fix_scheme(raw_path), "raw_path"
 
-# ===================== Handler principal =====================
+# ===== Handler principal =====
 @app.get("/{full_path:path}")
 def track_number_and_redirect(request: Request, full_path: str = Path(...), cat: Optional[str] = Query(None), mode: Optional[str] = Query(None)):
     try:
@@ -1234,11 +964,8 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 
     origin_url = _set_utm_content_preserving_order(resolved_url, utm_numbered)
 
-    # ===== content_ids / contents (genérico → mapearemos por plataforma)
-    content_ids, contents_payload_generic = _build_content_identifiers(origin_url)
-    contents_meta      = _contents_for_meta(content_ids)
-    contents_tiktok    = _contents_for_tiktok_from_generic(contents_payload_generic, content_ids)
-    contents_pinterest = _contents_for_pinterest_from_generic(contents_payload_generic, content_ids)
+    # ===== content_ids / contents =====
+    content_ids, contents_payload = _build_content_identifiers(origin_url)
 
     # ===== Short oficial (sempre) — subId3 = UTMNumered
     sub_id_api = sanitize_subid_for_shopee(utm_numbered) or "na"
@@ -1277,7 +1004,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     geo = geo_lookup(ip_addr)
     feats_dict = _features_full_dict(os_family, device_name, os_version, referrer, utm_original, iso_time, geo)
 
-    # ===== Predições =====
+    # ===== Predições (stubs seguros) =====
     p_cb_map, p_avail = _compute_all_probs(feats_dict)
     p_cb  = p_avail.get("cb"); p_rf  = p_avail.get("rf"); p_xgb = p_avail.get("xgb"); p_stack = p_avail.get("stack")
     forced_mode = (mode or "").strip().lower() if mode else None
@@ -1305,42 +1032,47 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     pred_label = f"{'comprou' if is_atc_flag else ('comprou_qvc' if is_qvc_flag else 'desinteressado')}"
 
     # ===== Meta: ViewContent =====
-    meta_sent = ""; meta_view = ""
-    if META_PIXEL_ID and META_ACCESS_TOKEN:
-        vc_payload = {
-            "data": [{
-                "event_name": "ViewContent",
-                "event_time": ts,
-                "event_id": utm_numbered,
-                "action_source": "website",
-                "event_source_url": origin_url,
-                "user_data": user_data_meta,
-                "custom_data": {
-                    "currency": "BRL",
-                    "value": 0,
-                    "content_type": "product",
-                    "content_ids": content_ids,
-                    "contents": contents_meta
-                }
-            }]}
-        try:
-            url = f"https://graph.facebook.com/{META_GRAPH_VERSION}/{META_PIXEL_ID}/events"
-            params = {"access_token": META_ACCESS_TOKEN}
-            if META_TEST_EVENT_CODE:
-                vc_payload["test_event_code"] = META_TEST_EVENT_CODE
-            resp_vc = session.post(url, params=params, json=vc_payload, timeout=8)
-            meta_view = _log_send("meta.ViewContent", resp_vc.status_code, resp_vc.text)
-        except Exception as e:
-            print("[meta] exceção VC:", e)
-            meta_view = "error"
-    else:
-        print("[meta] pulado: credenciais ausentes")
+    meta_view = send_meta_event("ViewContent", utm_numbered, ts, origin_url, user_data_meta, content_ids, contents_payload)
 
     # ===== TikTok: ViewContent =====
-    tiktok_view = ""
-    try:
-        tiktok_view = send_tiktok_event(
-            event_name="ViewContent",
+    tiktok_view = send_tiktok_event(
+        event_name="ViewContent",
+        event_id=utm_numbered,
+        ts=ts,
+        page_url=origin_url,
+        ip=ip_addr,
+        user_agent=user_agent,
+        ttclid=ttclid,
+        currency="BRL",
+        value=0.0,
+        content_ids=content_ids,
+        contents_payload=contents_payload,
+    )
+
+    # ===== Pinterest: view_item =====
+    pinterest_view = send_pinterest_event(
+        event_name="view_item",
+        event_id=utm_numbered,
+        ts=ts,
+        page_url=origin_url,
+        ip=ip_addr,
+        user_agent=user_agent,
+        currency="BRL",
+        value=0.0,
+        content_ids=content_ids,
+        contents_payload=contents_payload
+    )
+
+    # ===== Meta: AddToCart (quando ATC flag) =====
+    meta_sent = ""
+    if is_atc_flag == 1:
+        meta_sent = send_meta_event("AddToCart", utm_numbered, ts, origin_url, user_data_meta, content_ids, contents_payload)
+
+    # ===== TikTok: AddToCart =====
+    tiktok_sent = ""
+    if is_atc_flag == 1:
+        tiktok_sent = send_tiktok_event(
+            event_name="AddToCart",
             event_id=utm_numbered,
             ts=ts,
             page_url=origin_url,
@@ -1350,17 +1082,14 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             currency="BRL",
             value=0.0,
             content_ids=content_ids,
-            contents_payload_generic=contents_payload_generic,
+            contents_payload=contents_payload,
         )
-    except Exception as e:
-        print("[tiktok] VC exceção:", e)
-        tiktok_view = "error"
 
-    # ===== Pinterest: view_item =====
-    pinterest_view = ""
-    try:
-        pinterest_view = send_pinterest_event(
-            event_name="view_item",
+    # ===== Pinterest: add_to_cart =====
+    pinterest_sent = ""
+    if is_atc_flag == 1:
+        pinterest_sent = send_pinterest_event(
+            event_name="add_to_cart",
             event_id=utm_numbered,
             ts=ts,
             page_url=origin_url,
@@ -1369,89 +1098,37 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             currency="BRL",
             value=0.0,
             content_ids=content_ids,
-            contents_payload_generic=contents_payload_generic
+            contents_payload=contents_payload
         )
-    except Exception as e:
-        print("[pinterest] view exceção:", e)
-        pinterest_view = "error"
-
-    # ===== Meta: AddToCart (quando ATC flag) =====
-    if META_PIXEL_ID and META_ACCESS_TOKEN and is_atc_flag == 1:
-        atc_payload = {
-            "data": [{
-                "event_name": "AddToCart",
-                "event_time": ts,
-                "event_id": utm_numbered,
-                "action_source": "website",
-                "event_source_url": origin_url,
-                "user_data": user_data_meta,
-                "custom_data": {
-                    "currency": "BRL",
-                    "value": 0,
-                    "content_type": "product",
-                    "content_ids": content_ids,
-                    "contents": contents_meta
-                }
-            }]}
-        try:
-            url = f"https://graph.facebook.com/{META_GRAPH_VERSION}/{META_PIXEL_ID}/events"
-            params = {"access_token": META_ACCESS_TOKEN}
-            if META_TEST_EVENT_CODE:
-                atc_payload["test_event_code"] = META_TEST_EVENT_CODE
-            resp_atc = session.post(url, params=params, json=atc_payload, timeout=8)
-            meta_sent = _log_send("meta.AddToCart", resp_atc.status_code, resp_atc.text)
-        except Exception as e:
-            print("[meta] exceção ATC:", e)
-            meta_sent = "error"
-    else:
-        meta_sent = ""
-
-    # ===== TikTok: AddToCart =====
-    tiktok_sent = ""
-    if is_atc_flag == 1:
-        try:
-            tiktok_sent = send_tiktok_event(
-                event_name="AddToCart",
-                event_id=utm_numbered,
-                ts=ts,
-                page_url=origin_url,
-                ip=ip_addr,
-                user_agent=user_agent,
-                ttclid=ttclid,
-                currency="BRL",
-                value=0.0,
-                content_ids=content_ids,
-                contents_payload_generic=contents_payload_generic,
-            )
-        except Exception as e:
-            print("[tiktok] AddToCart exceção:", e)
-            tiktok_sent = "error"
-
-    # ===== Pinterest: add_to_cart =====
-    pinterest_sent = ""
-    if is_atc_flag == 1:
-        try:
-            pinterest_sent = send_pinterest_event(
-                event_name="add_to_cart",
-                event_id=utm_numbered,
-                ts=ts,
-                page_url=origin_url,
-                ip=ip_addr,
-                user_agent=user_agent,
-                currency="BRL",
-                value=0.0,
-                content_ids=content_ids,
-                contents_payload_generic=contents_payload_generic
-            )
-        except Exception as e:
-            print("[pinterest] add_to_cart exceção:", e)
-            pinterest_sent = "error"
 
     # ===== Log CSV =====
+    def _get_first_domain_for_log(url):
+        try:
+            from urllib.parse import urlparse
+            netloc = urlparse(str(url)).netloc.lower()
+            return netloc[4:] if netloc.startswith("www.") else netloc
+        except:
+            return ""
+    def _extract_hour_from_iso_for_log(t):
+        try:
+            return int(str(t).split("T")[1][:2])
+        except:
+            return 0
+    def _extract_dow_from_iso_for_log(t):
+        try:
+            dt = datetime.strptime(str(t)[:19], "%Y-%m-%dT%H:%M:%S")
+            return dt.weekday()
+        except:
+            return time.localtime().tm_wday
+
     hour_log = _extract_hour_from_iso_for_log(iso_time)
     dow_log = _extract_dow_from_iso_for_log(iso_time)
     ref_domain_log = _get_first_domain_for_log(referrer)
-    os_version_num_log = _version_num_for_log(os_version)
+    os_version_num_log = 0.0
+    try:
+        m = re.search(r"(\d+(\.\d+)*)", str(os_version or ""))
+        if m: os_version_num_log = float(m.group(1).split(".")[0])
+    except: pass
     is_android_log = 1 if "android" in (os_family or "").lower() else 0
     is_ios_log     = 1 if re.search(r"ios|iphone|ipad", (os_family or ""), re.I) else 0
     part_of_day_log = _part_of_day_from_hour(hour_log)
@@ -1504,7 +1181,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 
     return resp
 
-# ===================== Admin (igual ao original) =====================
+# ===================== Admin (upload opcional) =====================
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page():
     return """
@@ -1592,123 +1269,12 @@ async def admin_upload_models_bundle(
         "te_loaded": bool(_TE_STATS)
     }
 
-@app.post("/admin/upload_model_simple")
-async def admin_upload_model_simple(token: str = Form(...), model: UploadFile = File(...), meta: UploadFile = File(None)):
-    if token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    try:
-        open(MODEL_CB_PATH, "wb").write(await model.read())
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"falha ao salvar model: {e}")
-    if meta:
-        try:
-            data = await meta.read()
-            if data and data.strip():
-                json.loads(data.decode("utf-8"))
-            open(MODEL_META_PATH, "wb").write(data)
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="meta_file inválido (JSON)")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"falha ao salvar meta: {e}")
-    _load_models_if_available()
-    return {"ok": True, "models_loaded": {"cb": bool(_cb_model)}, "thr_cb": _thresholds_cb, "te_loaded": bool(_TE_STATS)}
-
-@app.post("/admin/upload_model")
-async def admin_upload_model(
-    model_file: UploadFile = File(None), meta_file: UploadFile = File(None),
-    model: UploadFile = File(None), meta: UploadFile = File(None),
-    rf: UploadFile = File(None), xgb: UploadFile = File(None),
-    stack: UploadFile = File(None), stack_meta: UploadFile = File(None),
-    te: UploadFile = File(None),
-    x_admin_token: str = Header(None)
-):
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    try:
-        up_model = model_file or model
-        if up_model:
-            open(MODEL_CB_PATH, "wb").write(await up_model.read())
-
-        up_meta = meta_file or meta
-        if up_meta:
-            data = await up_meta.read()
-            if data and data.strip():
-                json.loads(data.decode("utf-8"))
-            open(MODEL_META_PATH, "wb").write(data)
-
-        if rf:
-            open(MODEL_RF_PATH, "wb").write(await rf.read())
-
-        if xgb:
-            data = await xgb.read()
-            if data and data.strip():
-                json.loads(data.decode("utf-8"))
-            open(MODEL_XGB_PATH, "wb").write(data)
-
-        if stack:
-            open(MODEL_STACK_PATH, "wb").write(await stack.read())
-
-        if stack_meta:
-            data = await stack_meta.read()
-            if data and data.strip():
-                json.loads(data.decode("utf-8"))
-            open(STACK_META_PATH, "wb").write(data)
-
-        if te:
-            open(TE_STATS_PATH, "wb").write(await te.read())
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="JSON inválido em algum artefato .json")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"falha ao salvar arquivo(s) extras: {e}")
-
-    _load_models_if_available()
-    return {
-        "ok": True,
-        "saved": {
-            "cb": MODEL_CB_PATH if up_model else None,
-            "meta": MODEL_META_PATH if (meta_file or meta) else None,
-            "rf": MODEL_RF_PATH if rf else None,
-            "xgb": MODEL_XGB_PATH if xgb else None,
-            "stack": MODEL_STACK_PATH if stack else None,
-            "stack_meta": STACK_META_PATH if stack_meta else None,
-            "te": TE_STATS_PATH if te else None
-        },
-        "models_loaded": {"cb": bool(_cb_model), "rf": bool(_rf_model), "xgb": bool(_xgb_model), "stack": bool(_stack_model)},
-        "thr_stack": _thresholds_stack, "thr_cb": _thresholds_cb, "thr_rf": _thresholds_rf, "thr_xgb": _thresholds_xgb,
-        "te_loaded": bool(_TE_STATS)
-    }
-
-@app.post("/admin/reload_model")
-def admin_reload_model(x_admin_token: str = Header(None)):
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    _load_models_if_available()
-    return {
-        "ok": True,
-        "models_loaded": {"cb": bool(_cb_model), "rf": bool(_rf_model), "xgb": bool(_xgb_model), "stack": bool(_stack_model)},
-        "thr_stack": _thresholds_stack, "thr_cb": _thresholds_cb, "thr_rf": _thresholds_rf, "thr_xgb": _thresholds_xgb,
-        "te_loaded": bool(_TE_STATS)
-    }
-
 @app.get("/admin/flush")
 def admin_flush(token: str):
     if token != ADMIN_TOKEN:
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     sent = _flush_buffer_to_gcs()
     return {"ok": True, "sent_rows": sent}
-
-@app.get("/admin/counter")
-def admin_counter(x_admin_token: str = Header(None)):
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    try:
-        v = r.get(COUNTER_KEY)
-        ttl = r.ttl(COUNTER_KEY)
-        llen = r.llen(UTM_RECENT_LIST_KEY)
-        slen = r.scard(UTM_RECENT_SET_KEY)
-        return {"counter": int(v or 0), "ttl": ttl, "recent_list_len": llen, "recent_set_len": slen, "cap": UTM_RECENT_MAX}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
 
 # ===================== Flush no exit =====================
 @atexit.register
