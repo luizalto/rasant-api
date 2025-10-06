@@ -696,63 +696,62 @@ def send_tiktok_event(
 def send_pinterest_event(
     event_name: str,
     event_id: str,
-    ts: int,
+    ts: int,                      # Unix seconds (int) — Pinterest exige integer
     page_url: str,
     ip: str,
     user_agent: str,
     currency: str,
-    value: float,
+    value: float,                 # vamos converter para string no payload
     content_ids: List[str],
     contents_payload: List[Dict[str, Any]],
 ) -> str:
     """
     Envia evento server-side para a API de Conversões do Pinterest (v5).
-    Requer:
-      - event_time: inteiro (epoch seconds)
-      - currency: string ("BRL")
-      - value: número (float/int)
-      - content_ids: lista de strings
-      - contents: lista de objetos com quantity (int) / item_price (número)
+    Campos importantes no v5:
+      - event_time: integer (epoch seconds)
+      - custom_data.value: string (ex.: '72.39')
+      - contents[].item_price: string (ex.: '1325.12')
+      - contents[].quantity: integer
     """
     if not (PIN_AD_ACCOUNT_ID and PIN_ACCESS_TOKEN):
+        print("[pinterest] SKIP (credenciais ausentes)")
         return "skipped:no_pinterest_creds"
 
     url = f"{PIN_API_BASE}/ad_accounts/{PIN_AD_ACCOUNT_ID}/events"
     if PIN_TEST_MODE:
         url += "?test=true"
 
-    # Sanitizações mínimas para tipagem correta
-    safe_content_ids = [str(cid) for cid in (content_ids or [])]
-    safe_contents = []
+    # >>> Converte value e item_price para STRING conforme o schema oficial
+    value_str = f"{float(value):.2f}"  # '0.00', '12.34' etc.
+    contents_norm = []
     for c in (contents_payload or []):
-        qty = c.get("quantity", 1)
-        try:
-            qty = int(qty)
-        except Exception:
-            qty = 1
-        item_price = c.get("item_price", 0)
-        try:
-            item_price = float(item_price)
-        except Exception:
-            item_price = 0.0
-        safe_contents.append({"quantity": qty, "item_price": item_price})
+        qty = int(c.get("quantity", 1) or 1)
+        # se já vier item_price, usa; senão assume 0.00
+        price = c.get("item_price", 0.0)
+        price_str = f"{float(price):.2f}"  # string
+        item = {"quantity": qty, "item_price": price_str}
+        # opcional: se tiver um id de produto, envie também
+        if "id" in c and c["id"]:
+            item["id"] = str(c["id"])
+        contents_norm.append(item)
 
     payload = {
         "data": [{
-            "event_name": event_name,                   # ex: "view_item", "add_to_cart"
+            "event_name": event_name,        # ex.: 'view_item', 'add_to_cart'
             "action_source": "web",
-            "event_time": int(ts),                      # <<<<<<<<<<<<<< INTEIRO (CORRIGIDO)
-            "event_id": event_id,
+            "event_time": int(ts),           # integer seconds
+            "event_id": event_id,            # string
             "event_source_url": page_url,
             "user_data": {
                 "client_ip_address": ip,
                 "client_user_agent": user_agent
+                # (se quiser, pode incluir em/hashed_maids/etc. depois)
             },
             "custom_data": {
-                "currency": str(currency or "BRL"),     # string
-                "value": float(value or 0.0),           # número
-                "content_ids": safe_content_ids,        # lista[str]
-                "contents": safe_contents               # lista[{quantity:int, item_price:number}]
+                "currency": currency,        # string, ex.: 'BRL'
+                "value": value_str,          # string, ex.: '0.00'
+                "content_ids": [str(cid) for cid in (content_ids or [])],
+                "contents": contents_norm    # item_price(string), quantity(int)
             }
         }]}
     headers = {
@@ -762,19 +761,17 @@ def send_pinterest_event(
 
     try:
         resp = session.post(url, headers=headers, json=payload, timeout=8)
-        body = {}
+        ok = resp.status_code < 400
+        # LOG detalhado no servidor (sempre printa)
         try:
             body = resp.json()
         except Exception:
-            body = {"_raw": resp.text[:500]}
-        if resp.status_code < 400:
-            print(f"[pinterest.{event_name}] OK status={resp.status_code} body={json.dumps(body, ensure_ascii=False)}")
-            return "ok"
-        else:
-            print(f"[pinterest.{event_name}] ERRO status={resp.status_code} body={json.dumps(body, ensure_ascii=False)}")
-            return f"error:{resp.status_code}"
+            body = resp.text
+        print(f"[pinterest.{event_name}] {'OK' if ok else 'ERRO'} "
+              f"status={resp.status_code} body={body}")
+        return "ok" if ok else f"error:{resp.status_code}"
     except Exception as e:
-        print(f"[pinterest.{event_name}] EXC {type(e).__name__}: {e}")
+        print("[pinterest] exceção:", e)
         return "error"
 
 
@@ -1316,4 +1313,5 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
+
 
