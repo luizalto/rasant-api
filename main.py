@@ -1,13 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI) + TikTok Events API
+FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI) + TikTok Events API + Pinterest Conversions API
 (versão consolidada) — UTMContent / UTMContent01 / UTMNumered com Janela Deslizante (1000) e Monotonicidade
-
-Reforços implementados:
-- Geração de UTM numerado SEM duplicação, com janela deslizante de N=1000 últimos IDs em Redis (lista + set capados).
-- Guard de monotonicidade local + realinhamento do contador no startup a partir do último número visto.
-- Correção: carregamento do XGBoost duplicado removido.
-- Correção: cookies via response.set_cookie (um header por cookie).
 """
 
 import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
@@ -64,6 +58,12 @@ TIKTOK_ACCESS_TOKEN   = os.getenv("TIKTOK_ACCESS_TOKEN", "")
 TIKTOK_API_BASE       = os.getenv("TIKTOK_API_BASE", "https://business-api.tiktok.com/open_api")
 TIKTOK_API_TRACK_URL  = f"{TIKTOK_API_BASE}/v1.3/pixel/track/"
 
+# Pinterest Conversions API (NOVO)
+PIN_AD_ACCOUNT_ID     = os.getenv("PIN_AD_ACCOUNT_ID", "")
+PIN_ACCESS_TOKEN      = os.getenv("PIN_ACCESS_TOKEN", "")
+PIN_TEST_MODE         = os.getenv("PIN_TEST_MODE", "0").lower() in ("1", "true", "yes", "on")
+PIN_API_BASE          = "https://api.pinterest.com/v5"
+
 # Seleção de modelo (server)
 SERVING_MODE_ENV      = (os.getenv("SERVING_MODE", "auto") or "auto").strip().lower()  # auto|cb|rf|xgb|stack
 
@@ -86,7 +86,7 @@ MODEL_STACK_PATH     = os.path.join(MODELS_DIR, "stack_model.joblib")
 STACK_META_PATH      = os.path.join(MODELS_DIR, "stack_meta.json")
 
 # ===================== App / Clients =====================
-app = FastAPI(title="Shopee UTM → ShortLink + Geo + Predict (Multi-Model) + CAPI + TikTok")
+app = FastAPI(title="Shopee UTM → ShortLink + Geo + Predict (Multi-Model) + CAPI + TikTok + Pinterest")
 
 # Redis
 r = redis.from_url(REDIS_URL)
@@ -140,7 +140,6 @@ def _is_allowed_long(domain: str) -> bool:
     return apex_ok or suf_ok
 
 def _resolve_short_follow(url: str) -> str:
-    """Mantido para compatibilidade; só será usado se SKIP_RESOLVE=0."""
     try:
         resp = session.head(url, allow_redirects=True, timeout=DEFAULT_TIMEOUT)
         final_url = resp.url
@@ -204,28 +203,19 @@ _buffer_rows: List[List[str]] = []
 _last_flush_ts = time.time()
 
 CSV_HEADERS = [
-    # tempos e request
     "timestamp","iso_time","ip","user_agent","referrer",
-    # urls
     "short_link_in","resolved_url","final_url","category",
-    # utm
     "utm_original","utm_original_01","subid_base","subid_full","utm_numbered","fbclid","fbp","fbc",
-    # device
     "device_name","os_family","os_version",
-    # geo
     "geo_status","geo_country","geo_region","geo_state","geo_city","geo_zip","geo_lat","geo_lon","geo_isp","geo_org","geo_asn",
-    # features básicas calculadas
     "part_of_day","hour","dow","ref_domain","os_version_num","is_android","is_ios",
-    # predição (do modo ativo)
     "pred_label","p_comprou","p_quase","p_desinteressado",
-    # thresholds (do modo ativo) e flags
     "thr_qvc","thr_atc","is_qvc","is_atc",
-    # métricas derivadas (modo ativo)
     "pcomprou_pct","thr_qvc_pct","thr_atc_pct","gap_qvc","gap_atc","pct_of_atc",
-    # eventos meta
     "meta_event_sent","meta_view_sent",
-    # eventos tiktok
-    "tiktok_event_sent","tiktok_view_sent"
+    "tiktok_event_sent","tiktok_view_sent",
+    # NOVO:
+    "pinterest_event_sent","pinterest_view_sent"
 ]
 
 # ===================== Utils =====================
@@ -236,7 +226,6 @@ def incr_counter_raw() -> int:
     val, _ = pipe.execute()
     return int(val)
 
-# Guard de monotonicidade local + realinhamento em startup
 _last_seen = {"v": 0}
 _last_lock = threading.Lock()
 
@@ -244,14 +233,12 @@ def incr_counter_monotonic() -> int:
     n = incr_counter_raw()
     with _last_lock:
         if n <= _last_seen["v"]:
-            # sobe até ficar acima do maior visto por ESTE processo
             delta = (_last_seen["v"] + 1) - n
             n = int(r.incrby(COUNTER_KEY, delta))
         _last_seen["v"] = n
     return n
 
 def _parse_tail_number(utm: str) -> Optional[int]:
-    # pega o que vem após a ÚLTIMA letra 'N'
     if not utm:
         return None
     i = utm.rfind('N')
@@ -261,9 +248,7 @@ def _parse_tail_number(utm: str) -> Optional[int]:
     return int(tail) if tail.isdigit() else None
 
 def _realign_counter_from_recent_window():
-    """Se o Redis reiniciar e o COUNTER_KEY voltar baixo, alinhe ao maior visto na janela."""
     try:
-        # lê alguns do topo e de posições mais profundas para garantir
         recent = r.lrange(UTM_RECENT_LIST_KEY, 0, min(UTM_RECENT_MAX-1, 200))
         max_n = 0
         for utm in (recent or []):
@@ -331,42 +316,29 @@ def extract_utm_content_from_url(u: str) -> str:
     except:
         return ""
 
-# ===== Normalizador de UTM =====
 _URL_CUT_RE = re.compile(r'(https?:\/\/|www\.|[a-z0-9-]+\.(?:com|br|net|org)(?:\/|$))', re.I)
 
 def _normalize_utm_content(raw: str) -> Tuple[str, str]:
-    """
-    Retorna (UTMContent, UTMContent01).
-    - Corta qualquer URL/host que apareça no valor.
-    - Mantém apenas [A-Za-z0-9-].
-    - Suporta sufixo '-A\\d+' para compor o UTMContent01.
-    """
     s = (raw or "").strip()
-
     m = _URL_CUT_RE.search(s)
     if m:
         s = s[:m.start()]
     idx_http = s.lower().find("http")
     if idx_http != -1:
         s = s[:idx_http]
-
     s = re.sub(r'^[\s\-_]+|[\s\-_]+$', '', s)
     s = re.sub(r'[^A-Za-z0-9\-]+', '', s)
     s = re.sub(r'-{2,}', '-', s)
-
     m2 = re.match(r'^(?P<base>[A-Za-z0-9\-]*?)(?:-?(?P<suf>A\d+))?$', s)
     if not m2:
         return s, ""
-
     base = (m2.group("base") or "").strip("-")
     suf  = m2.group("suf") or ""
-
     utm_content    = base
     utm_content_01 = f"{base}-{suf}" if suf else ""
     return utm_content, utm_content_01
 
 def resolve_short_link(short_url: str) -> Tuple[str, Dict[str, Optional[str]]]:
-    """Mantido para compatibilidade; hoje não usamos se SKIP_RESOLVE=1."""
     current = short_url
     final_url = short_url
     subids = {}
@@ -380,7 +352,6 @@ def resolve_short_link(short_url: str) -> Tuple[str, Dict[str, Optional[str]]]:
         pass
     return final_url, subids
 
-# Shopee short-link
 _SUBID_MAXLEN = int(os.getenv("SHOPEE_SUBID_MAXLEN", "50"))
 _SUBID_REGEX  = re.compile(r"[^A-Za-z0-9]")
 def sanitize_subid_for_shopee(value: str) -> str:
@@ -448,16 +419,15 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
         print("[geo_lookup] erro:", e)
         return {"geo_status":"fail"}
 
-# ===================== Multi-Model: estado global =====================
+# ===================== Multi-Model ... (mesmo que antes) =====================
 _cb_model = None
 _rf_model = None
 _xgb_model = None
 _stack_model = None  # LogisticRegression
 
-_stack_features: List[str] = []  # ordem esperada p/ stack
+_stack_features: List[str] = []
 _loaded_libs = {"catboost": False, "xgboost": False}
 
-# meta / features / thresholds
 _FEATURE_NAMES_FROM_META: List[str] = []
 _CAT_IDX_FROM_META: List[int] = []
 _TE_STATS = None
@@ -472,9 +442,8 @@ _thresholds_cb    = {"qvc_mid": 0.5, "atc_high": 0.5}
 _thresholds_rf    = None
 _thresholds_xgb   = None
 
-_current_mode = SERVING_MODE_ENV  # "auto" | "cb" | "rf" | "xgb" | "stack"
+_current_mode = SERVING_MODE_ENV
 
-# ===================== TE helpers =====================
 def _load_te_if_available():
     global _TE_STATS, _TE_PRIORS
     if os.path.exists(TE_STATS_PATH):
@@ -496,7 +465,6 @@ def _apply_te(colname: str, value: str) -> Tuple[float,float]:
         return float(rec.get("count", 0.0)), float(rec.get("buy_rate", prior))
     return 0.0, prior
 
-# ===================== feature builders =====================
 def _norm_text(s: str) -> str:
     import unicodedata
     s = (s or "").strip().lower()
@@ -596,7 +564,6 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
     device_city_combo   = (f"{device_bucket}__{geo_city}").lower()
     utm_partofday_combo = (f"{utm_original}__{part_of_day}").lower()
 
-    # TE encoders — sempre usando utm_original (base)
     utm_n,  utm_br  = _apply_te("utm_original", str(utm_original or ""))
     ref_n,  ref_br  = _apply_te("ref_domain",   str(ref_domain))
     devb_n, devb_br = _apply_te("device_bucket",str(device_bucket))
@@ -617,16 +584,8 @@ def _features_full_dict(os_family, device_name, os_version, referrer, utm_origin
         "city_n": float(city_n), "city_br": float(city_br),
     }
 
-# ===================== loaders =====================
+# ======= (load models) =======
 def _load_models_if_available():
-    """
-    Carrega todos os artefatos disponíveis e prepara:
-      - CatBoost (cb)
-      - RandomForest (rf)
-      - XGBoost (xgb)
-      - Stack (LogReg + stack_meta)
-      - Meta (features, thresholds, TE)
-    """
     global _cb_model, _rf_model, _xgb_model, _stack_model, _stack_features
     global _FEATURE_NAMES_FROM_META, _CAT_IDX_FROM_META
     global _POS_LABEL_NAME, _POS_LABEL_ID, _POS_IDX
@@ -719,7 +678,7 @@ def _load_models_if_available():
         except Exception as e:
             print("[RF] erro ao carregar:", e)
 
-    # XGB (removido duplicado)
+    # XGB
     _xgb_model = None
     try:
         if os.path.exists(MODEL_XGB_PATH):
@@ -763,21 +722,13 @@ def _load_models_if_available():
     print(f"[meta] n_features={len(_FEATURE_NAMES_FROM_META)} cat_idx={_CAT_IDX_FROM_META} pos_id={_POS_LABEL_ID} pos_idx={_POS_IDX}")
     print(f"[thr] stack={_thresholds_stack} cb={_thresholds_cb} rf={_thresholds_rf} xgb={_thresholds_xgb} TE={'yes' if _TE_STATS else 'no'}")
 
-# ======== UTM numerado: Janela deslizante (lista+set) e unicidade ========
+# ======== UTM numerado ========
 def _window_add_and_trim(utm_value: str):
-    """
-    Adiciona o UTM no topo da lista e garante tamanho máximo;
-    se estourar, remove o último e também tira do set.
-    """
     pipe = r.pipeline()
-    # adiciona na lista (topo) e garante tamanho
     pipe.lpush(UTM_RECENT_LIST_KEY, utm_value)
     pipe.ltrim(UTM_RECENT_LIST_KEY, 0, UTM_RECENT_MAX - 1)
     pipe.execute()
-
-    # checa se ultrapassou e remove o extra do set
     try:
-        # se a lista estiver maior (condição de corrida), faça RPOP uma vez
         llen = r.llen(UTM_RECENT_LIST_KEY)
         if llen and llen > UTM_RECENT_MAX:
             popped = r.rpop(UTM_RECENT_LIST_KEY)
@@ -791,29 +742,18 @@ def _window_add_and_trim(utm_value: str):
         pass
 
 def next_unique_numbered(seed_clean_for_numbered: str) -> str:
-    """
-    Gera um UTM numerado único, garantindo que NÃO esteja no set de últimos N.
-    - Se colidir, tenta novamente.
-    - Ao aceitar, adiciona na janela (lista+set), capando a 1000 e removendo o mais antigo do set.
-    """
     attempts = 0
     while attempts < 12:
         attempts += 1
         n = incr_counter_monotonic()
         utm = f"{seed_clean_for_numbered}N{n}"
-
-        # SADD retorna 1 se adicionou (não existia), 0 se já existia
         try:
             added = r.sadd(UTM_RECENT_SET_KEY, utm)
         except Exception:
-            # se falhar, segue em frente com utm gerado (melhor do que travar)
             added = 1
-
         if added == 1:
             _window_add_and_trim(utm)
             return utm
-        # se já existia, tenta de novo (gera outro n)
-    # fallback: pula o contador para escapar de colisão persistente
     try:
         jump = random.randint(10, 1000)
         r.incrby(COUNTER_KEY, jump)
@@ -828,10 +768,9 @@ def next_unique_numbered(seed_clean_for_numbered: str) -> str:
     _window_add_and_trim(utm)
     return utm
 
-# Realinha contador no startup baseado na janela recente
 _realign_counter_from_recent_window()
 
-# ===================== Predição helpers =====================
+# ===================== Predição helpers (idem original) =====================
 def _rf_xgb_feature_vector_from(feats_dict: Dict[str, Any]) -> List[float]:
     cols = ["hour","dow","is_weekend","os_version_num","is_android","is_ios",
             "utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br"]
@@ -883,13 +822,9 @@ def _xgb_predict_proba(feats_dict: Dict[str, Any]) -> Optional[float]:
     try:
         import numpy as np
         X_np = np.asarray([_rf_xgb_feature_vector_from(feats_dict)], dtype=float)
-
-        # Caso 1: wrapper sklearn (XGBClassifier)
         if hasattr(_xgb_model, "predict_proba"):
             proba = _xgb_model.predict_proba(X_np)[0]
             return float(proba[1]) if len(proba) >= 2 else None
-
-        # Caso 2: Booster puro
         import xgboost as xgb
         dmat = xgb.DMatrix(X_np)
         p = _xgb_model.predict(dmat)
@@ -1031,7 +966,66 @@ def send_tiktok_event(
         print("[tiktok] exceção:", e)
         return "error"
 
-# ===================== GCS flush =====================
+# ===================== Pinterest helper (NOVO) =====================
+def send_pinterest_event(
+    event_name: str,
+    event_id: str,
+    ts: int,
+    page_url: str,
+    ip: str,
+    user_agent: str,
+    currency: str,
+    value: float,
+    content_ids: List[str],
+    contents_payload: List[Dict[str, Any]],
+) -> str:
+    """
+    Envia evento server-side para a API de Conversões do Pinterest.
+    Nomes sugeridos:
+      - view_item  (visualização)
+      - add_to_cart (conversão 'ATC' lógica)
+    """
+    if not (PIN_AD_ACCOUNT_ID and PIN_ACCESS_TOKEN):
+        return "skipped:no_pinterest_creds"
+
+    url = f"{PIN_API_BASE}/ad_accounts/{PIN_AD_ACCOUNT_ID}/events"
+    if PIN_TEST_MODE:
+        url += "?test=true"
+
+    payload = {
+        "data": [{
+            "event_name": event_name,
+            "action_source": "web",
+            "event_time": ts,
+            "event_id": event_id,
+            "event_source_url": page_url,
+            "user_data": {
+                "client_ip_address": ip,
+                "client_user_agent": user_agent
+                # (ganchos para em/ph/external_id/hashed_maids se quiser incluir depois)
+            },
+            "custom_data": {
+                "currency": currency,
+                "value": float(value),
+                "content_ids": content_ids,
+                "contents": [{"quantity": c.get("quantity", 1), "item_price": c.get("item_price", 0)} for c in contents_payload] if contents_payload else []
+            }
+        }]}
+    headers = {
+        "Authorization": f"Bearer {PIN_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        resp = session.post(url, headers=headers, json=payload, timeout=8)
+        if resp.status_code < 400:
+            return "ok"
+        return f"error:{resp.status_code}"
+    except Exception as e:
+        print("[pinterest] exceção:", e)
+        return "error"
+
+# ===================== GCS flush etc. (igual ao original) =====================
 def _day_key(ts: int) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts))
 
@@ -1117,19 +1111,13 @@ def robots():
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def home():
-    """
-    Página inicial institucional p/ aprovação (Pinterest/afins).
-    Serve o arquivo index.html da raiz do projeto.
-    """
     try:
         index_path = os.path.join(BASE_DIR, "index.html")
         with open(index_path, "r", encoding="utf-8") as f:
             html = f.read()
-        # Cache leve só para reduzir latência, sem atrapalhar updates
         headers = {"Cache-Control": "public, max-age=3600"}
         return HTMLResponse(content=html, status_code=200, headers=headers)
     except FileNotFoundError:
-        # Fallback seguro caso o arquivo não esteja no container
         return HTMLResponse(
             content="""
             <!doctype html><meta charset="utf-8">
@@ -1142,7 +1130,6 @@ def home():
             """,
             status_code=200
         )
-
 
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy():
@@ -1175,7 +1162,6 @@ def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str,
 # ===================== Handler principal =====================
 @app.get("/{full_path:path}")
 def track_number_and_redirect(request: Request, full_path: str = Path(...), cat: Optional[str] = Query(None), mode: Optional[str] = Query(None)):
-    # Interpretação da URL de entrada (sem resolver short, por padrão)
     try:
         incoming_url, in_mode = _build_incoming_from_request(request, full_path)
     except HTTPException as he:
@@ -1193,12 +1179,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     device_name, os_family, os_version = parse_device_info(user_agent)
 
     parts_in = urlsplit(incoming_url)
-
-    if SKIP_RESOLVE:
-        resolved_url = _fix_scheme(incoming_url)
-    else:
-        resolved_url = _resolve_short_follow(incoming_url) if _is_short_domain(parts_in.netloc) else _fix_scheme(incoming_url)
-
+    resolved_url = _fix_scheme(incoming_url) if SKIP_RESOLVE else (_resolve_short_follow(incoming_url) if _is_short_domain(parts_in.netloc) else _fix_scheme(incoming_url))
     parts_res = urlsplit(resolved_url)
     if not parts_res.scheme or not parts_res.netloc:
         return JSONResponse({"ok": False, "error": f"URL inválida: {resolved_url}"}, status_code=400)
@@ -1209,13 +1190,9 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     outer_uc = request.query_params.get("uc")
     if not outer_uc:
         return JSONResponse({"ok": False, "error": "utm_missing_uc"}, status_code=400)
-
     utm_original, utm_original_01 = _normalize_utm_content(outer_uc)
-
     seed_for_numbering = (utm_original_01 or utm_original)
     seed_clean_for_numbered = re.sub(r'[^A-Za-z0-9\-]', '', seed_for_numbering) or "n"
-
-    # >>> GERAÇÃO ÚNICA COM JANELA DESLIZANTE (cap 1000)
     utm_numbered = next_unique_numbered(seed_clean_for_numbered)
 
     origin_url = _set_utm_content_preserving_order(resolved_url, utm_numbered)
@@ -1223,9 +1200,9 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     # ===== content_ids / contents =====
     content_ids, contents_payload = _build_content_identifiers(origin_url)
 
-    # ===== Short oficial (sempre) — subId3 = UTMNumered (sanitizado) =====
+    # ===== Short oficial (sempre) — subId3 = UTMNumered
     sub_id_api = sanitize_subid_for_shopee(utm_numbered) or "na"
-    dest = generate_short_link(origin_url, sub_id_api)  # se falhar, 502
+    dest = generate_short_link(origin_url, sub_id_api)
 
     # ===== Cookies / IDs persistentes =====
     fbp_cookie = get_cookie_value(cookie_header, "_fbp") or _gen_fbp(ts)
@@ -1238,11 +1215,11 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         "ip": ip_addr, "ua": user_agent, "referrer": referrer,
         "event_source_url": origin_url, "short_link": dest,
         "vc_time": ts,
-        "utm_original": utm_original,           # UTMContent (base)
-        "utm_original_01": utm_original_01,     # UTMContent01 (com -A.. ou vazio)
+        "utm_original": utm_original,
+        "utm_original_01": utm_original_01,
         "subid_base": utm_original,
         "subid_full": (utm_original_01 or utm_original),
-        "utm_numbered": utm_numbered,           # UTMNumered (aplicado em utm_content e subId3)
+        "utm_numbered": utm_numbered,
         "fbclid": fbclid, "fbp": fbp_cookie, "fbc": fbc_cookie, "eid": eid_cookie, "mode": in_mode
     }, ensure_ascii=False))
 
@@ -1262,29 +1239,21 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 
     # ===== Predições =====
     p_cb_map, p_avail = _compute_all_probs(feats_dict)
-    p_cb  = p_avail.get("cb")
-    p_rf  = p_avail.get("rf")
-    p_xgb = p_avail.get("xgb")
-    p_stack = p_avail.get("stack")
-
+    p_cb  = p_avail.get("cb"); p_rf  = p_avail.get("rf"); p_xgb = p_avail.get("xgb"); p_stack = p_avail.get("stack")
     forced_mode = (mode or "").strip().lower() if mode else None
     active_mode = _choose_active_mode(forced_mode, p_avail)
 
     if active_mode == "stack" and p_stack is not None:
-        p_c = float(p_stack)
-        thr_q, thr_a = _thresholds_for_mode("stack")
+        p_c = float(p_stack);  thr_q, thr_a = _thresholds_for_mode("stack")
         p_map = {"comprou": p_c, "quase": 0.0, "desinteressado": 1.0 - p_c}
     elif active_mode == "cb" and p_cb is not None:
-        p_c = float(p_cb)
-        thr_q, thr_a = _thresholds_for_mode("cb")
+        p_c = float(p_cb);     thr_q, thr_a = _thresholds_for_mode("cb")
         p_map = {"comprou": p_c, "quase": float(p_cb_map.get("quase", 0.0)), "desinteressado": float(p_cb_map.get("desinteressado", 1.0 - p_c))}
     elif active_mode == "xgb" and p_xgb is not None:
-        p_c = float(p_xgb)
-        thr_q, thr_a = _thresholds_for_mode("xgb")
+        p_c = float(p_xgb);    thr_q, thr_a = _thresholds_for_mode("xgb")
         p_map = {"comprou": p_c, "quase": 0.0, "desinteressado": 1.0 - p_c}
     elif active_mode == "rf" and p_rf is not None:
-        p_c = float(p_rf)
-        thr_q, thr_a = _thresholds_for_mode("rf")
+        p_c = float(p_rf);     thr_q, thr_a = _thresholds_for_mode("rf")
         p_map = {"comprou": p_c, "quase": 0.0, "desinteressado": 1.0 - p_c}
     else:
         p_c, thr_q, thr_a = 0.0, 0.5, 0.5
@@ -1296,8 +1265,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     pred_label = f"{'comprou' if is_atc_flag else ('comprou_qvc' if is_qvc_flag else 'desinteressado')}"
 
     # ===== Meta: ViewContent =====
-    meta_sent = ""
-    meta_view = ""
+    meta_sent = ""; meta_view = ""
     if META_PIXEL_ID and META_ACCESS_TOKEN:
         vc_payload = {
             "data": [{
@@ -1326,7 +1294,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             print("[meta] VC exceção:", e)
             meta_view = "error"
 
-    # ===== TikTok: ViewContent =====
+    # ===== TikTok: ViewContent (mantém) =====
     tiktok_view = ""
     try:
         tiktok_view = send_tiktok_event(
@@ -1346,7 +1314,26 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         print("[tiktok] VC exceção:", e)
         tiktok_view = "error"
 
-    # ===== Meta: AddToCart =====
+    # ===== Pinterest: view_item (NOVO) =====
+    pinterest_view = ""
+    try:
+        pinterest_view = send_pinterest_event(
+            event_name="view_item",
+            event_id=utm_numbered,
+            ts=ts,
+            page_url=origin_url,
+            ip=ip_addr,
+            user_agent=user_agent,
+            currency="BRL",
+            value=0.0,
+            content_ids=content_ids,
+            contents_payload=contents_payload
+        )
+    except Exception as e:
+        print("[pinterest] view exceção:", e)
+        pinterest_view = "error"
+
+    # ===== Meta: AddToCart (quando ATC flag) =====
     if META_PIXEL_ID and META_ACCESS_TOKEN and is_atc_flag == 1:
         atc_payload = {
             "data": [{
@@ -1377,12 +1364,12 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     else:
         meta_sent = ""
 
-    # ===== TikTok: CompletePayment =====
+    # ===== TikTok: AddToCart (CORRIGIDO) =====
     tiktok_sent = ""
     if is_atc_flag == 1:
         try:
             tiktok_sent = send_tiktok_event(
-                event_name="CompletePayment",
+                event_name="AddToCart",  # << mudou de CompletePayment/AddPaymentInfo para AddToCart
                 event_id=utm_numbered,
                 ts=ts,
                 page_url=origin_url,
@@ -1395,8 +1382,28 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                 contents_payload=contents_payload,
             )
         except Exception as e:
-            print("[tiktok] Purchase exceção:", e)
+            print("[tiktok] AddToCart exceção:", e)
             tiktok_sent = "error"
+
+    # ===== Pinterest: add_to_cart (NOVO) =====
+    pinterest_sent = ""
+    if is_atc_flag == 1:
+        try:
+            pinterest_sent = send_pinterest_event(
+                event_name="add_to_cart",
+                event_id=utm_numbered,
+                ts=ts,
+                page_url=origin_url,
+                ip=ip_addr,
+                user_agent=user_agent,
+                currency="BRL",
+                value=0.0,
+                content_ids=content_ids,
+                contents_payload=contents_payload
+            )
+        except Exception as e:
+            print("[pinterest] add_to_cart exceção:", e)
+            pinterest_sent = "error"
 
     # ===== Log CSV =====
     hour_log = _extract_hour_from_iso_for_log(iso_time)
@@ -1427,19 +1434,21 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         float(thr_q), float(thr_a), int(is_qvc_flag), int(is_atc_flag),
         pcomprou_pct, thr_qvc_pct, thr_atc_pct, gap_qvc, gap_atc, pct_of_atc,
         meta_sent, meta_view,
-        tiktok_sent, tiktok_view
+        tiktok_sent, tiktok_view,
+        # NOVO
+        pinterest_sent, pinterest_view
     ]
     with _buffer_lock:
         _buffer_rows.append(csv_row)
 
-    # ===== Redirect + cookies corretos =====
+    # ===== Redirect + cookies =====
     resp = RedirectResponse(dest, status_code=302)
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     resp.set_cookie("_fbp", fbp_cookie, max_age=63072000, path="/", samesite="lax")
     resp.set_cookie("_fbc", fbc_cookie, max_age=63072000, path="/", samesite="lax")
     resp.set_cookie("_eid", eid_cookie, max_age=63072000, path="/", samesite="lax")
 
-    # Pinterest: devolver HTML com refresh (mantendo cookies já setados)
+    # Pinterest UA: devolver HTML com refresh (mantido)
     if "pinterest" in (user_agent or "").lower():
         html = f"""<!doctype html>
 <html><head>
@@ -1454,7 +1463,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 
     return resp
 
-# ===================== Admin =====================
+# ===================== Admin (igual ao original) =====================
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page():
     return """
@@ -1671,4 +1680,3 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
-
