@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK) + Meta Ads (CAPI) + TikTok Events API + Pinterest Conversions API
+FastAPI – Shopee ShortLink + Redis + GCS + Geo (IP) + Predição (CatBoost/RF/XGB/STACK)
++ Meta Ads (CAPI) + TikTok Events API + Pinterest Conversions API
 (versão consolidada) — UTMContent / UTMContent01 / UTMNumered com Janela Deslizante (1000) e Monotonicidade
 """
 
-import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random
+import os, re, time, csv, io, threading, urllib.parse, atexit, hashlib, json, random, ipaddress
 from typing import Optional, Dict, Tuple, List, Any
 
 import requests
@@ -58,7 +59,7 @@ TIKTOK_ACCESS_TOKEN   = os.getenv("TIKTOK_ACCESS_TOKEN", "")
 TIKTOK_API_BASE       = os.getenv("TIKTOK_API_BASE", "https://business-api.tiktok.com/open_api")
 TIKTOK_API_TRACK_URL  = f"{TIKTOK_API_BASE}/v1.3/pixel/track/"
 
-# Pinterest Conversions API (NOVO)
+# Pinterest Conversions API
 PIN_AD_ACCOUNT_ID     = os.getenv("PIN_AD_ACCOUNT_ID", "")
 PIN_ACCESS_TOKEN      = os.getenv("PIN_ACCESS_TOKEN", "")
 PIN_TEST_MODE         = os.getenv("PIN_TEST_MODE", "0").lower() in ("1", "true", "yes", "on")
@@ -188,7 +189,6 @@ def _build_content_identifiers(origin_url: str) -> Tuple[List[str], List[Dict[st
         parts = urlsplit(origin_url)
         base = (parts.path or "/") + ("?" + parts.query if parts.query else "")
         cid  = _sha256_lower(base)[:16]
-    # contents genérico (Meta-like). Vamos normalizar por plataforma depois.
     return [cid], [{"id": cid, "quantity": 1}]
 
 # ===================== AM / IDs =====================
@@ -219,12 +219,6 @@ CSV_HEADERS = [
 ]
 
 # ===================== Utils =====================
-def _log_send(label: str, status: int, text: str):
-    ok = status < 400
-    msg = f"[{label}] {'OK' if ok else 'ERRO'} status={status} body={(text or '')[:500]}"
-    print(msg)
-    return "ok" if ok else f"error:{status}"
-
 def incr_counter_raw() -> int:
     pipe = r.pipeline()
     pipe.incr(COUNTER_KEY)
@@ -390,11 +384,23 @@ def generate_short_link(origin_url: str, utm_content_for_api: str) -> str:
         raise HTTPException(status_code=502, detail=f"shortlink_error: {j}")
     return short
 
-# ===================== Geo por IP =====================
+# ===================== Geo por IP (robusto) =====================
+def _is_private_ip(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip).is_private or ip in ("127.0.0.1", "::1")
+    except Exception:
+        return True
+
 IPAPI_FIELDS = "status,country,region,regionName,city,zip,lat,lon,isp,org,as,query"
+
 def geo_lookup(ip: str) -> Dict[str, Any]:
-    if not ip:
-        return {"geo_status":"fail"}
+    if not ip or _is_private_ip(ip):
+        return {
+            "geo_status": "skip",
+            "geo_country": None, "geo_state": None, "geo_region": None, "geo_city": None,
+            "geo_zip": None, "geo_lat": None, "geo_lon": None,
+            "geo_isp": None, "geo_org": None, "geo_asn": None,
+        }
     cache_key = f"{GEO_CACHE_PREFIX}{ip}"
     try:
         cached = r.get(cache_key)
@@ -402,9 +408,22 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
             return json.loads(cached)
     except Exception:
         pass
+    url = f"http://ip-api.com/json/{ip}?fields={IPAPI_FIELDS}&lang=pt-BR"
     try:
-        url = f"http://ip-api.com/json/{ip}?fields={IPAPI_FIELDS}&lang=pt-BR"
         resp = session.get(url, timeout=5)
+        if resp.status_code != 200:
+            fail = {"geo_status": f"http_{resp.status_code}"}
+            try: r.setex(cache_key, 300, json.dumps(fail, ensure_ascii=False))
+            except Exception: pass
+            print(f"[geo_lookup] http={resp.status_code} ip={ip}")
+            return fail
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if "json" not in ctype:
+            fail = {"geo_status": "non_json"}
+            try: r.setex(cache_key, 300, json.dumps(fail, ensure_ascii=False))
+            except Exception: pass
+            print(f"[geo_lookup] non-json content-type='{ctype}' ip={ip}")
+            return fail
         data = resp.json()
         norm = {
             "geo_status": data.get("status","fail"),
@@ -419,13 +438,18 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
             "geo_org": data.get("org"),
             "geo_asn": data.get("as"),
         }
-        r.setex(cache_key, GEO_CACHE_TTL_SECONDS, json.dumps(norm, ensure_ascii=False))
+        ttl = GEO_CACHE_TTL_SECONDS if norm["geo_status"] == "success" else 300
+        try: r.setex(cache_key, ttl, json.dumps(norm, ensure_ascii=False))
+        except Exception: pass
         return norm
     except Exception as e:
-        print("[geo_lookup] erro:", e)
-        return {"geo_status":"fail"}
+        fail = {"geo_status": "error"}
+        try: r.setex(cache_key, 300, json.dumps(fail, ensure_ascii=False))
+        except Exception: pass
+        print(f"[geo_lookup] exceção: {e.__class__.__name__}")
+        return fail
 
-# ===================== Multi-Model ... (mesmo que antes) =====================
+# ===================== Predição helpers (idem original, sem mudanças funcionais) =====================
 _cb_model = None
 _rf_model = None
 _xgb_model = None
@@ -728,55 +752,6 @@ def _load_models_if_available():
     print(f"[meta] n_features={len(_FEATURE_NAMES_FROM_META)} cat_idx={_CAT_IDX_FROM_META} pos_id={_POS_LABEL_ID} pos_idx={_POS_IDX}")
     print(f"[thr] stack={_thresholds_stack} cb={_thresholds_cb} rf={_thresholds_rf} xgb={_thresholds_xgb} TE={'yes' if _TE_STATS else 'no'}")
 
-# ======== UTM numerado ========
-def _window_add_and_trim(utm_value: str):
-    pipe = r.pipeline()
-    pipe.lpush(UTM_RECENT_LIST_KEY, utm_value)
-    pipe.ltrim(UTM_RECENT_LIST_KEY, 0, UTM_RECENT_MAX - 1)
-    pipe.execute()
-    try:
-        llen = r.llen(UTM_RECENT_LIST_KEY)
-        if llen and llen > UTM_RECENT_MAX:
-            popped = r.rpop(UTM_RECENT_LIST_KEY)
-            if popped:
-                try:
-                    popped_str = popped.decode() if isinstance(popped, bytes) else popped
-                    r.srem(UTM_RECENT_SET_KEY, popped_str)
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-def next_unique_numbered(seed_clean_for_numbered: str) -> str:
-    attempts = 0
-    while attempts < 12:
-        attempts += 1
-        n = incr_counter_monotonic()
-        utm = f"{seed_clean_for_numbered}N{n}"
-        try:
-            added = r.sadd(UTM_RECENT_SET_KEY, utm)
-        except Exception:
-            added = 1
-        if added == 1:
-            _window_add_and_trim(utm)
-            return utm
-    try:
-        jump = random.randint(10, 1000)
-        r.incrby(COUNTER_KEY, jump)
-    except Exception:
-        pass
-    n = incr_counter_monotonic()
-    utm = f"{seed_clean_for_numbered}N{n}"
-    try:
-        r.sadd(UTM_RECENT_SET_KEY, utm)
-    except Exception:
-        pass
-    _window_add_and_trim(utm)
-    return utm
-
-_realign_counter_from_recent_window()
-
-# ===================== Predição helpers (idem original) =====================
 def _rf_xgb_feature_vector_from(feats_dict: Dict[str, Any]) -> List[float]:
     cols = ["hour","dow","is_weekend","os_version_num","is_android","is_ios",
             "utm_n","utm_br","ref_n","ref_br","devb_n","devb_br","city_n","city_br"]
@@ -925,184 +900,11 @@ def _compute_all_probs(feats_dict: Dict[str, Any]) -> Tuple[Dict[str,float], Dic
 
 _load_models_if_available()
 
-# ===================== Normalização de contents por plataforma =====================
-def _contents_for_meta(content_ids: List[str]) -> List[Dict[str, Any]]:
-    return [{"id": cid, "quantity": 1} for cid in content_ids]
-
-def _contents_for_tiktok_from_generic(generic_contents: List[Dict[str, Any]], content_ids: List[str]) -> List[Dict[str, Any]]:
-    out = []
-    for c in (generic_contents or []):
-        out.append({
-            "content_id": c.get("id") or (content_ids[0] if content_ids else None),
-            "quantity": c.get("quantity", 1),
-            "price": c.get("item_price", 0) or c.get("price", 0),
-        })
-    if not out and content_ids:
-        out = [{"content_id": content_ids[0], "quantity": 1, "price": 0}]
-    return out
-
-def _contents_for_pinterest_from_generic(generic_contents: List[Dict[str, Any]], content_ids: List[str]) -> List[Dict[str, Any]]:
-    # item_price precisa ser string; id precisa existir
-    out = []
-    if generic_contents:
-        for i, c in enumerate(generic_contents):
-            cid = c.get("id") or (content_ids[i] if i < len(content_ids) else (content_ids[0] if content_ids else None))
-            price = c.get("item_price", 0) or c.get("price", 0)
-            out.append({
-                "id": str(cid) if cid is not None else None,
-                "quantity": int(c.get("quantity", 1)),
-                "item_price": f"{float(price):.2f}",
-            })
-    else:
-        for cid in content_ids:
-            out.append({"id": str(cid), "quantity": 1, "item_price": "0.00"})
-    return out
-
-# ===================== TikTok helper (timestamp ISO-8601 string) =====================
-def send_tiktok_event(
-    event_name: str,
-    event_id: str,
-    ts_iso_utc: str,              # <-- ISO-8601 string exigido pelo TikTok
-    page_url: str,
-    ip: str,
-    user_agent: str,
-    ttclid: Optional[str],
-    currency: str,
-    value: float,
-    content_ids: List[str],
-    contents_payload_generic: List[Dict[str, Any]],
-) -> str:
-    if not (TIKTOK_PIXEL_ID and TIKTOK_ACCESS_TOKEN):
-        print("[tiktok] pulado: credenciais ausentes")
-        return "skipped:no_tiktok_creds"
-
-    tt_contents = _contents_for_tiktok_from_generic(contents_payload_generic, content_ids)
-
-    payload = {
-        "pixel_code": TIKTOK_PIXEL_ID,
-        "event": event_name,
-        "event_id": event_id,
-        "timestamp": ts_iso_utc,  # <-- string ISO-8601 (ex.: '2025-10-06T22:06:13Z')
-        "context": {
-            "ad": ({"callback": ttclid} if ttclid else {}),
-            "page": {"url": page_url},
-            "user": {"ip": ip, "user_agent": user_agent}
-        },
-        "properties": {
-            "currency": currency,
-            "value": float(value),
-            "content_type": "product",
-            "content_id": content_ids[0] if content_ids else None,
-            "contents": tt_contents,
-        }
-    }
-
-    headers = {"Content-Type": "application/json", "Access-Token": TIKTOK_ACCESS_TOKEN}
-
-    try:
-        resp = session.post(TIKTOK_API_TRACK_URL, headers=headers, json=payload, timeout=8)
-        return _log_send(f"tiktok.{event_name}", resp.status_code, resp.text)
-    except Exception as e:
-        print(f"[tiktok] exceção em {event_name}: {e}")
-        return "error"
-
-# ===================== Pinterest helper (value/item_price como strings) =====================
-def send_pinterest_event(
-    event_name: str,
-    event_id: str,
-    ts: int,                       # Pinterest aceita epoch int
-    page_url: str,
-    ip: str,
-    user_agent: str,
-    currency: str,
-    value: float,
-    content_ids: List[str],
-    contents_payload_generic: List[Dict[str, Any]],
-) -> str:
-    """
-    Envia evento server-side para a API de Conversões do Pinterest.
-    Nomes sugeridos:
-      - view_item
-      - add_to_cart
-    """
-    if not (PIN_AD_ACCOUNT_ID and PIN_ACCESS_TOKEN):
-        print("[pinterest] pulado: credenciais ausentes")
-        return "skipped:no_pinterest_creds"
-
-    url = f"{PIN_API_BASE}/ad_accounts/{PIN_AD_ACCOUNT_ID}/events"
-    if PIN_TEST_MODE:
-        url += "?test=true"
-
-    pin_contents = _contents_for_pinterest_from_generic(contents_payload_generic, content_ids)
-
-    payload = {
-        "data": [{
-            "event_name": event_name,
-            "action_source": "web",
-            "event_time": ts,  # epoch int
-            "event_id": event_id,
-            "event_source_url": page_url,
-            "user_data": {
-                "client_ip_address": ip,
-                "client_user_agent": user_agent
-            },
-            "custom_data": {
-                "currency": currency,
-                "value": f"{float(value):.2f}",           # <-- string
-                "content_ids": [str(x) for x in (content_ids or [])],
-                "contents": pin_contents                  # <-- item_price string + id garantido
-            }
-        }]}
-    headers = {
-        "Authorization": f"Bearer {PIN_ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-    try:
-        resp = session.post(url, headers=headers, json=payload, timeout=8)
-        return _log_send(f"pinterest.{event_name}", resp.status_code, resp.text)
-    except Exception as e:
-        print(f"[pinterest] exceção em {event_name}: {e}")
-        return "error"
-
-# ===================== GCS flush etc. (igual ao original) =====================
-def _day_key(ts: int) -> str:
-    return time.strftime("%Y-%m-%d", time.localtime(ts))
-
-def _gcs_object_name(ts: int, part: int) -> str:
-    d = _day_key(ts)
-    return f"{GCS_PREFIX}date={d}/clicks_{d}_part-{part:04d}.csv"
-
-def _flush_buffer_to_gcs() -> int:
-    global _buffer_rows, _last_flush_ts
-    if not _bucket:
-        return 0
-    with _buffer_lock:
-        rows = list(_buffer_rows)
-        if len(rows) == 0:
-            return 0
-        _buffer_rows = []
-        _last_flush_ts = time.time()
-    output = io.StringIO()
-    w = csv.writer(output)
-    w.writerow(CSV_HEADERS)
-    w.writerows(rows)
-    data = output.getvalue().encode("utf-8")
-    part = int(time.time() * 1000) % 10_000_000
-    blob_name = _gcs_object_name(int(time.time()), part)
-    _bucket.blob(blob_name).upload_from_string(data, content_type="text/csv")
-    print(f"[FLUSH] {len(rows)} linha(s) → gs://{GCS_BUCKET}/{blob_name}")
-    return len(rows)
-
-def _background_flusher():
-    while True:
-        try:
-            _flush_buffer_to_gcs()
-        except Exception as e:
-            print("[FLUSH-ERR]", e)
-        time.sleep(FLUSH_MAX_SECONDS)
-
-threading.Thread(target=_background_flusher, daemon=True).start()
+# ===================== Helpers de LOG =====================
+def _log_send(tag: str, status: int, body: str) -> str:
+    ok = "OK" if status < 400 else "ERRO"
+    print(f"[{tag}] {ok} status={status} body={body}")
+    return ("ok" if status < 400 else f"error:{status}")
 
 # ===================== Rotas =====================
 @app.get("/health")
@@ -1201,12 +1003,7 @@ def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str,
 
 # ===================== Handler principal =====================
 @app.get("/{full_path:path}")
-def track_number_and_redirect(
-    request: Request,
-    full_path: str = Path(...),
-    cat: Optional[str] = Query(None),
-    mode: Optional[str] = Query(None)
-):
+def track_number_and_redirect(request: Request, full_path: str = Path(...), cat: Optional[str] = Query(None), mode: Optional[str] = Query(None)):
     try:
         incoming_url, in_mode = _build_incoming_from_request(request, full_path)
     except HTTPException as he:
@@ -1214,7 +1011,7 @@ def track_number_and_redirect(
 
     ts = int(time.time())
     iso_time = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(ts))
-    # TikTok exige timestamp ISO-8601 em string (UTC):
+    # TikTok exige ISO-8601 UTC string
     ts_iso_utc = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     headers = request.headers
@@ -1227,9 +1024,7 @@ def track_number_and_redirect(
     device_name, os_family, os_version = parse_device_info(user_agent)
 
     parts_in = urlsplit(incoming_url)
-    resolved_url = _fix_scheme(incoming_url) if SKIP_RESOLVE else (
-        _resolve_short_follow(incoming_url) if _is_short_domain(parts_in.netloc) else _fix_scheme(incoming_url)
-    )
+    resolved_url = _fix_scheme(incoming_url) if SKIP_RESOLVE else (_resolve_short_follow(incoming_url) if _is_short_domain(parts_in.netloc) else _fix_scheme(incoming_url))
     parts_res = urlsplit(resolved_url)
     if not parts_res.scheme or not parts_res.netloc:
         return JSONResponse({"ok": False, "error": f"URL inválida: {resolved_url}"}, status_code=400)
@@ -1247,10 +1042,9 @@ def track_number_and_redirect(
 
     origin_url = _set_utm_content_preserving_order(resolved_url, utm_numbered)
 
-    # ===== content_ids / contents (genérico → mapearemos por plataforma)
+    # ===== content_ids / contents genérico
     content_ids, contents_payload_generic = _build_content_identifiers(origin_url)
 
-    # Normalizações por plataforma
     contents_meta = [{"id": cid, "quantity": 1} for cid in content_ids]
 
     def _contents_for_tiktok_from_generic(generic, ids):
@@ -1375,7 +1169,7 @@ def track_number_and_redirect(
             resp_vc = session.post(url, params=params, json=vc_payload, timeout=8)
             meta_view = _log_send("meta.ViewContent", resp_vc.status_code, resp_vc.text)
         except Exception as e:
-            print("[meta] exceção VC:", e)
+            print("[meta] VC exceção:", e)
             meta_view = "error"
     else:
         print("[meta] pulado: credenciais ausentes")
@@ -1419,7 +1213,7 @@ def track_number_and_redirect(
             "data": [{
                 "event_name": "view_item",
                 "action_source": "web",
-                "event_time": ts,  # epoch int permitido
+                "event_time": ts,
                 "event_id": utm_numbered,
                 "event_source_url": origin_url,
                 "user_data": {
@@ -1473,7 +1267,7 @@ def track_number_and_redirect(
             resp_atc = session.post(url, params=params, json=atc_payload, timeout=8)
             meta_sent = _log_send("meta.AddToCart", resp_atc.status_code, resp_atc.text)
         except Exception as e:
-            print("[meta] exceção ATC:", e)
+            print("[meta] ATC exceção:", e)
             meta_sent = "error"
     else:
         meta_sent = ""
@@ -1810,7 +1604,46 @@ def admin_counter(x_admin_token: str = Header(None)):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ===================== Flush no exit =====================
+# ===================== Flush GCS =====================
+def _day_key(ts: int) -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+def _gcs_object_name(ts: int, part: int) -> str:
+    d = _day_key(ts)
+    return f"{GCS_PREFIX}date={d}/clicks_{d}_part-{part:04d}.csv"
+
+def _flush_buffer_to_gcs() -> int:
+    global _buffer_rows, _last_flush_ts
+    if not _bucket:
+        return 0
+    with _buffer_lock:
+        rows = list(_buffer_rows)
+        if len(rows) == 0:
+            return 0
+        _buffer_rows = []
+        _last_flush_ts = time.time()
+    output = io.StringIO()
+    w = csv.writer(output)
+    w.writerow(CSV_HEADERS)
+    w.writerows(rows)
+    data = output.getvalue().encode("utf-8")
+    part = int(time.time() * 1000) % 10_000_000
+    blob_name = _gcs_object_name(int(time.time()), part)
+    _bucket.blob(blob_name).upload_from_string(data, content_type="text/csv")
+    print(f"[FLUSH] {len(rows)} linha(s) → gs://{GCS_BUCKET}/{blob_name}")
+    return len(rows)
+
+def _background_flusher():
+    while True:
+        try:
+            _flush_buffer_to_gcs()
+        except Exception as e:
+            print("[FLUSH-ERR]", e)
+        time.sleep(FLUSH_MAX_SECONDS)
+
+threading.Thread(target=_background_flusher, daemon=True).start()
+
+# ===================== Flush on exit =====================
 @atexit.register
 def _flush_on_exit():
     try:
@@ -1821,4 +1654,3 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
-
