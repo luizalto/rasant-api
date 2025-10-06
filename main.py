@@ -942,24 +942,27 @@ def _contents_for_tiktok_from_generic(generic_contents: List[Dict[str, Any]], co
     return out
 
 def _contents_for_pinterest_from_generic(generic_contents: List[Dict[str, Any]], content_ids: List[str]) -> List[Dict[str, Any]]:
+    # item_price precisa ser string; id precisa existir
     out = []
     if generic_contents:
         for i, c in enumerate(generic_contents):
+            cid = c.get("id") or (content_ids[i] if i < len(content_ids) else (content_ids[0] if content_ids else None))
+            price = c.get("item_price", 0) or c.get("price", 0)
             out.append({
-                "id": c.get("id") or (content_ids[i] if i < len(content_ids) else (content_ids[0] if content_ids else None)),
-                "quantity": c.get("quantity", 1),
-                "item_price": c.get("item_price", 0)
+                "id": str(cid) if cid is not None else None,
+                "quantity": int(c.get("quantity", 1)),
+                "item_price": f"{float(price):.2f}",
             })
     else:
         for cid in content_ids:
-            out.append({"id": cid, "quantity": 1, "item_price": 0})
+            out.append({"id": str(cid), "quantity": 1, "item_price": "0.00"})
     return out
 
-# ===================== TikTok helper =====================
+# ===================== TikTok helper (timestamp ISO-8601 string) =====================
 def send_tiktok_event(
     event_name: str,
     event_id: str,
-    ts: int,
+    ts_iso_utc: str,              # <-- ISO-8601 string exigido pelo TikTok
     page_url: str,
     ip: str,
     user_agent: str,
@@ -979,7 +982,7 @@ def send_tiktok_event(
         "pixel_code": TIKTOK_PIXEL_ID,
         "event": event_name,
         "event_id": event_id,
-        "timestamp": ts,
+        "timestamp": ts_iso_utc,  # <-- string ISO-8601 (ex.: '2025-10-06T22:06:13Z')
         "context": {
             "ad": ({"callback": ttclid} if ttclid else {}),
             "page": {"url": page_url},
@@ -1003,11 +1006,11 @@ def send_tiktok_event(
         print(f"[tiktok] exceção em {event_name}: {e}")
         return "error"
 
-# ===================== Pinterest helper (NOVO) =====================
+# ===================== Pinterest helper (value/item_price como strings) =====================
 def send_pinterest_event(
     event_name: str,
     event_id: str,
-    ts: int,
+    ts: int,                       # Pinterest aceita epoch int
     page_url: str,
     ip: str,
     user_agent: str,
@@ -1036,7 +1039,7 @@ def send_pinterest_event(
         "data": [{
             "event_name": event_name,
             "action_source": "web",
-            "event_time": ts,
+            "event_time": ts,  # epoch int
             "event_id": event_id,
             "event_source_url": page_url,
             "user_data": {
@@ -1045,9 +1048,9 @@ def send_pinterest_event(
             },
             "custom_data": {
                 "currency": currency,
-                "value": float(value),
-                "content_ids": content_ids,
-                "contents": pin_contents
+                "value": f"{float(value):.2f}",           # <-- string
+                "content_ids": [str(x) for x in (content_ids or [])],
+                "contents": pin_contents                  # <-- item_price string + id garantido
             }
         }]}
     headers = {
@@ -1198,7 +1201,12 @@ def _build_incoming_from_request(request: Request, full_path: str) -> Tuple[str,
 
 # ===================== Handler principal =====================
 @app.get("/{full_path:path}")
-def track_number_and_redirect(request: Request, full_path: str = Path(...), cat: Optional[str] = Query(None), mode: Optional[str] = Query(None)):
+def track_number_and_redirect(
+    request: Request,
+    full_path: str = Path(...),
+    cat: Optional[str] = Query(None),
+    mode: Optional[str] = Query(None)
+):
     try:
         incoming_url, in_mode = _build_incoming_from_request(request, full_path)
     except HTTPException as he:
@@ -1206,6 +1214,9 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 
     ts = int(time.time())
     iso_time = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(ts))
+    # TikTok exige timestamp ISO-8601 em string (UTC):
+    ts_iso_utc = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     headers = request.headers
     cookie_header = headers.get("cookie") or headers.get("Cookie")
     referrer = headers.get("referer") or "-"
@@ -1216,14 +1227,16 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     device_name, os_family, os_version = parse_device_info(user_agent)
 
     parts_in = urlsplit(incoming_url)
-    resolved_url = _fix_scheme(incoming_url) if SKIP_RESOLVE else (_resolve_short_follow(incoming_url) if _is_short_domain(parts_in.netloc) else _fix_scheme(incoming_url))
+    resolved_url = _fix_scheme(incoming_url) if SKIP_RESOLVE else (
+        _resolve_short_follow(incoming_url) if _is_short_domain(parts_in.netloc) else _fix_scheme(incoming_url)
+    )
     parts_res = urlsplit(resolved_url)
     if not parts_res.scheme or not parts_res.netloc:
         return JSONResponse({"ok": False, "error": f"URL inválida: {resolved_url}"}, status_code=400)
     if not _is_allowed_long(parts_res.netloc) and not _is_short_domain(parts_res.netloc):
         return JSONResponse({"ok": False, "error": f"Domínio não permitido: {parts_res.netloc}"}, status_code=400)
 
-    # ===== UTM: usa SOMENTE o parâmetro 'uc' =====
+    # ===== UTM via 'uc' =====
     outer_uc = request.query_params.get("uc")
     if not outer_uc:
         return JSONResponse({"ok": False, "error": "utm_missing_uc"}, status_code=400)
@@ -1236,11 +1249,42 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 
     # ===== content_ids / contents (genérico → mapearemos por plataforma)
     content_ids, contents_payload_generic = _build_content_identifiers(origin_url)
-    contents_meta      = _contents_for_meta(content_ids)
-    contents_tiktok    = _contents_for_tiktok_from_generic(contents_payload_generic, content_ids)
+
+    # Normalizações por plataforma
+    contents_meta = [{"id": cid, "quantity": 1} for cid in content_ids]
+
+    def _contents_for_tiktok_from_generic(generic, ids):
+        out = []
+        for c in (generic or []):
+            out.append({
+                "content_id": c.get("id") or (ids[0] if ids else None),
+                "quantity": c.get("quantity", 1),
+                "price": c.get("item_price", 0) or c.get("price", 0),
+            })
+        if not out and ids:
+            out = [{"content_id": ids[0], "quantity": 1, "price": 0}]
+        return out
+
+    def _contents_for_pinterest_from_generic(generic, ids):
+        out = []
+        if generic:
+            for i, c in enumerate(generic):
+                cid = c.get("id") or (ids[i] if i < len(ids) else (ids[0] if ids else None))
+                price = c.get("item_price", 0)
+                out.append({
+                    "id": str(cid) if cid is not None else None,
+                    "quantity": int(c.get("quantity", 1)),
+                    "item_price": f"{float(price):.2f}",  # string
+                })
+        else:
+            for cid in ids:
+                out.append({"id": str(cid), "quantity": 1, "item_price": "0.00"})
+        return out
+
+    contents_tiktok = _contents_for_tiktok_from_generic(contents_payload_generic, content_ids)
     contents_pinterest = _contents_for_pinterest_from_generic(contents_payload_generic, content_ids)
 
-    # ===== Short oficial (sempre) — subId3 = UTMNumered
+    # ===== Short oficial (Shopee) — subId3 = UTMNumered
     sub_id_api = sanitize_subid_for_shopee(utm_numbered) or "na"
     dest = generate_short_link(origin_url, sub_id_api)
 
@@ -1339,19 +1383,31 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     # ===== TikTok: ViewContent =====
     tiktok_view = ""
     try:
-        tiktok_view = send_tiktok_event(
-            event_name="ViewContent",
-            event_id=utm_numbered,
-            ts=ts,
-            page_url=origin_url,
-            ip=ip_addr,
-            user_agent=user_agent,
-            ttclid=ttclid,
-            currency="BRL",
-            value=0.0,
-            content_ids=content_ids,
-            contents_payload_generic=contents_payload_generic,
-        )
+        payload_tt_vc = {
+            "pixel_code": TIKTOK_PIXEL_ID,
+            "event": "ViewContent",
+            "event_id": utm_numbered,
+            "timestamp": ts_iso_utc,
+            "context": {
+                "ad": ({"callback": ttclid} if ttclid else {}),
+                "page": {"url": origin_url},
+                "user": {"ip": ip_addr, "user_agent": user_agent}
+            },
+            "properties": {
+                "currency": "BRL",
+                "value": 0.0,
+                "content_type": "product",
+                "content_id": content_ids[0] if content_ids else None,
+                "contents": contents_tiktok,
+            }
+        }
+        if TIKTOK_PIXEL_ID and TIKTOK_ACCESS_TOKEN:
+            resp_tt = session.post(TIKTOK_API_TRACK_URL,
+                                   headers={"Content-Type": "application/json", "Access-Token": TIKTOK_ACCESS_TOKEN},
+                                   json=payload_tt_vc, timeout=8)
+            tiktok_view = _log_send("tiktok.ViewContent", resp_tt.status_code, resp_tt.text)
+        else:
+            print("[tiktok] pulado: credenciais ausentes"); tiktok_view = "skipped:no_tiktok_creds"
     except Exception as e:
         print("[tiktok] VC exceção:", e)
         tiktok_view = "error"
@@ -1359,18 +1415,34 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     # ===== Pinterest: view_item =====
     pinterest_view = ""
     try:
-        pinterest_view = send_pinterest_event(
-            event_name="view_item",
-            event_id=utm_numbered,
-            ts=ts,
-            page_url=origin_url,
-            ip=ip_addr,
-            user_agent=user_agent,
-            currency="BRL",
-            value=0.0,
-            content_ids=content_ids,
-            contents_payload_generic=contents_payload_generic
-        )
+        pin_payload = {
+            "data": [{
+                "event_name": "view_item",
+                "action_source": "web",
+                "event_time": ts,  # epoch int permitido
+                "event_id": utm_numbered,
+                "event_source_url": origin_url,
+                "user_data": {
+                    "client_ip_address": ip_addr,
+                    "client_user_agent": user_agent
+                },
+                "custom_data": {
+                    "currency": "BRL",
+                    "value": "0.00",  # string
+                    "content_ids": [str(x) for x in (content_ids or [])],
+                    "contents": contents_pinterest
+                }
+            }]}
+        url_pin = f"{PIN_API_BASE}/ad_accounts/{PIN_AD_ACCOUNT_ID}/events"
+        if PIN_TEST_MODE:
+            url_pin += "?test=true"
+        if PIN_AD_ACCOUNT_ID and PIN_ACCESS_TOKEN:
+            resp_pin = session.post(url_pin,
+                                    headers={"Authorization": f"Bearer {PIN_ACCESS_TOKEN}", "Content-Type": "application/json"},
+                                    json=pin_payload, timeout=8)
+            pinterest_view = _log_send("pinterest.view_item", resp_pin.status_code, resp_pin.text)
+        else:
+            print("[pinterest] pulado: credenciais ausentes"); pinterest_view = "skipped:no_pinterest_creds"
     except Exception as e:
         print("[pinterest] view exceção:", e)
         pinterest_view = "error"
@@ -1410,19 +1482,31 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     tiktok_sent = ""
     if is_atc_flag == 1:
         try:
-            tiktok_sent = send_tiktok_event(
-                event_name="AddToCart",
-                event_id=utm_numbered,
-                ts=ts,
-                page_url=origin_url,
-                ip=ip_addr,
-                user_agent=user_agent,
-                ttclid=ttclid,
-                currency="BRL",
-                value=0.0,
-                content_ids=content_ids,
-                contents_payload_generic=contents_payload_generic,
-            )
+            payload_tt_atc = {
+                "pixel_code": TIKTOK_PIXEL_ID,
+                "event": "AddToCart",
+                "event_id": utm_numbered,
+                "timestamp": ts_iso_utc,
+                "context": {
+                    "ad": ({"callback": ttclid} if ttclid else {}),
+                    "page": {"url": origin_url},
+                    "user": {"ip": ip_addr, "user_agent": user_agent}
+                },
+                "properties": {
+                    "currency": "BRL",
+                    "value": 0.0,
+                    "content_type": "product",
+                    "content_id": content_ids[0] if content_ids else None,
+                    "contents": contents_tiktok,
+                }
+            }
+            if TIKTOK_PIXEL_ID and TIKTOK_ACCESS_TOKEN:
+                resp_tt_atc = session.post(TIKTOK_API_TRACK_URL,
+                                           headers={"Content-Type": "application/json", "Access-Token": TIKTOK_ACCESS_TOKEN},
+                                           json=payload_tt_atc, timeout=8)
+                tiktok_sent = _log_send("tiktok.AddToCart", resp_tt_atc.status_code, resp_tt_atc.text)
+            else:
+                print("[tiktok] pulado: credenciais ausentes"); tiktok_sent = "skipped:no_tiktok_creds"
         except Exception as e:
             print("[tiktok] AddToCart exceção:", e)
             tiktok_sent = "error"
@@ -1431,18 +1515,34 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     pinterest_sent = ""
     if is_atc_flag == 1:
         try:
-            pinterest_sent = send_pinterest_event(
-                event_name="add_to_cart",
-                event_id=utm_numbered,
-                ts=ts,
-                page_url=origin_url,
-                ip=ip_addr,
-                user_agent=user_agent,
-                currency="BRL",
-                value=0.0,
-                content_ids=content_ids,
-                contents_payload_generic=contents_payload_generic
-            )
+            pin_payload_atc = {
+                "data": [{
+                    "event_name": "add_to_cart",
+                    "action_source": "web",
+                    "event_time": ts,
+                    "event_id": utm_numbered,
+                    "event_source_url": origin_url,
+                    "user_data": {
+                        "client_ip_address": ip_addr,
+                        "client_user_agent": user_agent
+                    },
+                    "custom_data": {
+                        "currency": "BRL",
+                        "value": "0.00",  # string
+                        "content_ids": [str(x) for x in (content_ids or [])],
+                        "contents": contents_pinterest
+                    }
+                }]}
+            url_pin = f"{PIN_API_BASE}/ad_accounts/{PIN_AD_ACCOUNT_ID}/events"
+            if PIN_TEST_MODE:
+                url_pin += "?test=true"
+            if PIN_AD_ACCOUNT_ID and PIN_ACCESS_TOKEN:
+                resp_pin_atc = session.post(url_pin,
+                                            headers={"Authorization": f"Bearer {PIN_ACCESS_TOKEN}", "Content-Type": "application/json"},
+                                            json=pin_payload_atc, timeout=8)
+                pinterest_sent = _log_send("pinterest.add_to_cart", resp_pin_atc.status_code, resp_pin_atc.text)
+            else:
+                print("[pinterest] pulado: credenciais ausentes"); pinterest_sent = "skipped:no_pinterest_creds"
         except Exception as e:
             print("[pinterest] add_to_cart exceção:", e)
             pinterest_sent = "error"
@@ -1489,7 +1589,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
     resp.set_cookie("_fbc", fbc_cookie, max_age=63072000, path="/", samesite="lax")
     resp.set_cookie("_eid", eid_cookie, max_age=63072000, path="/", samesite="lax")
 
-    # Pinterest UA: devolver HTML com refresh (mantido)
+    # Pinterest UA: devolver HTML com refresh (workaround)
     if "pinterest" in (user_agent or "").lower():
         html = f"""<!doctype html>
 <html><head>
@@ -1504,7 +1604,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 
     return resp
 
-# ===================== Admin (igual ao original) =====================
+# ===================== Admin =====================
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page():
     return """
@@ -1721,3 +1821,4 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
+
