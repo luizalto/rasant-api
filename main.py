@@ -188,6 +188,7 @@ def _build_content_identifiers(origin_url: str) -> Tuple[List[str], List[Dict[st
         parts = urlsplit(origin_url)
         base = (parts.path or "/") + ("?" + parts.query if parts.query else "")
         cid  = _sha256_lower(base)[:16]
+    # contents genérico (Meta-like). Vamos normalizar por plataforma depois.
     return [cid], [{"id": cid, "quantity": 1}]
 
 # ===================== AM / IDs =====================
@@ -214,11 +215,16 @@ CSV_HEADERS = [
     "pcomprou_pct","thr_qvc_pct","thr_atc_pct","gap_qvc","gap_atc","pct_of_atc",
     "meta_event_sent","meta_view_sent",
     "tiktok_event_sent","tiktok_view_sent",
-    # NOVO:
     "pinterest_event_sent","pinterest_view_sent"
 ]
 
 # ===================== Utils =====================
+def _log_send(label: str, status: int, text: str):
+    ok = status < 400
+    msg = f"[{label}] {'OK' if ok else 'ERRO'} status={status} body={(text or '')[:500]}"
+    print(msg)
+    return "ok" if ok else f"error:{status}"
+
 def incr_counter_raw() -> int:
     pipe = r.pipeline()
     pipe.incr(COUNTER_KEY)
@@ -919,6 +925,36 @@ def _compute_all_probs(feats_dict: Dict[str, Any]) -> Tuple[Dict[str,float], Dic
 
 _load_models_if_available()
 
+# ===================== Normalização de contents por plataforma =====================
+def _contents_for_meta(content_ids: List[str]) -> List[Dict[str, Any]]:
+    return [{"id": cid, "quantity": 1} for cid in content_ids]
+
+def _contents_for_tiktok_from_generic(generic_contents: List[Dict[str, Any]], content_ids: List[str]) -> List[Dict[str, Any]]:
+    out = []
+    for c in (generic_contents or []):
+        out.append({
+            "content_id": c.get("id") or (content_ids[0] if content_ids else None),
+            "quantity": c.get("quantity", 1),
+            "price": c.get("item_price", 0) or c.get("price", 0),
+        })
+    if not out and content_ids:
+        out = [{"content_id": content_ids[0], "quantity": 1, "price": 0}]
+    return out
+
+def _contents_for_pinterest_from_generic(generic_contents: List[Dict[str, Any]], content_ids: List[str]) -> List[Dict[str, Any]]:
+    out = []
+    if generic_contents:
+        for i, c in enumerate(generic_contents):
+            out.append({
+                "id": c.get("id") or (content_ids[i] if i < len(content_ids) else (content_ids[0] if content_ids else None)),
+                "quantity": c.get("quantity", 1),
+                "item_price": c.get("item_price", 0)
+            })
+    else:
+        for cid in content_ids:
+            out.append({"id": cid, "quantity": 1, "item_price": 0})
+    return out
+
 # ===================== TikTok helper =====================
 def send_tiktok_event(
     event_name: str,
@@ -931,10 +967,13 @@ def send_tiktok_event(
     currency: str,
     value: float,
     content_ids: List[str],
-    contents_payload: List[Dict[str, Any]],
+    contents_payload_generic: List[Dict[str, Any]],
 ) -> str:
     if not (TIKTOK_PIXEL_ID and TIKTOK_ACCESS_TOKEN):
+        print("[tiktok] pulado: credenciais ausentes")
         return "skipped:no_tiktok_creds"
+
+    tt_contents = _contents_for_tiktok_from_generic(contents_payload_generic, content_ids)
 
     payload = {
         "pixel_code": TIKTOK_PIXEL_ID,
@@ -942,7 +981,7 @@ def send_tiktok_event(
         "event_id": event_id,
         "timestamp": ts,
         "context": {
-            "ad": {"callback": ttclid} if ttclid else {},
+            "ad": ({"callback": ttclid} if ttclid else {}),
             "page": {"url": page_url},
             "user": {"ip": ip, "user_agent": user_agent}
         },
@@ -951,7 +990,7 @@ def send_tiktok_event(
             "value": float(value),
             "content_type": "product",
             "content_id": content_ids[0] if content_ids else None,
-            "contents": contents_payload,
+            "contents": tt_contents,
         }
     }
 
@@ -959,11 +998,9 @@ def send_tiktok_event(
 
     try:
         resp = session.post(TIKTOK_API_TRACK_URL, headers=headers, json=payload, timeout=8)
-        if resp.status_code < 400:
-            return "ok"
-        return f"error:{resp.status_code}"
+        return _log_send(f"tiktok.{event_name}", resp.status_code, resp.text)
     except Exception as e:
-        print("[tiktok] exceção:", e)
+        print(f"[tiktok] exceção em {event_name}: {e}")
         return "error"
 
 # ===================== Pinterest helper (NOVO) =====================
@@ -977,20 +1014,23 @@ def send_pinterest_event(
     currency: str,
     value: float,
     content_ids: List[str],
-    contents_payload: List[Dict[str, Any]],
+    contents_payload_generic: List[Dict[str, Any]],
 ) -> str:
     """
     Envia evento server-side para a API de Conversões do Pinterest.
     Nomes sugeridos:
-      - view_item  (visualização)
-      - add_to_cart (conversão 'ATC' lógica)
+      - view_item
+      - add_to_cart
     """
     if not (PIN_AD_ACCOUNT_ID and PIN_ACCESS_TOKEN):
+        print("[pinterest] pulado: credenciais ausentes")
         return "skipped:no_pinterest_creds"
 
     url = f"{PIN_API_BASE}/ad_accounts/{PIN_AD_ACCOUNT_ID}/events"
     if PIN_TEST_MODE:
         url += "?test=true"
+
+    pin_contents = _contents_for_pinterest_from_generic(contents_payload_generic, content_ids)
 
     payload = {
         "data": [{
@@ -1002,13 +1042,12 @@ def send_pinterest_event(
             "user_data": {
                 "client_ip_address": ip,
                 "client_user_agent": user_agent
-                # (ganchos para em/ph/external_id/hashed_maids se quiser incluir depois)
             },
             "custom_data": {
                 "currency": currency,
                 "value": float(value),
                 "content_ids": content_ids,
-                "contents": [{"quantity": c.get("quantity", 1), "item_price": c.get("item_price", 0)} for c in contents_payload] if contents_payload else []
+                "contents": pin_contents
             }
         }]}
     headers = {
@@ -1018,11 +1057,9 @@ def send_pinterest_event(
 
     try:
         resp = session.post(url, headers=headers, json=payload, timeout=8)
-        if resp.status_code < 400:
-            return "ok"
-        return f"error:{resp.status_code}"
+        return _log_send(f"pinterest.{event_name}", resp.status_code, resp.text)
     except Exception as e:
-        print("[pinterest] exceção:", e)
+        print(f"[pinterest] exceção em {event_name}: {e}")
         return "error"
 
 # ===================== GCS flush etc. (igual ao original) =====================
@@ -1197,8 +1234,11 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
 
     origin_url = _set_utm_content_preserving_order(resolved_url, utm_numbered)
 
-    # ===== content_ids / contents =====
-    content_ids, contents_payload = _build_content_identifiers(origin_url)
+    # ===== content_ids / contents (genérico → mapearemos por plataforma)
+    content_ids, contents_payload_generic = _build_content_identifiers(origin_url)
+    contents_meta      = _contents_for_meta(content_ids)
+    contents_tiktok    = _contents_for_tiktok_from_generic(contents_payload_generic, content_ids)
+    contents_pinterest = _contents_for_pinterest_from_generic(contents_payload_generic, content_ids)
 
     # ===== Short oficial (sempre) — subId3 = UTMNumered
     sub_id_api = sanitize_subid_for_shopee(utm_numbered) or "na"
@@ -1280,7 +1320,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                     "value": 0,
                     "content_type": "product",
                     "content_ids": content_ids,
-                    "contents": contents_payload
+                    "contents": contents_meta
                 }
             }]}
         try:
@@ -1289,12 +1329,14 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             if META_TEST_EVENT_CODE:
                 vc_payload["test_event_code"] = META_TEST_EVENT_CODE
             resp_vc = session.post(url, params=params, json=vc_payload, timeout=8)
-            meta_view = "ViewContent" if resp_vc.status_code < 400 else f"error:{resp_vc.status_code}"
+            meta_view = _log_send("meta.ViewContent", resp_vc.status_code, resp_vc.text)
         except Exception as e:
-            print("[meta] VC exceção:", e)
+            print("[meta] exceção VC:", e)
             meta_view = "error"
+    else:
+        print("[meta] pulado: credenciais ausentes")
 
-    # ===== TikTok: ViewContent (mantém) =====
+    # ===== TikTok: ViewContent =====
     tiktok_view = ""
     try:
         tiktok_view = send_tiktok_event(
@@ -1308,13 +1350,13 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             currency="BRL",
             value=0.0,
             content_ids=content_ids,
-            contents_payload=contents_payload,
+            contents_payload_generic=contents_payload_generic,
         )
     except Exception as e:
         print("[tiktok] VC exceção:", e)
         tiktok_view = "error"
 
-    # ===== Pinterest: view_item (NOVO) =====
+    # ===== Pinterest: view_item =====
     pinterest_view = ""
     try:
         pinterest_view = send_pinterest_event(
@@ -1327,7 +1369,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             currency="BRL",
             value=0.0,
             content_ids=content_ids,
-            contents_payload=contents_payload
+            contents_payload_generic=contents_payload_generic
         )
     except Exception as e:
         print("[pinterest] view exceção:", e)
@@ -1348,7 +1390,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                     "value": 0,
                     "content_type": "product",
                     "content_ids": content_ids,
-                    "contents": contents_payload
+                    "contents": contents_meta
                 }
             }]}
         try:
@@ -1357,19 +1399,19 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
             if META_TEST_EVENT_CODE:
                 atc_payload["test_event_code"] = META_TEST_EVENT_CODE
             resp_atc = session.post(url, params=params, json=atc_payload, timeout=8)
-            meta_sent = "AddToCart" if resp_atc.status_code < 400 else f"error:{resp_atc.status_code}"
+            meta_sent = _log_send("meta.AddToCart", resp_atc.status_code, resp_atc.text)
         except Exception as e:
-            print("[meta] ATC exceção:", e)
+            print("[meta] exceção ATC:", e)
             meta_sent = "error"
     else:
         meta_sent = ""
 
-    # ===== TikTok: AddToCart (CORRIGIDO) =====
+    # ===== TikTok: AddToCart =====
     tiktok_sent = ""
     if is_atc_flag == 1:
         try:
             tiktok_sent = send_tiktok_event(
-                event_name="AddToCart",  # << mudou de CompletePayment/AddPaymentInfo para AddToCart
+                event_name="AddToCart",
                 event_id=utm_numbered,
                 ts=ts,
                 page_url=origin_url,
@@ -1379,13 +1421,13 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                 currency="BRL",
                 value=0.0,
                 content_ids=content_ids,
-                contents_payload=contents_payload,
+                contents_payload_generic=contents_payload_generic,
             )
         except Exception as e:
             print("[tiktok] AddToCart exceção:", e)
             tiktok_sent = "error"
 
-    # ===== Pinterest: add_to_cart (NOVO) =====
+    # ===== Pinterest: add_to_cart =====
     pinterest_sent = ""
     if is_atc_flag == 1:
         try:
@@ -1399,7 +1441,7 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
                 currency="BRL",
                 value=0.0,
                 content_ids=content_ids,
-                contents_payload=contents_payload
+                contents_payload_generic=contents_payload_generic
             )
         except Exception as e:
             print("[pinterest] add_to_cart exceção:", e)
@@ -1435,7 +1477,6 @@ def track_number_and_redirect(request: Request, full_path: str = Path(...), cat:
         pcomprou_pct, thr_qvc_pct, thr_atc_pct, gap_qvc, gap_atc, pct_of_atc,
         meta_sent, meta_view,
         tiktok_sent, tiktok_view,
-        # NOVO
         pinterest_sent, pinterest_view
     ]
     with _buffer_lock:
