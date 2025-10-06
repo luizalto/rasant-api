@@ -705,20 +705,43 @@ def send_pinterest_event(
     content_ids: List[str],
     contents_payload: List[Dict[str, Any]],
 ) -> str:
+    """
+    Envia evento server-side para a API de Conversões do Pinterest (v5).
+    Requer:
+      - event_time: inteiro (epoch seconds)
+      - currency: string ("BRL")
+      - value: número (float/int)
+      - content_ids: lista de strings
+      - contents: lista de objetos com quantity (int) / item_price (número)
+    """
     if not (PIN_AD_ACCOUNT_ID and PIN_ACCESS_TOKEN):
-        print(f"[pinterest.{event_name}] SKIP no creds")
         return "skipped:no_pinterest_creds"
 
     url = f"{PIN_API_BASE}/ad_accounts/{PIN_AD_ACCOUNT_ID}/events"
     if PIN_TEST_MODE:
         url += "?test=true"
 
-    # Correção: Pinterest reclama de tipos numéricos em alguns campos -> enviar strings
+    # Sanitizações mínimas para tipagem correta
+    safe_content_ids = [str(cid) for cid in (content_ids or [])]
+    safe_contents = []
+    for c in (contents_payload or []):
+        qty = c.get("quantity", 1)
+        try:
+            qty = int(qty)
+        except Exception:
+            qty = 1
+        item_price = c.get("item_price", 0)
+        try:
+            item_price = float(item_price)
+        except Exception:
+            item_price = 0.0
+        safe_contents.append({"quantity": qty, "item_price": item_price})
+
     payload = {
         "data": [{
-            "event_name": event_name,
+            "event_name": event_name,                   # ex: "view_item", "add_to_cart"
             "action_source": "web",
-            "event_time": str(ts),  # string
+            "event_time": int(ts),                      # <<<<<<<<<<<<<< INTEIRO (CORRIGIDO)
             "event_id": event_id,
             "event_source_url": page_url,
             "user_data": {
@@ -726,10 +749,10 @@ def send_pinterest_event(
                 "client_user_agent": user_agent
             },
             "custom_data": {
-                "currency": currency,
-                "value": str(value),
-                "content_ids": [str(c) for c in (content_ids or [])],
-                "contents": [{"quantity": int(c.get("quantity", 1)), "item_price": str(c.get("item_price", "0"))} for c in (contents_payload or [])]
+                "currency": str(currency or "BRL"),     # string
+                "value": float(value or 0.0),           # número
+                "content_ids": safe_content_ids,        # lista[str]
+                "contents": safe_contents               # lista[{quantity:int, item_price:number}]
             }
         }]}
     headers = {
@@ -739,15 +762,21 @@ def send_pinterest_event(
 
     try:
         resp = session.post(url, headers=headers, json=payload, timeout=8)
-        body = safe_body(resp)
-        if resp.status_code < 400 and body.get("num_events_processed", 0) >= 1:
+        body = {}
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"_raw": resp.text[:500]}
+        if resp.status_code < 400:
             print(f"[pinterest.{event_name}] OK status={resp.status_code} body={json.dumps(body, ensure_ascii=False)}")
             return "ok"
-        print(f"[pinterest.{event_name}] ERRO status={resp.status_code} body={json.dumps(body, ensure_ascii=False)}")
-        return f"error:{resp.status_code}"
+        else:
+            print(f"[pinterest.{event_name}] ERRO status={resp.status_code} body={json.dumps(body, ensure_ascii=False)}")
+            return f"error:{resp.status_code}"
     except Exception as e:
-        print(f"[pinterest.{event_name}] exceção: {e}")
+        print(f"[pinterest.{event_name}] EXC {type(e).__name__}: {e}")
         return "error"
+
 
 # ===================== Meta helper (com logs consistentes) =====================
 def send_meta_event(event_name: str, event_id: str, ts: int, origin_url: str, user_data_meta: Dict[str, Any],
@@ -1287,3 +1316,4 @@ def _flush_on_exit():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
+
