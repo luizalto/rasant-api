@@ -3,20 +3,20 @@
 import os, time, hashlib, random, queue, threading
 import requests
 from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, PlainTextResponse
 
 META_PIXEL_ID     = os.getenv("FB_PIXEL_ID")
 META_ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN")
 META_GRAPH_VER    = "v17.0"
 
-WHATSAPP_TEST_NUMBER = "5548920013625"
-WHATSAPP_TEST_TEXT   = "Quero o link"
+# 🔑 TOKEN DE VERIFICAÇÃO DO WHATSAPP (ENV)
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
 
 app = FastAPI()
 session = requests.Session()
 q = queue.Queue()
 
-# ---------------- WORKER (PRODUÇÃO) ----------------
+# -------- WORKER --------
 def worker():
     while True:
         payload = q.get()
@@ -35,7 +35,7 @@ threading.Thread(target=worker, daemon=True).start()
 
 sha = lambda s: hashlib.sha256(s.encode()).hexdigest()
 
-# ---------------- FILTRO BOT ----------------
+# -------- FILTROS --------
 BOT_UA = [
     "facebookexternalhit",
     "facebot",
@@ -51,71 +51,75 @@ def is_bot(ua: str):
     ua = ua.lower()
     return any(b in ua for b in BOT_UA)
 
-# ---------------- ROTA PRINCIPAL ----------------
+# -------- WEBHOOK WHATSAPP --------
+@app.get("/webhook")
+def verify_webhook(r: Request):
+    mode      = r.query_params.get("hub.mode")
+    token     = r.query_params.get("hub.verify_token")
+    challenge = r.query_params.get("hub.challenge")
+
+    if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
+        return PlainTextResponse(challenge, status_code=200)
+
+    return PlainTextResponse("Verification failed", status_code=403)
+
+
+@app.post("/webhook")
+async def receive_webhook(r: Request):
+    # Por enquanto não faz nada com a mensagem
+    # Só recebe para não dar erro no Meta
+    return {"status": "ok"}
+
+# -------- ROTA PRINCIPAL --------
 @app.get("/{p:path}")
 def go(r: Request, p: str):
 
-    # destino original
+    # destino
     d = r.query_params.get("link") or p
     if not d.startswith("http"):
         d = "https://" + d
 
-    # 🔥 MODO TESTE (PRIORIDADE TOTAL)
-    if r.query_params.get("test") == "1":
-        wa_url = (
-            f"https://wa.me/{WHATSAPP_TEST_NUMBER}"
-            f"?text={WHATSAPP_TEST_TEXT.replace(' ', '%20')}"
-        )
-        return RedirectResponse(wa_url, status_code=302)
-
-    # ---------------- PRODUÇÃO NORMAL ----------------
-
+    # headers
     h  = r.headers
     ua = h.get("user-agent","")
     ck = h.get("cookie")
     ip = r.client.host if r.client else "0.0.0.0"
 
-    # filtro bot
+    # 🔒 FILTRO 1: BOT
     if is_bot(ua):
         return RedirectResponse(d,302)
 
-    # só conta se clk=1
+    # 🔒 FILTRO 2: SÓ CONTA SE clk=1
     if r.query_params.get("clk") != "1":
         return RedirectResponse(d,302)
 
     # cookies
     t   = int(time.time())
-    fbp = (ck.split("_fbp=")[1].split(";")[0]
-           if ck and "_fbp=" in ck
-           else f"fb.1.{t}.{random.randint(10**15,10**16-1)}")
+    fbp = (ck.split("_fbp=")[1].split(";")[0] if ck and "_fbp=" in ck else f"fb.1.{t}.{random.randint(10**15,10**16-1)}")
+    fbc = (ck.split("_fbc=")[1].split(";")[0] if ck and "_fbc=" in ck else f"fb.1.{t}.{sha(fbp)[:16]}")
+    eid = (ck.split("_eid=")[1].split(";")[0] if ck and "_eid=" in ck else sha(fbp))
 
-    fbc = (ck.split("_fbc=")[1].split(";")[0]
-           if ck and "_fbc=" in ck
-           else f"fb.1.{t}.{sha(fbp)[:16]}")
-
-    eid = (ck.split("_eid=")[1].split(";")[0]
-           if ck and "_eid=" in ck
-           else sha(fbp))
-
-    # fila de evento (produção)
+    # fila (evento real)
     q.put_nowait({
-        "data":[{
-            "event_name":"ViewContent",
-            "event_time":t,
-            "event_id":eid,
-            "action_source":"website",
-            "event_source_url":d,
-            "user_data":{
-                "client_ip_address":ip,
-                "client_user_agent":ua,
-                "external_id":eid,
-                "fbp":fbp,
-                "fbc":fbc
+        "data":[
+            {
+                "event_name":"ViewContent",
+                "event_time":t,
+                "event_id":eid,
+                "action_source":"website",
+                "event_source_url":d,
+                "user_data":{
+                    "client_ip_address":ip,
+                    "client_user_agent":ua,
+                    "external_id":eid,
+                    "fbp":fbp,
+                    "fbc":fbc
+                }
             }
-        }]
+        ]
     })
 
-    # redirect final
+    # redirect
     resp = RedirectResponse(d,302)
     resp.set_cookie("_fbp", fbp, max_age=63072000, path="/", samesite="lax")
     resp.set_cookie("_fbc", fbc, max_age=63072000, path="/", samesite="lax")
