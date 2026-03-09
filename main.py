@@ -1,108 +1,248 @@
-# -*- coding: utf-8 -*-
-
-import os, time, hashlib, random, queue, threading
+import os
+import time
+import json
+import hashlib
+import random
+import re
+import redis
 import requests
-from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse
-
-META_PIXEL_ID     = os.getenv("FB_PIXEL_ID")
-META_ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN")
-META_GRAPH_VER    = "v17.0"
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import RedirectResponse, JSONResponse
+from urllib.parse import urlsplit, urlunsplit
 
 app = FastAPI()
+
+# CONFIG
+REDIS_URL = os.getenv("REDIS_URL","redis://localhost:6379/0")
+
+SHOPEE_APP_ID = os.getenv("SHOPEE_APP_ID")
+SHOPEE_APP_SECRET = os.getenv("SHOPEE_APP_SECRET")
+SHOPEE_ENDPOINT = "https://open-api.affiliate.shopee.com.br/graphql"
+
+META_PIXEL_ID = os.getenv("META_PIXEL_ID")
+META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
+
+VIDEO_ID = os.getenv("VIDEO_ID","v1")
+
+r = redis.from_url(REDIS_URL)
+
 session = requests.Session()
-q = queue.Queue()
 
-# -------- WORKER --------
-def worker():
-    while True:
-        payload = q.get()
-        try:
-            session.post(
-                f"https://graph.facebook.com/{META_GRAPH_VER}/{META_PIXEL_ID}/events",
-                params={"access_token": META_ACCESS_TOKEN},
-                json=payload,
-                timeout=2
-            )
-        except:
-            pass
-        q.task_done()
+COUNTER_KEY = "utm_counter"
 
-threading.Thread(target=worker, daemon=True).start()
+# ============================
+# UTILS
+# ============================
 
-sha = lambda s: hashlib.sha256(s.encode()).hexdigest()
+def sha256(s):
+    return hashlib.sha256(s.encode()).hexdigest()
 
-# -------- FILTROS --------
-BOT_UA = [
-    "facebookexternalhit",
-    "facebot",
-    "metainspector",
-    "adsbot",
-    "crawler",
-    "bot"
-]
+def gen_fbp(ts):
+    return f"fb.1.{ts}.{random.randint(10**15,10**16-1)}"
 
-def is_bot(ua: str):
-    if not ua:
-        return False
-    ua = ua.lower()
-    return any(b in ua for b in BOT_UA)
+def gen_fbc(fbp, ts):
+    return f"fb.1.{ts}.{sha256(fbp)[:16]}"
 
-# -------- ROTA --------
-@app.get("/{p:path}")
-def go(r: Request, p: str):
+def get_cookie(cookie_header,name):
+    if not cookie_header:
+        return None
+    for c in cookie_header.split(";"):
+        c=c.strip()
+        if c.startswith(name+"="):
+            return c.split("=")[1]
+    return None
 
-    # destino
-    d = r.query_params.get("link") or p
-    if not d.startswith("http"):
-        d = "https://" + d
+def next_number():
+    return int(r.incr(COUNTER_KEY))
 
-    # headers
-    h  = r.headers
-    ua = h.get("user-agent","")
-    ck = h.get("cookie")
-    ip = r.client.host if r.client else "0.0.0.0"
+def set_utm(url,value):
 
-    # 🔒 FILTRO 1: BOT
-    if is_bot(ua):
-        return RedirectResponse(d,302)
+    parts=urlsplit(url)
 
-    # 🔒 FILTRO 2: SÓ CONTA SE clk=1
-    if r.query_params.get("clk") != "1":
-        return RedirectResponse(d,302)
+    query=parts.query.split("&") if parts.query else []
 
-    # cookies
-    t   = int(time.time())
-    fbp = (ck.split("_fbp=")[1].split(";")[0] if ck and "_fbp=" in ck else f"fb.1.{t}.{random.randint(10**15,10**16-1)}")
-    fbc = (ck.split("_fbc=")[1].split(";")[0] if ck and "_fbc=" in ck else f"fb.1.{t}.{sha(fbp)[:16]}")
-    eid = (ck.split("_eid=")[1].split(";")[0] if ck and "_eid=" in ck else sha(fbp))
+    replaced=False
 
-    # fila (evento real)
-    q.put_nowait({
-        "data":[{
-            "event_name":"ViewContent",
-            "event_time":t,
-            "event_id":eid,
-            "action_source":"website",
-            "event_source_url":d,
-            "user_data":{
-                "client_ip_address":ip,
-                "client_user_agent":ua,
-                "external_id":eid,
-                "fbp":fbp,
-                "fbc":fbc
+    for i,q in enumerate(query):
+        if q.startswith("utm_content="):
+            query[i]="utm_content="+value
+            replaced=True
+
+    if not replaced:
+        query.append("utm_content="+value)
+
+    new_query="&".join(query)
+
+    return urlunsplit((parts.scheme,parts.netloc,parts.path,new_query,parts.fragment))
+
+# ============================
+# SHOPEE SHORTLINK
+# ============================
+
+def generate_short_link(origin_url,subid):
+
+    payload={
+        "query":f"""
+        mutation {{
+            generateShortLink(
+                input: {{
+                    originUrl: "{origin_url}",
+                    subIds:["","","{subid}","",""]
+                }}
+            ) {{
+                shortLink
+            }}
+        }}
+        """
+    }
+
+    payload=json.dumps(payload,separators=(',',':'))
+
+    ts=str(int(time.time()))
+
+    signature=sha256(SHOPEE_APP_ID+ts+payload+SHOPEE_APP_SECRET)
+
+    headers={
+        "Authorization":f"SHA256 Credential={SHOPEE_APP_ID}, Timestamp={ts}, Signature={signature}",
+        "Content-Type":"application/json"
+    }
+
+    resp=session.post(SHOPEE_ENDPOINT,data=payload,headers=headers)
+
+    j=resp.json()
+
+    short=j["data"]["generateShortLink"]["shortLink"]
+
+    return short
+
+# ============================
+# META PURCHASE EVENT
+# ============================
+
+def send_purchase(data):
+
+    url=f"https://graph.facebook.com/v17.0/{META_PIXEL_ID}/events"
+
+    payload={
+        "data":[
+            {
+                "event_name":"Purchase",
+                "event_time":int(time.time()),
+                "event_id":data["utm"],
+                "action_source":"website",
+                "user_data":{
+                    "client_ip_address":data["ip"],
+                    "client_user_agent":data["ua"],
+                    "fbp":data["fbp"],
+                    "fbc":data["fbc"]
+                },
+                "custom_data":{
+                    "currency":"BRL",
+                    "value":1
+                }
             }
-        }]
-    })
+        ]
+    }
+
+    params={"access_token":META_ACCESS_TOKEN}
+
+    session.post(url,params=params,json=payload)
+
+# ============================
+# CLICK HANDLER
+# ============================
+
+@app.get("/{path:path}")
+def click(request:Request,path:str):
+
+    link=request.query_params.get("link")
+
+    if not link:
+        raise HTTPException(400,"missing link")
+
+    ts=int(time.time())
+
+    cookie=request.headers.get("cookie")
+
+    ip=request.client.host
+
+    ua=request.headers.get("user-agent","")
+
+    fbclid=request.query_params.get("fbclid")
+
+    fbp=get_cookie(cookie,"_fbp") or gen_fbp(ts)
+
+    fbc=get_cookie(cookie,"_fbc") or gen_fbc(fbp,ts)
+
+    if fbclid:
+        fbc=f"fb.1.{ts}.{fbclid}"
+
+    # gerar UTM
+
+    n=next_number()
+
+    utm=f"{VIDEO_ID}n{n}"
+
+    # inserir utm no link
+
+    origin_url=set_utm(link,utm)
+
+    # gerar shortlink
+
+    short=generate_short_link(origin_url,utm)
+
+    # salvar dados para purchase futuro
+
+    r.setex(
+
+        f"click:{utm}",
+
+        604800,
+
+        json.dumps({
+
+            "utm":utm,
+            "ip":ip,
+            "ua":ua,
+            "fbp":fbp,
+            "fbc":fbc
+
+        })
+
+    )
 
     # redirect
-    r = RedirectResponse(d,302)
-    r.set_cookie("_fbp", fbp, max_age=63072000, path="/", samesite="lax")
-    r.set_cookie("_fbc", fbc, max_age=63072000, path="/", samesite="lax")
-    r.set_cookie("_eid", eid, max_age=63072000, path="/", samesite="lax")
-    return r
 
+    resp=RedirectResponse(short)
 
-if __name__ == "__main__":
+    resp.set_cookie("_fbp",fbp,max_age=63072000)
+
+    resp.set_cookie("_fbc",fbc,max_age=63072000)
+
+    return resp
+
+# ============================
+# PURCHASE ENDPOINT
+# ============================
+
+@app.get("/send_purchase")
+def purchase(utm:str):
+
+    data=r.get(f"click:{utm}")
+
+    if not data:
+        return {"error":"utm not found"}
+
+    data=json.loads(data)
+
+    send_purchase(data)
+
+    return {"status":"sent"}
+
+# ============================
+
+if __name__=="__main__":
+
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT","10000")), workers=4)
+
+    uvicorn.run(app,host="0.0.0.0",port=8000)
