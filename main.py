@@ -5,6 +5,7 @@ import hashlib
 import random
 import redis
 import requests
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse
 from urllib.parse import urlsplit, urlunsplit
@@ -23,8 +24,6 @@ SHOPEE_ENDPOINT = "https://open-api.affiliate.shopee.com.br/graphql"
 
 META_PIXEL_ID = os.getenv("META_PIXEL_ID")
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
-
-VIDEO_ID = os.getenv("VIDEO_ID", "v1")
 
 r = redis.from_url(REDIS_URL)
 
@@ -170,7 +169,7 @@ def click(request: Request, full_path: str):
 
     link = request.query_params.get("link")
 
-    # aceita link no path
+    # aceitar link no path
     if not link and full_path.startswith("http"):
 
         link = full_path
@@ -197,21 +196,29 @@ def click(request: Request, full_path: str):
 
         fbc = f"fb.1.{ts}.{fbclid}"
 
-    # gerar utm numerada
+    # pegar uc do link
+
+    uc = request.query_params.get("uc")
+
+    if not uc:
+
+        uc = "default"
+
+    # gerar numero sequencial
 
     n = next_number()
 
-    utm = f"{VIDEO_ID}n{n}"
+    utm = f"{uc}R{n}"
 
-    # inserir utm
+    # inserir utm no link
 
     origin_url = set_utm(link, utm)
 
-    # gerar shortlink
+    # gerar shortlink da Shopee
 
     short = generate_short_link(origin_url, utm)
 
-    # salvar dados
+    # salvar dados do clique
 
     r.setex(
 
@@ -222,13 +229,9 @@ def click(request: Request, full_path: str):
         json.dumps({
 
             "utm": utm,
-
             "ip": ip,
-
             "ua": ua,
-
             "fbp": fbp,
-
             "fbc": fbc
 
         })
@@ -260,7 +263,7 @@ def purchase(utm: str):
 
     send_purchase(data)
 
-    return {"status": "sent"}
+    return {"status": "purchase sent"}
 
 # =============================
 
