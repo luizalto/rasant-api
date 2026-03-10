@@ -8,7 +8,7 @@ import requests
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit, unquote
 
 app = FastAPI()
 
@@ -16,7 +16,7 @@ app = FastAPI()
 # CONFIG
 # =============================
 
-REDIS_URL = os.getenv("REDIS_URL","redis://localhost:6379/0")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 SHOPEE_APP_ID = os.getenv("SHOPEE_APP_ID")
 SHOPEE_APP_SECRET = os.getenv("SHOPEE_APP_SECRET")
@@ -121,7 +121,16 @@ def generate_short_link(origin_url,subid):
 
     resp=session.post(SHOPEE_ENDPOINT,data=payload,headers=headers)
 
-    j=resp.json()
+    try:
+        j=resp.json()
+    except:
+        print("Erro ao ler resposta Shopee:", resp.text)
+        raise Exception("Shopee response invalid")
+
+    print("Shopee response:", j)
+
+    if "data" not in j:
+        raise Exception(f"Shopee API error: {j}")
 
     return j["data"]["generateShortLink"]["shortLink"]
 
@@ -138,7 +147,6 @@ def send_viewcontent(data):
             {
                 "event_name":"ViewContent",
                 "event_time":int(time.time()),
-                "event_id":data["utm"],
                 "action_source":"website",
                 "user_data":{
                     "client_ip_address":data["ip"],
@@ -204,6 +212,8 @@ def click(request:Request,full_path:str):
 
         raise HTTPException(400,"missing link")
 
+    link=unquote(link)
+
     ts=int(time.time())
 
     cookie=request.headers.get("cookie")
@@ -234,7 +244,15 @@ def click(request:Request,full_path:str):
 
     origin_url=set_utm(link,utm)
 
-    short=generate_short_link(origin_url,utm)
+    try:
+
+        short=generate_short_link(origin_url,utm)
+
+    except Exception as e:
+
+        print("Erro ao gerar shortlink:",e)
+
+        return JSONResponse({"error":"shopee_link_error"})
 
     data={
         "utm":utm,
@@ -246,22 +264,10 @@ def click(request:Request,full_path:str):
 
     r.setex(f"click:{utm}",604800,json.dumps(data))
 
-    # =============================
-    # PRINT NO TERMINAL
-    # =============================
-
     print("\n================ CLICK ================")
     print("URL:",link)
     print("UTM:",utm)
-    print("FBP:",fbp)
-    print("FBC:",fbc)
     print("=======================================\n")
-
-    print(f'{ip}:0 - "GET /{link} HTTP/1.1" 307 Temporary Redirect')
-
-    # =============================
-    # META VIEWCONTENT
-    # =============================
 
     send_viewcontent(data)
 
@@ -278,13 +284,21 @@ def click(request:Request,full_path:str):
 # =============================
 
 @app.get("/send_purchase")
-def purchase(utm:str):
+def purchase(utm:str=None):
+
+    if not utm:
+        return {"error":"missing utm"}
 
     data=r.get(f"click:{utm}")
 
     if not data:
 
-        return JSONResponse({"error":"utm not found"})
+        print("UTM não encontrada:", utm)
+
+        return {
+            "status":"utm_not_found",
+            "utm":utm
+        }
 
     data=json.loads(data)
 
