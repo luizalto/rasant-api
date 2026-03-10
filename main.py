@@ -124,13 +124,12 @@ def generate_short_link(origin_url,subid):
     try:
         j=resp.json()
     except:
-        print("Erro ao ler resposta Shopee:", resp.text)
-        raise Exception("Shopee response invalid")
-
-    print("Shopee response:", j)
+        print("Erro resposta Shopee:", resp.text)
+        raise Exception("Erro Shopee")
 
     if "data" not in j:
-        raise Exception(f"Shopee API error: {j}")
+        print("Erro Shopee:", j)
+        raise Exception("Shopee API error")
 
     return j["data"]["generateShortLink"]["shortLink"]
 
@@ -250,7 +249,7 @@ def click(request:Request,full_path:str):
 
     except Exception as e:
 
-        print("Erro ao gerar shortlink:",e)
+        print("Erro shortlink:",e)
 
         return JSONResponse({"error":"shopee_link_error"})
 
@@ -264,10 +263,7 @@ def click(request:Request,full_path:str):
 
     r.setex(f"click:{utm}",604800,json.dumps(data))
 
-    print("\n================ CLICK ================")
-    print("URL:",link)
-    print("UTM:",utm)
-    print("=======================================\n")
+    print("SALVO NO REDIS:", f"click:{utm}")
 
     send_viewcontent(data)
 
@@ -280,7 +276,7 @@ def click(request:Request,full_path:str):
     return resp
 
 # =============================
-# PURCHASE ENDPOINT
+# PURCHASE
 # =============================
 
 @app.get("/send_purchase")
@@ -292,19 +288,43 @@ def purchase(utm:str=None):
     data=r.get(f"click:{utm}")
 
     if not data:
-
         print("UTM não encontrada:", utm)
-
-        return {
-            "status":"utm_not_found",
-            "utm":utm
-        }
+        return {"status":"utm_not_found","utm":utm}
 
     data=json.loads(data)
 
     send_purchase(data)
 
     return {"status":"purchase sent"}
+
+# =============================
+# REDIS TEST
+# =============================
+
+@app.get("/redis_ping")
+def redis_ping():
+    try:
+        return {"redis": r.ping()}
+    except Exception as e:
+        return {"redis": False, "error": str(e)}
+
+@app.get("/redis_test")
+def redis_test():
+
+    try:
+
+        keys=r.keys("click:*")
+
+        return{
+            "total":len(keys),
+            "keys":[k.decode() for k in keys[:20]]
+        }
+
+    except Exception as e:
+
+        return{
+            "error":str(e)
+        }
 
 # =============================
 
