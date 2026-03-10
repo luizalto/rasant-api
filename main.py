@@ -60,7 +60,6 @@ def get_cookie(cookie_header,name):
     return None
 
 def next_number():
-
     return int(r.incr(COUNTER_KEY))
 
 def set_utm(url,value):
@@ -80,7 +79,6 @@ def set_utm(url,value):
             replaced=True
 
     if not replaced:
-
         query.append("utm_content="+value)
 
     new_query="&".join(query)
@@ -195,88 +193,7 @@ def send_purchase(data):
     session.post(url,params=params,json=payload)
 
 # =============================
-# CLICK HANDLER
-# =============================
-
-@app.get("/{full_path:path}")
-def click(request:Request,full_path:str):
-
-    link=request.query_params.get("link")
-
-    if not link and full_path.startswith("http"):
-
-        link=full_path
-
-    if not link:
-
-        raise HTTPException(400,"missing link")
-
-    link=unquote(link)
-
-    ts=int(time.time())
-
-    cookie=request.headers.get("cookie")
-
-    ip=request.client.host
-
-    ua=request.headers.get("user-agent","")
-
-    fbclid=request.query_params.get("fbclid")
-
-    fbp=get_cookie(cookie,"_fbp") or gen_fbp(ts)
-
-    fbc=get_cookie(cookie,"_fbc") or gen_fbc(fbp,ts)
-
-    if fbclid:
-
-        fbc=f"fb.1.{ts}.{fbclid}"
-
-    uc=request.query_params.get("uc")
-
-    if not uc:
-
-        uc="default"
-
-    n=next_number()
-
-    utm=f"{uc}R{n}"
-
-    origin_url=set_utm(link,utm)
-
-    try:
-
-        short=generate_short_link(origin_url,utm)
-
-    except Exception as e:
-
-        print("Erro shortlink:",e)
-
-        return JSONResponse({"error":"shopee_link_error"})
-
-    data={
-        "utm":utm,
-        "ip":ip,
-        "ua":ua,
-        "fbp":fbp,
-        "fbc":fbc
-    }
-
-    r.setex(f"click:{utm}",604800,json.dumps(data))
-
-    print("SALVO NO REDIS:", f"click:{utm}")
-
-    send_viewcontent(data)
-
-    resp=RedirectResponse(short)
-
-    resp.set_cookie("_fbp",fbp,max_age=63072000)
-
-    resp.set_cookie("_fbc",fbc,max_age=63072000)
-
-    return resp
-
-# =============================
-# PURCHASE
+# PURCHASE ENDPOINT
 # =============================
 
 @app.get("/send_purchase")
@@ -325,6 +242,82 @@ def redis_test():
         return{
             "error":str(e)
         }
+
+# =============================
+# CLICK HANDLER (SEMPRE ÚLTIMO)
+# =============================
+
+@app.get("/{full_path:path}")
+def click(request:Request,full_path:str):
+
+    link=request.query_params.get("link")
+
+    if not link and full_path.startswith("http"):
+        link=full_path
+
+    if not link:
+        raise HTTPException(400,"missing link")
+
+    link=unquote(link)
+
+    ts=int(time.time())
+
+    cookie=request.headers.get("cookie")
+
+    ip=request.client.host
+
+    ua=request.headers.get("user-agent","")
+
+    fbclid=request.query_params.get("fbclid")
+
+    fbp=get_cookie(cookie,"_fbp") or gen_fbp(ts)
+
+    fbc=get_cookie(cookie,"_fbc") or gen_fbc(fbp,ts)
+
+    if fbclid:
+        fbc=f"fb.1.{ts}.{fbclid}"
+
+    uc=request.query_params.get("uc")
+
+    if not uc:
+        uc="default"
+
+    n=next_number()
+
+    utm=f"{uc}R{n}"
+
+    origin_url=set_utm(link,utm)
+
+    try:
+
+        short=generate_short_link(origin_url,utm)
+
+    except Exception as e:
+
+        print("Erro shortlink:",e)
+
+        return JSONResponse({"error":"shopee_link_error"})
+
+    data={
+        "utm":utm,
+        "ip":ip,
+        "ua":ua,
+        "fbp":fbp,
+        "fbc":fbc
+    }
+
+    r.setex(f"click:{utm}",604800,json.dumps(data))
+
+    print("SALVO NO REDIS:", f"click:{utm}")
+
+    send_viewcontent(data)
+
+    resp=RedirectResponse(short)
+
+    resp.set_cookie("_fbp",fbp,max_age=63072000)
+    resp.set_cookie("_fbc",fbc,max_age=63072000)
+
+    return resp
 
 # =============================
 
