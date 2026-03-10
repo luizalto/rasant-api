@@ -16,7 +16,7 @@ app = FastAPI()
 # CONFIG
 # =============================
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_URL = os.getenv("REDIS_URL","redis://localhost:6379/0")
 
 SHOPEE_APP_ID = os.getenv("SHOPEE_APP_ID")
 SHOPEE_APP_SECRET = os.getenv("SHOPEE_APP_SECRET")
@@ -41,19 +41,19 @@ def sha256(s):
 def gen_fbp(ts):
     return f"fb.1.{ts}.{random.randint(10**15,10**16-1)}"
 
-def gen_fbc(fbp, ts):
+def gen_fbc(fbp,ts):
     return f"fb.1.{ts}.{sha256(fbp)[:16]}"
 
-def get_cookie(cookie_header, name):
+def get_cookie(cookie_header,name):
 
     if not cookie_header:
         return None
 
     for c in cookie_header.split(";"):
 
-        c = c.strip()
+        c=c.strip()
 
-        if c.startswith(name + "="):
+        if c.startswith(name+"="):
 
             return c.split("=")[1]
 
@@ -63,186 +63,213 @@ def next_number():
 
     return int(r.incr(COUNTER_KEY))
 
-def set_utm(url, value):
+def set_utm(url,value):
 
-    parts = urlsplit(url)
+    parts=urlsplit(url)
 
-    query = parts.query.split("&") if parts.query else []
+    query=parts.query.split("&") if parts.query else []
 
-    replaced = False
+    replaced=False
 
-    for i, q in enumerate(query):
+    for i,q in enumerate(query):
 
         if q.startswith("utm_content="):
 
-            query[i] = "utm_content=" + value
+            query[i]="utm_content="+value
 
-            replaced = True
+            replaced=True
 
     if not replaced:
 
-        query.append("utm_content=" + value)
+        query.append("utm_content="+value)
 
-    new_query = "&".join(query)
+    new_query="&".join(query)
 
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+    return urlunsplit((parts.scheme,parts.netloc,parts.path,new_query,parts.fragment))
 
 # =============================
 # SHOPEE SHORTLINK
 # =============================
 
-def generate_short_link(origin_url, subid):
+def generate_short_link(origin_url,subid):
 
-    payload = {
-        "query": f"""
+    payload={
+        "query":f"""
         mutation {{
             generateShortLink(
-                input: {{
-                    originUrl: "{origin_url}",
+                input:{{
+                    originUrl:"{origin_url}",
                     subIds:["","","{subid}","",""]
                 }}
-            ) {{
+            ){{
                 shortLink
             }}
         }}
         """
     }
 
-    payload = json.dumps(payload, separators=(',', ':'))
+    payload=json.dumps(payload,separators=(',',':'))
 
-    ts = str(int(time.time()))
+    ts=str(int(time.time()))
 
-    signature = sha256(SHOPEE_APP_ID + ts + payload + SHOPEE_APP_SECRET)
+    signature=sha256(SHOPEE_APP_ID+ts+payload+SHOPEE_APP_SECRET)
 
-    headers = {
-        "Authorization": f"SHA256 Credential={SHOPEE_APP_ID}, Timestamp={ts}, Signature={signature}",
-        "Content-Type": "application/json"
+    headers={
+        "Authorization":f"SHA256 Credential={SHOPEE_APP_ID}, Timestamp={ts}, Signature={signature}",
+        "Content-Type":"application/json"
     }
 
-    resp = session.post(SHOPEE_ENDPOINT, data=payload, headers=headers)
+    resp=session.post(SHOPEE_ENDPOINT,data=payload,headers=headers)
 
-    j = resp.json()
+    j=resp.json()
 
-    short = j["data"]["generateShortLink"]["shortLink"]
-
-    return short
+    return j["data"]["generateShortLink"]["shortLink"]
 
 # =============================
-# META PURCHASE EVENT
+# META EVENTS
 # =============================
 
-def send_purchase(data):
+def send_viewcontent(data):
 
-    url = f"https://graph.facebook.com/v17.0/{META_PIXEL_ID}/events"
+    url=f"https://graph.facebook.com/v17.0/{META_PIXEL_ID}/events"
 
-    payload = {
-        "data": [
+    payload={
+        "data":[
             {
-                "event_name": "Purchase",
-                "event_time": int(time.time()),
-                "event_id": data["utm"],
-                "action_source": "website",
-                "user_data": {
-                    "client_ip_address": data["ip"],
-                    "client_user_agent": data["ua"],
-                    "fbp": data["fbp"],
-                    "fbc": data["fbc"]
+                "event_name":"ViewContent",
+                "event_time":int(time.time()),
+                "event_id":data["utm"],
+                "action_source":"website",
+                "user_data":{
+                    "client_ip_address":data["ip"],
+                    "client_user_agent":data["ua"],
+                    "fbp":data["fbp"],
+                    "fbc":data["fbc"]
                 },
-                "custom_data": {
-                    "currency": "BRL",
-                    "value": 1
+                "custom_data":{
+                    "currency":"BRL",
+                    "value":0
                 }
             }
         ]
     }
 
-    params = {"access_token": META_ACCESS_TOKEN}
+    params={"access_token":META_ACCESS_TOKEN}
 
-    session.post(url, params=params, json=payload)
+    session.post(url,params=params,json=payload)
+
+def send_purchase(data):
+
+    url=f"https://graph.facebook.com/v17.0/{META_PIXEL_ID}/events"
+
+    payload={
+        "data":[
+            {
+                "event_name":"Purchase",
+                "event_time":int(time.time()),
+                "event_id":data["utm"],
+                "action_source":"website",
+                "user_data":{
+                    "client_ip_address":data["ip"],
+                    "client_user_agent":data["ua"],
+                    "fbp":data["fbp"],
+                    "fbc":data["fbc"]
+                },
+                "custom_data":{
+                    "currency":"BRL",
+                    "value":1
+                }
+            }
+        ]
+    }
+
+    params={"access_token":META_ACCESS_TOKEN}
+
+    session.post(url,params=params,json=payload)
 
 # =============================
 # CLICK HANDLER
 # =============================
 
 @app.get("/{full_path:path}")
-def click(request: Request, full_path: str):
+def click(request:Request,full_path:str):
 
-    link = request.query_params.get("link")
+    link=request.query_params.get("link")
 
-    # aceitar link no path
     if not link and full_path.startswith("http"):
 
-        link = full_path
+        link=full_path
 
     if not link:
 
-        raise HTTPException(400, "missing link")
+        raise HTTPException(400,"missing link")
 
-    ts = int(time.time())
+    ts=int(time.time())
 
-    cookie = request.headers.get("cookie")
+    cookie=request.headers.get("cookie")
 
-    ip = request.client.host
+    ip=request.client.host
 
-    ua = request.headers.get("user-agent", "")
+    ua=request.headers.get("user-agent","")
 
-    fbclid = request.query_params.get("fbclid")
+    fbclid=request.query_params.get("fbclid")
 
-    fbp = get_cookie(cookie, "_fbp") or gen_fbp(ts)
+    fbp=get_cookie(cookie,"_fbp") or gen_fbp(ts)
 
-    fbc = get_cookie(cookie, "_fbc") or gen_fbc(fbp, ts)
+    fbc=get_cookie(cookie,"_fbc") or gen_fbc(fbp,ts)
 
     if fbclid:
 
-        fbc = f"fb.1.{ts}.{fbclid}"
+        fbc=f"fb.1.{ts}.{fbclid}"
 
-    # pegar uc do link
-
-    uc = request.query_params.get("uc")
+    uc=request.query_params.get("uc")
 
     if not uc:
 
-        uc = "default"
+        uc="default"
 
-    # gerar numero sequencial
+    n=next_number()
 
-    n = next_number()
+    utm=f"{uc}R{n}"
 
-    utm = f"{uc}R{n}"
+    origin_url=set_utm(link,utm)
 
-    # inserir utm no link
+    short=generate_short_link(origin_url,utm)
 
-    origin_url = set_utm(link, utm)
+    data={
+        "utm":utm,
+        "ip":ip,
+        "ua":ua,
+        "fbp":fbp,
+        "fbc":fbc
+    }
 
-    # gerar shortlink da Shopee
+    r.setex(f"click:{utm}",604800,json.dumps(data))
 
-    short = generate_short_link(origin_url, utm)
+    # =============================
+    # PRINT NO TERMINAL
+    # =============================
 
-    # salvar dados do clique
+    print("\n================ CLICK ================")
+    print("URL:",link)
+    print("UTM:",utm)
+    print("FBP:",fbp)
+    print("FBC:",fbc)
+    print("=======================================\n")
 
-    r.setex(
+    print(f'{ip}:0 - "GET /{link} HTTP/1.1" 307 Temporary Redirect')
 
-        f"click:{utm}",
+    # =============================
+    # META VIEWCONTENT
+    # =============================
 
-        604800,
+    send_viewcontent(data)
 
-        json.dumps({
+    resp=RedirectResponse(short)
 
-            "utm": utm,
-            "ip": ip,
-            "ua": ua,
-            "fbp": fbp,
-            "fbc": fbc
+    resp.set_cookie("_fbp",fbp,max_age=63072000)
 
-        })
-
-    )
-
-    resp = RedirectResponse(short)
-
-    resp.set_cookie("_fbp", fbp, max_age=63072000)
-
-    resp.set_cookie("_fbc", fbc, max_age=63072000)
+    resp.set_cookie("_fbc",fbc,max_age=63072000)
 
     return resp
 
@@ -251,24 +278,24 @@ def click(request: Request, full_path: str):
 # =============================
 
 @app.get("/send_purchase")
-def purchase(utm: str):
+def purchase(utm:str):
 
-    data = r.get(f"click:{utm}")
+    data=r.get(f"click:{utm}")
 
     if not data:
 
-        return JSONResponse({"error": "utm not found"})
+        return JSONResponse({"error":"utm not found"})
 
-    data = json.loads(data)
+    data=json.loads(data)
 
     send_purchase(data)
 
-    return {"status": "purchase sent"}
+    return {"status":"purchase sent"}
 
 # =============================
 
-if __name__ == "__main__":
+if __name__=="__main__":
 
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app,host="0.0.0.0",port=8000)
