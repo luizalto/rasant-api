@@ -22,8 +22,20 @@ SHOPEE_APP_ID = os.getenv("SHOPEE_APP_ID")
 SHOPEE_APP_SECRET = os.getenv("SHOPEE_APP_SECRET")
 SHOPEE_ENDPOINT = "https://open-api.affiliate.shopee.com.br/graphql"
 
-META_PIXEL_ID = os.getenv("META_PIXEL_ID")
-META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
+# PIXELS DISPONÍVEIS (1 a 10)
+
+PIXELS = {
+    "1": {"id": os.getenv("META_PIXEL_ID_PX1"), "token": os.getenv("META_ACCESS_TOKEN_PX1")},
+    "2": {"id": os.getenv("META_PIXEL_ID_PX2"), "token": os.getenv("META_ACCESS_TOKEN_PX2")},
+    "3": {"id": os.getenv("META_PIXEL_ID_PX3"), "token": os.getenv("META_ACCESS_TOKEN_PX3")},
+    "4": {"id": os.getenv("META_PIXEL_ID_PX4"), "token": os.getenv("META_ACCESS_TOKEN_PX4")},
+    "5": {"id": os.getenv("META_PIXEL_ID_PX5"), "token": os.getenv("META_ACCESS_TOKEN_PX5")},
+    "6": {"id": os.getenv("META_PIXEL_ID_PX6"), "token": os.getenv("META_ACCESS_TOKEN_PX6")},
+    "7": {"id": os.getenv("META_PIXEL_ID_PX7"), "token": os.getenv("META_ACCESS_TOKEN_PX7")},
+    "8": {"id": os.getenv("META_PIXEL_ID_PX8"), "token": os.getenv("META_ACCESS_TOKEN_PX8")},
+    "9": {"id": os.getenv("META_PIXEL_ID_PX9"), "token": os.getenv("META_ACCESS_TOKEN_PX9")},
+    "10": {"id": os.getenv("META_ACCESS_TOKEN_PX10"), "token": os.getenv("META_ACCESS_TOKEN_PX10")}
+}
 
 r = redis.from_url(REDIS_URL)
 
@@ -119,14 +131,9 @@ def generate_short_link(origin_url,subid):
 
     resp=session.post(SHOPEE_ENDPOINT,data=payload,headers=headers)
 
-    try:
-        j=resp.json()
-    except:
-        print("Erro resposta Shopee:", resp.text)
-        raise Exception("Erro Shopee")
+    j=resp.json()
 
     if "data" not in j:
-        print("Erro Shopee:", j)
         raise Exception("Shopee API error")
 
     return j["data"]["generateShortLink"]["shortLink"]
@@ -135,9 +142,12 @@ def generate_short_link(origin_url,subid):
 # META EVENTS
 # =============================
 
-def send_viewcontent(data):
+def send_viewcontent(data,pixel):
 
-    url=f"https://graph.facebook.com/v17.0/{META_PIXEL_ID}/events"
+    if not pixel or not pixel["id"]:
+        return
+
+    url=f"https://graph.facebook.com/v17.0/{pixel['id']}/events"
 
     payload={
         "data":[
@@ -159,13 +169,16 @@ def send_viewcontent(data):
         ]
     }
 
-    params={"access_token":META_ACCESS_TOKEN}
+    params={"access_token":pixel["token"]}
 
     session.post(url,params=params,json=payload)
 
-def send_purchase(data):
+def send_purchase(data,pixel):
 
-    url=f"https://graph.facebook.com/v17.0/{META_PIXEL_ID}/events"
+    if not pixel or not pixel["id"]:
+        return
+
+    url=f"https://graph.facebook.com/v17.0/{pixel['id']}/events"
 
     payload={
         "data":[
@@ -188,7 +201,7 @@ def send_purchase(data):
         ]
     }
 
-    params={"access_token":META_ACCESS_TOKEN}
+    params={"access_token":pixel["token"]}
 
     session.post(url,params=params,json=payload)
 
@@ -197,54 +210,29 @@ def send_purchase(data):
 # =============================
 
 @app.get("/send_purchase")
-def purchase(utm:str=None):
+def purchase(utm:str=None,px:str=None):
 
     if not utm:
         return {"error":"missing utm"}
 
+    pixel=None
+
+    if px:
+        pixel = PIXELS.get(px)
+
     data=r.get(f"click:{utm}")
 
     if not data:
-        print("UTM não encontrada:", utm)
-        return {"status":"utm_not_found","utm":utm}
+        return {"status":"utm_not_found"}
 
     data=json.loads(data)
 
-    send_purchase(data)
+    send_purchase(data,pixel)
 
-    return {"status":"purchase sent"}
-
-# =============================
-# REDIS TEST
-# =============================
-
-@app.get("/redis_ping")
-def redis_ping():
-    try:
-        return {"redis": r.ping()}
-    except Exception as e:
-        return {"redis": False, "error": str(e)}
-
-@app.get("/redis_test")
-def redis_test():
-
-    try:
-
-        keys=r.keys("click:*")
-
-        return{
-            "total":len(keys),
-            "keys":[k.decode() for k in keys[:20]]
-        }
-
-    except Exception as e:
-
-        return{
-            "error":str(e)
-        }
+    return {"status":"purchase_sent"}
 
 # =============================
-# CLICK HANDLER (SEMPRE ÚLTIMO)
+# CLICK HANDLER
 # =============================
 
 @app.get("/{full_path:path}")
@@ -282,6 +270,13 @@ def click(request:Request,full_path:str):
     if not uc:
         uc="default"
 
+    px=request.query_params.get("px")
+
+    pixel=None
+
+    if px:
+        pixel=PIXELS.get(px)
+
     n=next_number()
 
     utm=f"{uc}R{n}"
@@ -292,9 +287,7 @@ def click(request:Request,full_path:str):
 
         short=generate_short_link(origin_url,utm)
 
-    except Exception as e:
-
-        print("Erro shortlink:",e)
+    except Exception:
 
         return JSONResponse({"error":"shopee_link_error"})
 
@@ -308,9 +301,8 @@ def click(request:Request,full_path:str):
 
     r.setex(f"click:{utm}",604800,json.dumps(data))
 
-    print("SALVO NO REDIS:", f"click:{utm}")
-
-    send_viewcontent(data)
+    if pixel:
+        send_viewcontent(data,pixel)
 
     resp=RedirectResponse(short)
 
@@ -319,7 +311,6 @@ def click(request:Request,full_path:str):
 
     return resp
 
-# =============================
 
 if __name__=="__main__":
 
